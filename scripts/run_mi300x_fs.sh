@@ -149,8 +149,9 @@ build_disk_image() {
     info "Building disk image (Ubuntu 22.04 + ROCm)..."
     info "This takes ~30 min and needs ~60GB disk space"
 
-    [ -n "$QEMU_BIN" ] && [ -x "$QEMU_BIN" ] || \
+    if [ -z "$QEMU_BIN" ] || [ ! -x "$QEMU_BIN" ]; then
         error "qemu-system-x86_64 not found. Install QEMU or set QEMU_BIN."
+    fi
     command -v unzip >/dev/null || \
         error "unzip not found. Install: sudo apt install unzip"
     check_kvm || error "KVM required for disk image build"

@@ -18,7 +18,6 @@ Consolidated lookup reference for the QEMU + gem5 MI300X co-simulation system. F
 | `--dgpu-mem-size` | `16GiB` | GPU VRAM size |
 | `--num-compute-units` | `40` | Number of GPU compute units |
 | `--mem-size` | `8GiB` | Guest physical memory size |
-| `--cosim-backend` | `vfio-user` | Cosim backend type: `vfio-user` (stock QEMU 10.0+) or `legacy` (custom QEMU) |
 | `--gem5-debug` | (none) | gem5 debug flag(s), e.g. `MI300XCosim`, `AMDGPUDevice,PM4PacketProcessor` |
 | `--vram-size` | `32GiB` | Custom VRAM size (alias for `--dgpu-mem-size`) |
 | `--num-cus` | `80` | Custom CU count (alias for `--num-compute-units`) |
@@ -91,7 +90,7 @@ console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu
 | gem5 Build Target | VEGA_X86 |
 | GPU Device | MI300X (gfx942, DeviceID 0x74A0) |
 | Coherence Protocol | GPU_VIPER |
-| QEMU | 10.0+ (vfio-user backend) or cosim branch (legacy backend) |
+| QEMU | System-installed QEMU 10.1+ with `vfio-user-pci` |
 
 ### Docker Images
 
@@ -110,7 +109,7 @@ console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu
 | gem5 binary | `build/VEGA_X86/gem5.opt` | ~1.1 GB |
 | Disk image | `../gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | ~55 GB |
 | Kernel | `../gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | ~64 MB |
-| QEMU binary | `qemu/build/qemu-system-x86_64` | -- |
+| QEMU binary | `qemu-system-x86_64` from the host `PATH` | -- |
 
 ---
 
@@ -168,7 +167,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | | |
 |---|---|
 | **Symptom** | `modprobe amdgpu` causes kernel NULL pointer dereference at `amdgpu_atom_parse_data_header+0x1b`. Call chain: `amdgpu_ras_init` -> `amdgpu_atomfirmware_mem_ecc_supported` -> `amdgpu_atom_parse_data_header`. RAX=0 (NULL `atom_context`) |
-| **Root Cause** | All five BIOS discovery methods fail in cosim mode (see [Section 1.3](#13-dd-command-parameters-vga-rom)). The driver logs `"Unable to locate a BIOS ROM"` and proceeds, but the RAS init path unconditionally calls `amdgpu_atom_parse_data_header()` without NULL-checking `atom_context`. QEMU's `romfile=` property is insufficient -- the amdgpu driver uses SMU register-based ROM access, not the PCI ROM BAR |
+| **Root Cause** | All five BIOS discovery methods fail in cosim mode (see [Section 1.3](#13-dd-command-parameters-vga-rom)). The driver logs `"Unable to locate a BIOS ROM"` and proceeds, but the RAS init path unconditionally calls `amdgpu_atom_parse_data_header()` without NULL-checking `atom_context`. The driver uses SMU register-based ROM access rather than the PCI ROM BAR |
 | **Fix** | Run `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` **before** `modprobe`. The `cosim-gpu-setup.service` does this automatically |
 
 ### 4.2 PSP / SMU Firmware Load Failure
@@ -179,23 +178,15 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | `ip_block_mask=0x6f` enables PSP (discovery index 3) but cosim does not model PSP hardware. The `amd_ip_block_type` enum in `amd_shared.h` shows PSP=4, but the mask uses discovery order where PSP is index 3 |
 | **Fix** | Use `ip_block_mask=0x67` to disable both PSP (bit 3) and SMU (bit 4). See [Section 3](#3-ip-block-mask-reference) |
 
-### 4.3 SIGIO Coalescing Deadlock (Legacy Backend Only)
-
-| | |
-|---|---|
-| **Symptom** | Driver hangs on first INDEX2/DATA2 register pair access. gem5 stops responding after ~15 messages. QEMU socket buffer fills up |
-| **Root Cause** | Linux FASYNC/SIGIO is edge-triggered. When QEMU sends a write + read in quick succession, both arrive before gem5's SIGIO handler fires. Only one signal is delivered; the handler reads one message and the second is stranded forever |
-| **Fix** | `MI300XGem5Cosim::handleClientData()` uses a `do/while` drain loop with `poll(fd, POLLIN, 0)` to read all pending messages per SIGIO. Not applicable to vfio-user backend (uses libvfio-user's non-blocking poll) |
-
-### 4.4 GART Table Not Populated in Co-simulation
+### 4.3 GART Table Not Populated in Co-simulation
 
 | | |
 |---|---|
 | **Symptom** | Massive `GART translation for X not found` warnings. PM4 reads all-zero memory (opcode 0x0). KIQ ring test times out |
-| **Root Cause** | In both backends, VRAM is backed by shared memory (`/dev/shm/mi300x-vram`). Driver writes to VRAM bypass gem5's memory system entirely, so `AMDGPUVM::gartTable` hash map is never populated via `AMDGPUDevice::writeFrame()` |
+| **Root Cause** | VRAM is backed by shared memory (`/dev/shm/mi300x-vram`). Driver writes to VRAM bypass gem5's memory system entirely, so `AMDGPUVM::gartTable` hash map is never populated via `AMDGPUDevice::writeFrame()` |
 | **Fix** | Co-simulation fallback in `GARTTranslationGen::translate()`: when `gartTable` misses, read the PTE directly from shared VRAM at `vramShmemPtr + (gartBase - fbBase) + gart_byte_offset`. Key detail: `getGARTAddr()` already multiplies the page index by 8, so `bits(vaddr, 63, 12)` is already a byte offset -- do not multiply by 8 again |
 
-### 4.5 GART Unmapped Page Crash
+### 4.4 GART Unmapped Page Crash
 
 | | |
 |---|---|
@@ -203,7 +194,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | GPU PM4/SDMA engines attempt DMA to GART pages the driver has not mapped (PTE=0). The original code created `GenericPageTableFault`, but the DMA callback chain retried the same failing address infinitely |
 | **Fix** | Unmapped GART pages are mapped to a sink (`paddr=0`). DMA reads return zeros, writes are discarded, simulation stays alive. This is normal: the first page at `ptStart` is simply unmapped |
 
-### 4.6 SDMA Ring Test Timeout
+### 4.5 SDMA Ring Test Timeout
 
 | | |
 |---|---|
@@ -211,7 +202,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | `sdma_delay` in `sdma_engine.hh` defaults to `1e9` ticks. In cosim mode, this translates to ~500ms wall-clock time, exceeding the driver's ~200ms timeout window. Flow: driver writes to SDMA ring, rings doorbell, gem5 schedules SDMA event with `sdma_delay` ticks delay, driver times out before gem5 completes |
 | **Fix** | Reduced `sdma_delay` from `1e9` to `1000` ticks. Increased `KEEPALIVE_INTERVAL` to `1e9` to prevent keepalive interference |
 
-### 4.7 VRAM Address GART Translation Error
+### 4.6 VRAM Address GART Translation Error
 
 | | |
 |---|---|
@@ -219,7 +210,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | SDMA rptr writeback and PM4 RELEASE_MEM destination addresses may point to VRAM (address < 16 GiB). When these pass through `getGARTAddr()`, page number is multiplied by 8, and GART lookup fails because VRAM has no page table entries |
 | **Fix** | Three-layer defense: (1) PM4: `writeData()`, `releaseMem()`, `queryStatus()` check `isVRAMAddress(addr)` and route to `getMemMgr()->writeRequest()`. (2) SDMA: `setGfxRptrLo/Hi()` and rptr writeback skip `getGARTAddr()` for VRAM addresses. (3) GART fallback: detect VRAM addresses and map to sink (`paddr=0`) |
 
-### 4.8 Shared Memory File Offset Mismatch
+### 4.7 Shared Memory File Offset Mismatch
 
 | | |
 |---|---|
@@ -227,7 +218,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | QEMU Q35 with 8 GiB RAM: `below_4g = 2 GiB` (hardcoded when `ram_size >= 0xB0000000`). gem5 configured as 3 GiB below / 5 GiB above. QEMU places above-4G data at file offset 2 GiB; gem5 reads from offset 3 GiB -- all zeros |
 | **Fix** | `mi300_cosim.py` replicates the Q35 split logic: `below_4g = min(total_mem, 0x80000000 if total_mem >= 0xB0000000 else 0xB0000000)` |
 
-### 4.9 Timer Overflow Crash
+### 4.8 Timer Overflow Crash
 
 | | |
 |---|---|
@@ -235,7 +226,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | RTC and PIT timers continuously schedule events, causing tick counter overflow in cosim's long-running mode |
 | **Fix** | Added `disable_rtc_events` parameter to `Cmos` and `disable_timer_events` to `I8254`. Both disabled in `mi300_cosim.py`. A keepalive event in the cosim bridge prevents the event queue from becoming empty |
 
-### 4.10 PM4ReleaseMem.dataSelect Panic
+### 4.9 PM4ReleaseMem.dataSelect Panic
 
 | | |
 |---|---|
@@ -243,7 +234,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | `pm4_packet_processor.cc` only implemented `dataSelect == 1` (32-bit data write). Driver uses other modes during GFX initialization |
 | **Fix** | Added all common dataSelect values: 0 = no data (event trigger only), 1 = 32-bit write (existed), 2 = 64-bit write, 3 = 64-bit GPU clock counter, other = warn and no-op |
 
-### 4.11 Unsupported PM4 Opcodes
+### 4.10 Unsupported PM4 Opcodes
 
 | | |
 |---|---|
@@ -251,7 +242,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | `ACQUIRE_MEM` (0x58) and `SET_RESOURCES` (0xA0) were not handled |
 | **Fix** | Both added to `pm4_defines.hh` and handled in `pm4_packet_processor.cc:decodeHeader()` as skip-and-continue (NOP) |
 
-### 4.12 PCI Class Code Mismatch
+### 4.11 PCI Class Code Mismatch
 
 | | |
 |---|---|
@@ -259,7 +250,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | PCI class was `PCI_CLASS_DISPLAY_OTHER (0x0380)` instead of `PCI_CLASS_DISPLAY_VGA (0x0300)` |
 | **Fix** | Changed to `PCI_CLASS_DISPLAY_VGA`. Kernel now recognizes the address range as "shadowed ROM" |
 
-### 4.13 QEMU Serial Console Conflict
+### 4.12 QEMU Serial Console Conflict
 
 | | |
 |---|---|
@@ -267,7 +258,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | `-nographic` implies `-serial mon:stdio`, creating serial0 on stdio. Explicit `-serial unix:...` becomes serial1 (ttyS1), but kernel uses `console=ttyS0` |
 | **Fix** | Use `-nographic` alone. For programmatic access, run QEMU inside `screen` |
 
-### 4.14 OOM During gem5 Linking
+### 4.13 OOM During gem5 Linking
 
 | | |
 |---|---|
@@ -275,7 +266,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | Default linker uses too much memory |
 | **Fix** | Use `scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold` |
 
-### 4.15 DRM Client Error -13 (Missing DKMS Module)
+### 4.14 DRM Client Error -13 (Missing DKMS Module)
 
 | | |
 |---|---|
@@ -283,7 +274,7 @@ The driver checks `(amdgpu_ip_block_mask & (1 << i))` where `i` is the discovery
 | **Root Cause** | Disk image missing `amddrm_exec.ko.zst` DKMS module. Without it, TTM memory manager fails, `drm_dev_enter()` returns `-EACCES` (-13) |
 | **Fix** | Rebuild disk image using latest `gem5-resources` (`origin/stable` branch). Verify with `guestfish` that `amddrm_exec.ko.zst` exists in `/lib/modules/6.8.0-79-generic/updates/dkms/` |
 
-### 4.16 Driver rmmod After hw_init Failure
+### 4.15 Driver rmmod After hw_init Failure
 
 | | |
 |---|---|
@@ -314,12 +305,6 @@ Usage:
 build/VEGA_X86/gem5.opt --debug-flags=MI300XCosim,AMDGPUDevice ...
 ```
 
-### QEMU Trace Events
-
-```bash
-./scripts/cosim_launch.sh --qemu-trace 'mi300x_gem5_*'
-```
-
 ### Log Inspection Commands
 
 ```bash
@@ -334,12 +319,6 @@ screen -S qemu-cosim -X stuff 'dmesg | tail -20\n'
 
 # Guest serial output (standalone sim)
 tail -f m5out/board.pc.com_1.device
-```
-
-### Socket Test
-
-```bash
-python3 scripts/cosim_test_client.py /tmp/gem5-mi300x.sock
 ```
 
 ### Incremental Rebuild
@@ -365,7 +344,7 @@ docker run --rm -v "$PWD:/gem5" -w /gem5 \
 | MMIO reads all return zero | gem5 not connected or crashed |
 | `insmod: ERROR: could not load module` | Kernel version mismatch |
 | `cosim-gpu-setup.service` failed | `journalctl -u cosim-gpu-setup` |
-| BAR layout probe error -12 | Rebuild QEMU with correct BAR5=MMIO layout |
+| BAR layout probe error -12 | Check the BAR region descriptors exported by `MI300XVfioUser` |
 
 ---
 
@@ -474,11 +453,9 @@ To use a different mirror, edit the URI in the patch file and re-apply.
 
 | File | Purpose |
 |------|---------|
-| `mi300x_vfio_user.{cc,hh}` | vfio-user server SimObject (**default backend**) |
+| `mi300x_vfio_user.{cc,hh}` | vfio-user server SimObject |
 | `MI300XVfioUser.py` | SimObject Python wrapper (vfio-user) |
-| `cosim_bridge.hh` | Abstract CosimBridge interface (both backends implement this) |
-| `mi300x_gem5_cosim.{cc,hh}` | Legacy socket bridge SimObject |
-| `MI300XGem5Cosim.py` | SimObject Python wrapper (legacy) |
+| `cosim_bridge.hh` | Abstract CosimBridge interface used by the vfio-user server |
 | `amdgpu_device.cc` | GPU device model core, `readROM()`, `intrPost()`, `writeFrame()` |
 | `amdgpu_vm.{cc,hh}` | All translation generators (GART, AGP, MMHUB, User), cosim VRAM fallback |
 | `pm4_packet_processor.{cc,hh}` | PM4 packet decode, DMA routing, VRAM write routing, `isVRAMAddress()` |
@@ -491,13 +468,12 @@ To use a different mirror, edit the URI in the patch file and re-apply.
 
 | File | Purpose |
 |------|---------|
-| `configs/example/gpufs/mi300_cosim.py` | Cosim system config (`--cosim-backend=vfio-user\|legacy`) |
+| `configs/example/gpufs/mi300_cosim.py` | vfio-user cosim system configuration |
 | `configs/example/gem5_library/x86-mi300x-gpu.py` | Standalone stdlib simulation config |
 | `configs/example/gpufs/mi300.py` | Legacy standalone simulation config |
 | `scripts/cosim_launch.sh` | Cosim orchestration (Docker + QEMU launch) |
 | `scripts/run_mi300x_fs.sh` | Build orchestration (compile, disk image, run) |
 | `scripts/Dockerfile.run` | Runtime Docker image definition |
-| `scripts/cosim_test_client.py` | Socket connectivity test tool |
 | `scripts/patches/0001-user-data-cn-mirror.patch` | China mirror patch for disk image build |
 
 ### gem5 Modified Infrastructure Files
@@ -514,21 +490,11 @@ To use a different mirror, edit the URI in the patch file and re-apply.
 | `src/python/gem5/prebuilt/viper/board.py` | ViperBoard: readfile injection, driver loading |
 | `src/python/gem5/components/devices/gpus/amdgpu.py` | MI300X device definition |
 
-### QEMU Files (Legacy Backend Only)
-
-| File | Purpose |
-|------|---------|
-| `qemu/hw/misc/mi300x_gem5.c` | MI300X PCI device with socket bridge |
-| `qemu/hw/misc/mi300x_gem5.h` | Header file |
-| `qemu/hw/misc/trace-events` | Trace event definitions |
-
-> The vfio-user backend uses QEMU's built-in `vfio-user-pci` device. No custom QEMU code is needed.
-
 ### External Dependencies
 
 | Path | Purpose |
 |------|---------|
-| `ext/libvfio-user/` | libvfio-user library (git submodule, vfio-user backend) |
+| `ext/libvfio-user/` | libvfio-user library (git submodule, vfio-user transport) |
 
 ### Guest Disk Image Contents
 
@@ -553,9 +519,9 @@ To use a different mirror, edit the URI in the patch file and re-apply.
 
 Driver constants: `AMDGPU_VRAM_BAR=0`, `AMDGPU_DOORBELL_BAR=2`, `AMDGPU_MMIO_BAR=5`.
 
-### Resource Routing (Both Backends)
+### Resource Routing
 
-| Resource | Via Socket/vfio-user? | Via Shared Memory? |
+| Resource | Via vfio-user? | Via Shared Memory? |
 |----------|----------------------|--------------------|
 | MMIO Registers (BAR5) | Yes | No |
 | VRAM (BAR0, 16 GiB) | **No** | Yes (`/dev/shm/mi300x-vram`) |

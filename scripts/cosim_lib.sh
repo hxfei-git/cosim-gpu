@@ -268,16 +268,16 @@ force_clean_orphans() {
         fi
     done
 
-    # Legacy un-namespaced resources
+    # Un-namespaced resources created by older launchers
     if [[ -e /tmp/gem5-mi300x.sock ]]; then
-        echo "  orphan legacy socket: /tmp/gem5-mi300x.sock"
+        echo "  orphan un-namespaced socket: /tmp/gem5-mi300x.sock"
         found=1
         if [[ "$confirm" == "true" ]]; then
             rm -f /tmp/gem5-mi300x.sock 2>/dev/null || true
         fi
     fi
     if docker ps -a --filter "status=exited" --filter "status=dead" --filter "status=created" --format '{{.Names}}' 2>/dev/null | grep -qx 'gem5-cosim'; then
-        echo "  orphan legacy container: gem5-cosim"
+        echo "  orphan un-namespaced container: gem5-cosim"
         found=1
         if [[ "$confirm" == "true" ]]; then
             docker rm -f gem5-cosim >/dev/null 2>&1 || true

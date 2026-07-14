@@ -3,16 +3,14 @@
 # gem5 MI300X Full-System GPU Simulation - Setup & Run Script
 #
 # Adapted for the local development layout:
-#   /home/zevorn/cosim/
+#   cosim-gpu/
 #     gem5/                     <- gem5 source & build
 #     gem5-resources/           <- disk image, kernel, GPU apps
 #     scripts/                  <- this script
-#     qemu/                     <- QEMU source (for cosim mode)
 #
 # Usage:
 #   ./scripts/run_mi300x_fs.sh build-gem5          # Build gem5 via Docker
-#   ./scripts/run_mi300x_fs.sh build-qemu          # Build QEMU (mi300x-gem5 cosim device)
-#   ./scripts/run_mi300x_fs.sh build-disk           # Build disk image (needs KVM + qemu)
+#   ./scripts/run_mi300x_fs.sh build-disk           # Build disk image (needs KVM + system QEMU)
 #   ./scripts/run_mi300x_fs.sh build-app [name]     # Build GPU test app (default: square)
 #   ./scripts/run_mi300x_fs.sh build-all            # Full setup from scratch
 #   ./scripts/run_mi300x_fs.sh run [app]            # Run with stdlib config (KVM)
@@ -36,10 +34,8 @@ KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
 SQUARE_APP="${RESOURCES_DIR}/src/gpu/square/bin.default/square.default"
 GEM5_BIN="${GEM5_DIR}/build/VEGA_X86/gem5.opt"
 
-# QEMU
-QEMU_DIR="${COSIM_DIR}/qemu"
-QEMU_BUILD_DIR="${QEMU_DIR}/build"
-QEMU_BIN="${QEMU_BUILD_DIR}/qemu-system-x86_64"
+# QEMU is a host dependency, not a project submodule.
+QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 2>/dev/null || true)}"
 
 # Logs
 LOGS_DIR="${COSIM_DIR}/logs"
@@ -133,50 +129,17 @@ build_gem5() {
 }
 
 # ==========================
-# Build QEMU (with mi300x-gem5 cosim device)
-# ==========================
-build_qemu() {
-    info "Building QEMU (x86_64-softmmu) with mi300x-gem5 device..."
-
-    [ -d "$QEMU_DIR" ] || error "QEMU source not found: $QEMU_DIR"
-
-    if [ -f "$QEMU_BIN" ]; then
-        info "QEMU binary already exists: $QEMU_BIN"
-        read -p "Rebuild? [y/N] " -n 1 -r
-        echo
-        [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
-    fi
-
-    mkdir -p "$QEMU_BUILD_DIR"
-    cd "$QEMU_BUILD_DIR"
-
-    if [ ! -f "$QEMU_BUILD_DIR/build.ninja" ]; then
-        info "Configuring QEMU..."
-        "${QEMU_DIR}/configure" --target-list=x86_64-softmmu
-    fi
-
-    local nproc_val
-    nproc_val="$(nproc)"
-    info "Build parallelism: -j${nproc_val}"
-
-    make -j"${nproc_val}"
-
-    [ -f "$QEMU_BIN" ] || error "QEMU build failed"
-    info "QEMU built: $QEMU_BIN"
-}
-
-# ==========================
 # Get gem5-resources
 # ==========================
 get_resources() {
-    if [ -d "$RESOURCES_DIR" ]; then
+    if [ -e "${RESOURCES_DIR}/.git" ]; then
         info "gem5-resources exists: $RESOURCES_DIR"
         return 0
     fi
 
-    info "Cloning gem5-resources..."
-    git clone --depth 1 https://github.com/gem5/gem5-resources.git "$RESOURCES_DIR"
-    info "gem5-resources cloned"
+    info "Initializing gem5-resources submodule..."
+    git -C "$COSIM_DIR" submodule update --init gem5-resources
+    info "gem5-resources initialized"
 }
 
 # ==========================
@@ -186,8 +149,8 @@ build_disk_image() {
     info "Building disk image (Ubuntu 22.04 + ROCm)..."
     info "This takes ~30 min and needs ~60GB disk space"
 
-    [ -x "$QEMU_BIN" ] || \
-        error "Project QEMU not built: $QEMU_BIN. Run: $0 build-qemu"
+    [ -n "$QEMU_BIN" ] && [ -x "$QEMU_BIN" ] || \
+        error "qemu-system-x86_64 not found. Install QEMU or set QEMU_BIN."
     command -v unzip >/dev/null || \
         error "unzip not found. Install: sudo apt install unzip"
     check_kvm || error "KVM required for disk image build"
@@ -208,7 +171,7 @@ build_disk_image() {
     if [ -n "${https_proxy:-}" ]; then
         proxy_args+=(-var "http_proxy=${https_proxy}")
     fi
-    PATH="${QEMU_BUILD_DIR}:$PATH" ./build.sh -var "qemu_path=${QEMU_BIN}" "${proxy_args[@]}" \
+    ./build.sh -var "qemu_path=${QEMU_BIN}" "${proxy_args[@]}" \
         2>&1 | awk '{ print strftime("[%H:%M:%S]"), $0; fflush() }' | tee "$BUILD_DISK_LOG"
 
     [ -f "$DISK_IMAGE" ] || error "Disk image build failed"
@@ -390,14 +353,11 @@ show_status() {
         warn "Docker:          not installed"
     fi
 
-    # QEMU
-    if [ -f "$QEMU_BIN" ]; then
+    # Host QEMU
+    if [ -n "$QEMU_BIN" ] && [ -x "$QEMU_BIN" ]; then
         info "QEMU binary:     $QEMU_BIN"
-    elif [ -d "$QEMU_DIR" ]; then
-        warn "QEMU binary:     NOT BUILT (run: $0 build-qemu)"
-        info "  QEMU source:   $QEMU_DIR"
     else
-        warn "QEMU source:     not found at $QEMU_DIR"
+        warn "QEMU binary:     not found (install qemu-system-x86_64 or set QEMU_BIN)"
     fi
 }
 
@@ -410,10 +370,9 @@ gem5 MI300X Full-System GPU Simulation
 
 Commands:
   build-gem5         Build gem5 (VEGA_X86) via Docker
-  build-qemu         Build QEMU (x86_64-softmmu, with mi300x-gem5 device)
   build-disk         Build disk image (Ubuntu 22.04 + ROCm)
   build-app [name]   Build GPU test app (default: square)
-  build-all          Full setup: gem5 + QEMU + disk image + GPU app
+  build-all          Full setup: gem5 + disk image + GPU app
   run [app]          Run with stdlib config (x86-mi300x-gpu.py)
   run-legacy [app]   Run with legacy config (gpufs/mi300.py)
   status             Show build status
@@ -421,10 +380,10 @@ Commands:
 Environment variables:
   GPU_APP_BUILD_IMAGE  Docker image for GPU app build
                      (default: $GPU_APP_BUILD_IMAGE)
+  QEMU_BIN            System QEMU binary used to build the disk image
 
 Layout:
   gem5 source:       $GEM5_DIR
-  QEMU source:       $QEMU_DIR
   gem5-resources:    $RESOURCES_DIR
   Disk image:        $DISK_IMAGE
   Kernel:            $KERNEL
@@ -443,7 +402,6 @@ main() {
     case "$cmd" in
         build-all)
             build_gem5
-            build_qemu
             get_resources
             build_disk_image
             build_gpu_app "${1:-square}"
@@ -452,9 +410,6 @@ main() {
             ;;
         build-gem5)
             build_gem5
-            ;;
-        build-qemu)
-            build_qemu
             ;;
         build-disk)
             get_resources

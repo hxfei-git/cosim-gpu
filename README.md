@@ -40,6 +40,7 @@ on a simulated GPU without physical hardware.
 | Host OS | Linux x86_64 with KVM (tested on WSL2 6.6.x) |
 | Docker | Running daemon, user in `docker` group |
 | KVM | `/dev/kvm` accessible |
+| QEMU | System-installed QEMU 10.1+ with `vfio-user-pci` |
 | Disk space | ~120 GB (55G disk image + build artifacts) |
 | RAM | 16 GB+ recommended |
 
@@ -48,10 +49,10 @@ on a simulated GPU without physical hardware.
 ### Option A: Script-based
 
 ```bash
-git clone --recurse-submodules git@github.com:zevorn/cosim.git
-cd cosim
+git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
+cd cosim-gpu
 
-# Build gem5 + QEMU + disk image (~2h total, needs KVM + Docker + ~60GB disk)
+# Build gem5 + disk image (~2h total, needs KVM + Docker + ~60GB disk)
 # This auto-builds the Docker image with json-c (needed by ext/libvfio-user)
 ./scripts/run_mi300x_fs.sh build-all
 
@@ -66,24 +67,22 @@ cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
 
 ```bash
 # 1. Clone with submodules
-git clone --recurse-submodules git@github.com:zevorn/cosim.git
-cd cosim
+git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
+cd cosim-gpu
 
-# 2. Build Docker image (adds json-c needed by ext/libvfio-user)
+# 2. Verify the host QEMU installation (no QEMU source submodule is required)
+qemu-system-x86_64 --version
+qemu-system-x86_64 -device help | grep vfio-user-pci
+
+# 3. Build Docker image (adds json-c needed by ext/libvfio-user)
 cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
 
-# 3. Build gem5 (in Docker, ~30min; use -j1 if OOM-killed during linking)
+# 4. Build gem5 (in Docker, ~30min; use -j1 if OOM-killed during linking)
 cd gem5
 docker run --rm -v "$(pwd):/gem5" -w /gem5 \
     gem5-run:local \
     scons build/VEGA_X86/gem5.opt -j4
 cd ..
-
-# 4. Build QEMU (stock build; vfio-user-pci is built-in since QEMU 10.0)
-cd qemu && mkdir -p build && cd build
-../configure --target-list=x86_64-softmmu
-make -j$(nproc)
-cd ../..
 
 # 5. Pre-build m5 utility (recommended — avoids git clone inside guest VM)
 docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 \
@@ -140,18 +139,17 @@ EOF
 ## Repository Structure
 
 ```
-cosim/
+cosim-gpu/
 |-- gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
 |   |-- src/dev/amdgpu/      # MI300X GPU device model & vfio-user bridge
 |   |-- ext/libvfio-user/    # libvfio-user library (Nutanix)
 |   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
-|-- qemu/                    # QEMU emulator (submodule, stock QEMU 10.0+)
 |-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
+|-- .agents/                 # reusable repository workflows (submodule)
 |-- scripts/                 # build & launch scripts
 |   |-- cosim_launch.sh      # one-click cosim launcher
 |   |-- run_mi300x_fs.sh     # build orchestration
 |   |-- cosim_guest_setup.sh # guest-side GPU setup
-|   |-- cosim_test_client.py # socket test client
 |   `-- Dockerfile.run       # gem5 runtime Docker image
 |-- docs/                    # technical documentation (zh + en)
 |   |-- en/                  # English
@@ -201,8 +199,8 @@ Detailed technical documentation is available in [`docs/`](docs/README.md):
 
 This project is licensed under the [Apache License 2.0](LICENSE).
 
-Note: The `gem5` and `qemu` submodules are governed by their own respective
-licenses (gem5: BSD-3-Clause, QEMU: GPL-2.0).
+Note: The submodules are governed by their own licenses. QEMU is a host runtime
+dependency and is not vendored by this repository.
 
 ## Acknowledgments
 

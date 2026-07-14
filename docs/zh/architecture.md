@@ -12,10 +12,7 @@
   - [组件图](#组件图)
   - [关键组件](#关键组件)
   - [通信通道](#通信通道)
-- [vfio-user 与 Legacy 后端](#vfio-user-与-legacy-后端)
-  - [vfio-user 后端（默认）](#vfio-user-后端默认)
-  - [Legacy Socket 后端](#legacy-socket-后端)
-  - [后端对比](#后端对比)
+- [vfio-user 传输层](#vfio-user-传输层)
 - [PCI BAR 布局](#pci-bar-布局)
 - [内存共享架构](#内存共享架构)
   - [三个共享通道](#三个共享通道)
@@ -38,8 +35,7 @@
   - [PM4 Packet Processor 路由](#pm4-packet-processor-路由)
   - [SDMA 引擎路由](#sdma-引擎路由)
   - [VRAM vs. 系统内存检测](#vram-vs-系统内存检测)
-  - [vfio-user 后端：共享内存直接访问](#vfio-user-后端共享内存直接访问)
-  - [Legacy 后端：Socket DMA 协议](#legacy-后端socket-dma-协议)
+  - [共享内存直接访问](#共享内存直接访问)
   - [中断处理器（IH）DMA](#中断处理器ihdma)
   - [完整数据流示例](#完整数据流示例)
 - [MSI-X 中断转发](#msi-x-中断转发)
@@ -53,10 +49,9 @@
   - [流量控制](#流量控制)
   - [架构阶段](#架构阶段)
 - [设计历程与关键决策](#设计历程与关键决策)
-  - [为什么选择 vfio-user 而非自定义协议](#为什么选择-vfio-user-而非自定义协议)
+  - [vfio-user 传输边界](#vfio-user-传输边界)
   - [为什么选择 Q35 + KVM](#为什么选择-q35-kvm)
   - [共享内存设计](#共享内存设计)
-  - [SIGIO 边沿触发排空](#sigio-边沿触发排空)
   - [GART 回退方案](#gart-回退方案)
   - [VRAM 路由发现](#vram-路由发现)
 
@@ -112,12 +107,10 @@ gem5 运行在 Docker 容器内，使用 `StubWorkload`（不运行 Linux 内核
 
 | 组件 | 位置 | 作用 |
 |---|---|---|
-| `MI300XVfioUser` | `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5 vfio-user 服务端；通过 libvfio-user 处理 BAR 访问和中断（默认后端） |
+| `MI300XVfioUser` | `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5 vfio-user 服务端；通过 libvfio-user 处理 BAR 访问和中断 |
 | `vfio-user-pci` | QEMU 内建设备 | QEMU 侧 vfio-user 客户端；无需自定义 QEMU 代码 |
-| `CosimBridge` | `src/dev/amdgpu/cosim_bridge.hh` | 抽象协同仿真桥接接口，vfio-user 和 legacy 后端均实现此接口 |
-| `MI300XGem5Cosim` | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | 旧版 socket 桥接 SimObject |
-| `mi300x_gem5.c` | `qemu/hw/misc/` | 旧版 QEMU PCI 设备；通过自定义 socket 协议转发 MMIO/doorbell |
-| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 配置；通过 `--cosim-backend=vfio-user|legacy` 选择后端 |
+| `CosimBridge` | `src/dev/amdgpu/cosim_bridge.hh` | `MI300XVfioUser` 使用的抽象桥接接口 |
+| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 vfio-user 协同仿真配置 |
 | `cosim_launch.sh` | `scripts/` | 编排 Docker (gem5) + QEMU 的启动流程 |
 
 ### 通信通道
@@ -130,39 +123,15 @@ gem5 运行在 Docker 容器内，使用 `StubWorkload`（不运行 Linux 内核
 
 ---
 
-## vfio-user 与 Legacy 后端
+## vfio-user 传输层
 
-协同仿真系统支持两种通信后端，通过 gem5 配置中的 `--cosim-backend=vfio-user|legacy` 选择。
+协同仿真系统使用行业标准的 vfio-user 协议（QEMU 10.1+ 内置支持）。
+gem5 侧使用 Nutanix 的 libvfio-user 库作为服务端。
 
-### vfio-user 后端（默认）
-
-vfio-user 后端使用行业标准的 vfio-user 协议（QEMU 10.0+ 内置支持）。gem5 侧使用 Nutanix 的 libvfio-user 库作为服务端。
-
-- **QEMU 侧**：使用内建的 `vfio-user-pci` 设备。无需自定义 QEMU 代码；任何原生 QEMU 10.0+ 构建均可使用。
+- **QEMU 侧**：使用内建的 `vfio-user-pci` 设备。无需自定义 QEMU 代码；任何原生 QEMU 10.1+ 构建均可使用。
 - **gem5 侧**：`MI300XVfioUser` 向 libvfio-user 注册 BAR 区域、配置空间和 MSI-X capability，然后处理来自 QEMU 的请求。
 - **DMA**：gem5 通过 Ruby 内存系统的共享后端直接访问 Guest RAM，无需 socket 往返。
-- **中断**：通过 `irq_fd`（注入 KVM 的 eventfd）传递，不需要自定义中断消息。
-
-### Legacy Socket 后端
-
-旧版后端使用自定义的 `mi300x-gem5` QEMU PCI 设备和基于两条 Unix socket 连接的自定义二进制协议：
-
-- **同步连接**：MMIO 请求-响应对（QEMU 发送写/读，gem5 响应）。
-- **异步连接**：gem5 向 QEMU 发送 IRQ raise/lower 事件和 DMA 读写请求。
-
-此后端需要从 `cosim/qemu/` 目录编译的 QEMU。
-
-### 后端对比
-
-| 维度 | vfio-user 后端 | Legacy Socket 后端 |
-|------|---------------|-------------------|
-| Guest RAM DMA | Ruby 内存系统直接访问共享后端 | Socket 请求-响应协议 |
-| VRAM 访问 | mmap 零拷贝 | mmap 零拷贝 |
-| 中断 | irq_fd（eventfd -> KVM） | 自定义 socket 消息 |
-| MMIO | vfio-user 消息传递 | 自定义二进制协议 |
-| QEMU 侧设备 | 内置 `vfio-user-pci` | 自定义 `mi300x_gem5.c` |
-| 地址转换 | gem5 内部 GART 转换 | QEMU 端 `pci_dma_read/write` |
-| QEMU 版本 | 原生 QEMU 10.0+ | 需要自定义分支 |
+- **中断**：通过 `irq_fd`（注入 KVM 的 eventfd）传递。
 
 ---
 
@@ -180,9 +149,9 @@ BAR5    MMIO regs    32-bit                512 KiB  (forwarded to gem5)
 | BAR | 内容 | 大小 | 通信方式 |
 |-----|------|------|---------|
 | BAR0+1 | VRAM | 16 GiB | 共享内存（零拷贝 mmap） |
-| BAR2+3 | Doorbell | 4 MiB | Socket 转发（vfio-user 或 legacy） |
+| BAR2+3 | Doorbell | 4 MiB | vfio-user 转发 |
 | BAR4 | MSI-X | 256 vectors | QEMU 本地 |
-| BAR5 | MMIO 寄存器 | 512 KiB | Socket 转发（vfio-user 或 legacy） |
+| BAR5 | MMIO 寄存器 | 512 KiB | vfio-user 转发 |
 
 BAR0+1 和 BAR2+3 是 64 位 BAR（16 GiB VRAM 无法放入 32 位地址空间）。在 PCI BAR size probing 期间，每个 64 位 BAR 的上半部分必须返回 size mask 的高 32 位。
 
@@ -642,9 +611,9 @@ else
 
 如果没有此检查，VRAM 地址会被送入 `getGARTAddr()` 导致页号乘以 8，GART 转换失败（VRAM 地址没有对应的页表项）。三层防护（PM4 层、SDMA 层、GART 回退 sink）防止仿真崩溃。
 
-### vfio-user 后端：共享内存直接访问
+### 共享内存直接访问
 
-在 vfio-user 后端下，gem5 通过 Ruby 内存系统的共享后端直接访问 Guest RAM，无需基于 socket 的 DMA 操作：
+通过 vfio-user 传输层时，gem5 经由 Ruby 内存系统的共享后端直接访问 Guest RAM，无需基于 socket 的 DMA 操作：
 
 ```
 gem5 GPU model (PM4/SDMA/IH)
@@ -670,51 +639,6 @@ gem5 GPU model (PM4/SDMA/IH)
 - **低延迟**：省去了 socket 请求-响应的往返开销
 - **简化架构**：无需自定义 DMA 协议，Ruby 内存系统天然支持共享后端
 
-### Legacy 后端：Socket DMA 协议
-
-旧版后端通过 socket 使用自定义二进制协议路由 DMA。
-
-**gem5 读取 Guest RAM**（ring buffer / fence）：
-
-```
-gem5 GPU model (PM4/SDMA/IH)
-  |
-  v cosimBridge->sendDmaRead(guestPhysAddr, length)
-  |
-  +- Construct DmaRead message (32-byte header)
-  |   { type=DmaRead, addr=guestPhysAddr, data=length }
-  |
-  +- sendAll(eventFd, &msg, 32)        -->  QEMU event thread
-  |                                           |
-  |                                           +- pci_dma_read(addr, buf, len)
-  |                                           |  (reads from /dev/shm/cosim-guest-ram)
-  |                                           |
-  |                                           +- sendAll(eventFd, &resp, 32)
-  |  <------------------------------------------+- sendAll(eventFd, data, len)
-  |
-  +- memcpy(dest, recvBuf, length)     // data arrives at gem5
-```
-
-**gem5 写入 Guest RAM**（fence / IH cookie）：
-
-```
-gem5 GPU model
-  |
-  v cosimBridge->sendDmaWrite(guestPhysAddr, length, data)
-  |
-  +- Construct DmaWrite message + data payload
-  |   { type=DmaWrite, addr=guestPhysAddr, data=length, size=length }
-  |
-  +- sendAll(eventFd, &msg, 32)        -->  QEMU event thread
-  +- sendAll(eventFd, data, length)    -->    |
-  |                                           +- pci_dma_write(addr, buf, len)
-  |                                           |  (writes to /dev/shm/cosim-guest-ram)
-  |
-  +- Done (DMA writes don't wait for response)
-```
-
-Legacy 后端的单次 DMA 最大传输量为 4 MiB（`COSIM_DMA_BUF_SIZE`）。实际场景中驱动通常以页为单位提交。
-
 ### 中断处理器（IH）DMA
 
 中断处理器使用原始系统物理地址（非 GART）：
@@ -730,7 +654,7 @@ Wptr Address:    regs.WptrAddr    (from IH_RB_WPTR_ADDR registers)
 2. 将更新后的写指针写入 `WptrAddr`
 3. 调用 `intrPost()` 向 Guest 发送 MSI-X 中断
 
-在协同仿真模式下，DMA 写入落入共享 Guest RAM（`/dev/shm/cosim-guest-ram`），中断通过 vfio-user 的 irq_fd 机制（或 legacy 后端的 event socket）转发给 QEMU。
+在协同仿真模式下，DMA 写入落入共享 Guest RAM（`/dev/shm/cosim-guest-ram`），中断通过 vfio-user 的 irq_fd 机制转发给 QEMU。
 
 ### 完整数据流示例
 
@@ -784,9 +708,8 @@ Fence 写入（RELEASE_MEM）的地址转换细节：
 
 ### 中断传递路径
 
-GPU 通过 MSI-X 中断向 Guest 发出完成事件信号（fence 回写、IH ring 条目）。中断传递链在不同后端中有所不同：
-
-**vfio-user 后端**：
+GPU 通过 MSI-X 中断向 Guest 发出完成事件信号（fence 回写、IH ring 条目）。
+中断传递链如下：
 
 ```
 gem5 AMDGPUDevice::intrPost()
@@ -802,24 +725,8 @@ gem5 AMDGPUDevice::intrPost()
        reads IH ring buffer from Guest RAM
 ```
 
-vfio-user 后端使用注册到 KVM 的 eventfd 描述符（`irq_fd`）。当 gem5 触发中断时，它写入 eventfd，KVM 直接将中断注入 Guest——热路径无需 QEMU 参与。
-
-**Legacy 后端**：
-
-```
-gem5 AMDGPUDevice::intrPost()
-  |
-  +-> cosimBridge->sendIrqRaise(0)
-  |
-  +-> MI300XGem5Cosim: send IrqRaise message via event socket
-  |
-  +-> QEMU mi300x_gem5.c: event thread receives message
-  |     msix_notify(pci_dev, vector)
-  |
-  +-> KVM injects MSI-X interrupt into guest
-  |
-  +-> Guest IH handler processes interrupt
-```
+vfio-user 传输层使用注册到 KVM 的 eventfd 描述符（`irq_fd`）。当 gem5 触发
+中断时，它写入 eventfd，KVM 直接将中断注入 Guest——热路径无需 QEMU 参与。
 
 设备支持 256 个 MSI-X 向量（BAR4）。
 
@@ -914,13 +821,12 @@ GPU N: [N * vram_size, (N+1) * vram_size)
 
 本节记录了塑造协同仿真系统的关键架构决策和重要 bug 修复洞察。
 
-### 为什么选择 vfio-user 而非自定义协议
+### vfio-user 传输边界
 
-初始实现使用自定义二进制协议，通过两条 Unix socket 连接传输（一条同步用于 MMIO，一条异步用于事件）。这种方式可以工作，但需要维护一个自定义 QEMU PCI 设备（`mi300x_gem5.c`）和自定义协议定义。
+vfio-user 传输层让 QEMU 侧保持为系统安装的原版二进制，并将 GPU 模型集成
+集中在 gem5 中。设计基于三个因素：
 
-迁移到 vfio-user 由三个因素驱动：
-
-1. **无需自定义 QEMU 代码**：任何原生 QEMU 10.0+ 构建都可以通过内置的 `vfio-user-pci` 设备直接连接 gem5，无需维护 QEMU 分支。
+1. **无需自定义 QEMU 代码**：任何原生 QEMU 10.1+ 构建都可以通过内置的 `vfio-user-pci` 设备直接连接 gem5。
 2. **协议标准化**：BAR 映射、配置空间、中断和 DMA 全部由 vfio-user 规范定义，减少了协议层面的 bug 可能性。
 3. **更简单的部署**：用户只需构建支持 libvfio-user 的 gem5；QEMU 直接使用原生版本。
 
@@ -948,24 +854,6 @@ vfio-user 迁移过程中解决的问题：
 
 将两者合并到一个文件中会引入复杂的偏移算术和两个独立地址空间之间的耦合。
 
-### SIGIO 边沿触发排空
-
-gem5 的 `PollQueue` 使用 `FASYNC`/`SIGIO` 监听 socket，这是边沿触发的：当 socket 缓冲区从空变为非空时，内核发送一次 `SIGIO`，且仅此一次。
-
-amdgpu 驱动频繁地先写 INDEX 寄存器（选择要访问的内部寄存器），然后立即读 DATA 寄存器（获取值）。这两条消息背靠背到达 gem5 的 socket 缓冲区，但只会触发一次 SIGIO。如果消息处理器每次只读一条消息，第二条消息就会留在缓冲区中，没有信号唤醒 gem5。QEMU 阻塞等待读响应。结果：处理 15 条消息后死锁。
-
-修复方案：使用 `do/while` 排空循环配合 `poll(fd, POLLIN, 0)`，在每次 SIGIO 到来时消费所有待处理消息：
-
-```cpp
-do {
-    // read and process one message
-    ...
-    struct pollfd pfd = {fd, POLLIN, 0};
-} while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN));
-```
-
-此问题仅影响 legacy 后端。vfio-user 后端使用 libvfio-user 的非阻塞 poll 机制。
-
 ### GART 回退方案
 
 在独立 gem5 模式下，GART 条目维护在哈希表（`gartTable`）中，由 `writeFrame()` 和 SDMA 影子拷贝填充。在协同仿真中，驱动通过 QEMU 的 BAR0 映射写入 GART PTE，直接进入共享 VRAM，不经过 gem5 的 `writeFrame()`。哈希表为空。
@@ -990,8 +878,7 @@ do {
 
 | 文件 | 作用 |
 |------|------|
-| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | vfio-user 服务端 SimObject（默认后端） |
-| `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | 旧版 socket 桥接 SimObject |
+| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | vfio-user 服务端 SimObject |
 | `src/dev/amdgpu/cosim_bridge.hh` | 抽象 CosimBridge 接口 |
 | `src/dev/amdgpu/amdgpu_vm.{cc,hh}` | 所有转换生成器（GART、AGP、MMHUB、User） |
 | `src/dev/amdgpu/pm4_packet_processor.{cc,hh}` | PM4 DMA 路由、VRAM 检测、`getGARTAddr` |
@@ -999,5 +886,5 @@ do {
 | `src/dev/amdgpu/interrupt_handler.cc` | IH ring buffer DMA 和中断传递 |
 | `src/dev/amdgpu/amdgpu_device.cc` | 设备级 `intrPost()`、`writeFrame()` |
 | `src/dev/amdgpu/xgmi_bridge.{cc,hh}` | xGMI 互连桥接 |
-| `configs/example/gpufs/mi300_cosim.py` | 系统配置、内存设置、后端选择 |
+| `configs/example/gpufs/mi300_cosim.py` | 系统配置和内存设置 |
 | `scripts/cosim_launch.sh` | 启动编排 |

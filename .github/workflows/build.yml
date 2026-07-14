@@ -1,4 +1,4 @@
-# Compile verification for gem5 and QEMU (push to main + manual)
+# Compile verification for gem5 (push to main + manual)
 name: Build
 
 on:
@@ -6,7 +6,6 @@ on:
     branches: [main]
     paths:
       - 'gem5'
-      - 'qemu'
       - '.gitmodules'
       - 'scripts/Dockerfile.run'
       - '.github/workflows/build.yml'
@@ -14,7 +13,6 @@ on:
     branches: [main]
     paths:
       - 'gem5'
-      - 'qemu'
       - '.gitmodules'
       - 'scripts/Dockerfile.run'
   workflow_dispatch:
@@ -53,36 +51,3 @@ jobs:
 
       - name: Verify binary
         run: test -f gem5/build/VEGA_X86/gem5.opt
-
-  build-qemu:
-    name: Build QEMU (x86_64-softmmu)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Init qemu submodule
-        run: |
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git submodule update --init --depth 1 qemu
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            build-essential meson ninja-build pkg-config \
-            libglib2.0-dev libpixman-1-dev libslirp-dev
-
-      - name: Configure QEMU
-        run: |
-          cd qemu
-          mkdir -p build && cd build
-          ../configure --target-list=x86_64-softmmu
-
-      - name: Build QEMU
-        run: make -C qemu/build -j"$(nproc)"
-
-      - name: Verify binary
-        run: test -f qemu/build/qemu-system-x86_64

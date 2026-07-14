@@ -12,10 +12,7 @@ This document provides a deep-dive into the architecture and design of the QEMU 
   - [Component Diagram](#component-diagram)
   - [Key Components](#key-components)
   - [Communication Channels](#communication-channels)
-- [vfio-user and Legacy Backends](#vfio-user-and-legacy-backends)
-  - [vfio-user Backend (Default)](#vfio-user-backend-default)
-  - [Legacy Socket Backend](#legacy-socket-backend)
-  - [Backend Comparison](#backend-comparison)
+- [vfio-user Transport](#vfio-user-transport)
 - [PCI BAR Layout](#pci-bar-layout)
 - [Memory Sharing Architecture](#memory-sharing-architecture)
   - [Three Sharing Channels](#three-sharing-channels)
@@ -38,8 +35,7 @@ This document provides a deep-dive into the architecture and design of the QEMU 
   - [PM4 Packet Processor Routing](#pm4-packet-processor-routing)
   - [SDMA Engine Routing](#sdma-engine-routing)
   - [VRAM vs. System Memory Detection](#vram-vs-system-memory-detection)
-  - [vfio-user Backend: Shared Memory Direct Access](#vfio-user-backend-shared-memory-direct-access)
-  - [Legacy Backend: Socket DMA Protocol](#legacy-backend-socket-dma-protocol)
+  - [Shared Memory Direct Access](#shared-memory-direct-access)
   - [Interrupt Handler (IH) DMA](#interrupt-handler-ih-dma)
   - [Complete Data Flow Example](#complete-data-flow-example)
 - [MSI-X Interrupt Forwarding](#msi-x-interrupt-forwarding)
@@ -53,10 +49,9 @@ This document provides a deep-dive into the architecture and design of the QEMU 
   - [Flow Control](#flow-control)
   - [Architecture Phases](#architecture-phases)
 - [Design History and Key Decisions](#design-history-and-key-decisions)
-  - [Why vfio-user Over a Custom Protocol](#why-vfio-user-over-a-custom-protocol)
+  - [vfio-user Transport Boundary](#vfio-user-transport-boundary)
   - [Why Q35 + KVM](#why-q35-kvm)
   - [Shared Memory Design](#shared-memory-design)
-  - [SIGIO Edge-Triggered Drain](#sigio-edge-triggered-drain)
   - [GART Fallback Approach](#gart-fallback-approach)
   - [VRAM Routing Discovery](#vram-routing-discovery)
 
@@ -112,12 +107,10 @@ gem5 runs inside a Docker container with a `StubWorkload` (no Linux kernel of it
 
 | Component | Location | Purpose |
 |---|---|---|
-| `MI300XVfioUser` | `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5 vfio-user server; handles BAR access and interrupts via libvfio-user (default backend) |
+| `MI300XVfioUser` | `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | gem5 vfio-user server; handles BAR access and interrupts via libvfio-user |
 | `vfio-user-pci` | QEMU built-in device | QEMU-side vfio-user client; no custom QEMU code needed |
-| `CosimBridge` | `src/dev/amdgpu/cosim_bridge.hh` | Abstract co-simulation bridge interface, implemented by both backends |
-| `MI300XGem5Cosim` | `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | Legacy socket bridge SimObject |
-| `mi300x_gem5.c` | `qemu/hw/misc/` | Legacy QEMU PCI device; forwards MMIO/doorbell via custom socket protocol |
-| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 config; selects backend via `--cosim-backend=vfio-user|legacy` |
+| `CosimBridge` | `src/dev/amdgpu/cosim_bridge.hh` | Abstract bridge interface used by `MI300XVfioUser` |
+| `mi300_cosim.py` | `configs/example/gpufs/` | gem5 vfio-user co-simulation configuration |
 | `cosim_launch.sh` | `scripts/` | Orchestrates Docker (gem5) + QEMU launch sequence |
 
 ### Communication Channels
@@ -130,39 +123,16 @@ The system uses three distinct channels between QEMU and gem5:
 
 ---
 
-## vfio-user and Legacy Backends
+## vfio-user Transport
 
-The co-simulation system supports two communication backends, selectable via `--cosim-backend=vfio-user|legacy` in the gem5 configuration.
+The co-simulation system uses the industry-standard vfio-user protocol (QEMU
+10.1+ built-in support). On the gem5 side, Nutanix's libvfio-user library acts
+as the server.
 
-### vfio-user Backend (Default)
-
-The vfio-user backend uses the industry-standard vfio-user protocol (QEMU 10.0+ built-in support). On the gem5 side, Nutanix's libvfio-user library acts as the server.
-
-- **QEMU side**: Uses the built-in `vfio-user-pci` device. No custom QEMU code is required; any stock QEMU 10.0+ build works.
+- **QEMU side**: Uses the built-in `vfio-user-pci` device. No custom QEMU code is required; any stock QEMU 10.1+ build works.
 - **gem5 side**: `MI300XVfioUser` registers BAR regions, configuration space, and MSI-X capabilities with libvfio-user, then serves requests from QEMU.
 - **DMA**: gem5 accesses Guest RAM directly through the Ruby memory system's shared backstore, with no socket round-trips.
-- **Interrupts**: Delivered via `irq_fd` (eventfd injected into KVM), eliminating custom interrupt messages.
-
-### Legacy Socket Backend
-
-The legacy backend uses a custom `mi300x-gem5` QEMU PCI device and a custom binary protocol over two Unix socket connections:
-
-- **Synchronous connection**: MMIO request-response pairs (QEMU sends write/read, gem5 responds).
-- **Asynchronous connection**: gem5 sends IRQ raise/lower events and DMA read/write requests to QEMU.
-
-This backend requires a QEMU build from the `cosim/qemu/` directory.
-
-### Backend Comparison
-
-| Dimension | vfio-user Backend | Legacy Socket Backend |
-|-----------|-------------------|----------------------|
-| Guest RAM DMA | Ruby memory system direct access to shared backstore | Socket request-response protocol |
-| VRAM access | mmap zero-copy | mmap zero-copy |
-| Interrupts | irq_fd (eventfd -> KVM) | Custom socket messages |
-| MMIO | vfio-user message passing | Custom binary protocol |
-| QEMU-side device | Built-in `vfio-user-pci` | Custom `mi300x_gem5.c` |
-| Address translation | gem5-internal GART translation | QEMU-side `pci_dma_read/write` |
-| QEMU version | Stock QEMU 10.0+ | Custom fork required |
+- **Interrupts**: Delivered via `irq_fd` (eventfd injected into KVM).
 
 ---
 
@@ -180,9 +150,9 @@ BAR5    MMIO regs    32-bit                512 KiB  (forwarded to gem5)
 | BAR | Content | Size | Communication Method |
 |-----|---------|------|---------------------|
 | BAR0+1 | VRAM | 16 GiB | Shared memory (zero-copy mmap) |
-| BAR2+3 | Doorbell | 4 MiB | Socket forwarding (vfio-user or legacy) |
+| BAR2+3 | Doorbell | 4 MiB | vfio-user forwarding |
 | BAR4 | MSI-X | 256 vectors | QEMU local |
-| BAR5 | MMIO registers | 512 KiB | Socket forwarding (vfio-user or legacy) |
+| BAR5 | MMIO registers | 512 KiB | vfio-user forwarding |
 
 BAR0+1 and BAR2+3 are 64-bit BARs (16 GiB VRAM cannot fit in the 32-bit address space). During PCI BAR size probing, the upper half of each 64-bit BAR must return the high 32 bits of the size mask.
 
@@ -642,9 +612,9 @@ else
 
 Without this check, VRAM addresses fed through `getGARTAddr()` have their page numbers multiplied by 8, and GART translation fails because VRAM addresses have no corresponding page table entries. The three-layer defense (PM4 layer, SDMA layer, GART fallback sink) prevents this from crashing the simulation.
 
-### vfio-user Backend: Shared Memory Direct Access
+### Shared Memory Direct Access
 
-With the vfio-user backend, gem5 accesses Guest RAM directly through the Ruby memory system's shared backstore, with no socket-based DMA operations:
+With the vfio-user transport, gem5 accesses Guest RAM directly through the Ruby memory system's shared backstore, with no socket-based DMA operations:
 
 ```
 gem5 GPU model (PM4/SDMA/IH)
@@ -670,51 +640,6 @@ Advantages:
 - **Low latency**: Eliminates the socket request-response round-trip overhead
 - **Simplified architecture**: No custom DMA protocol needed; Ruby's memory system natively supports shared backstores
 
-### Legacy Backend: Socket DMA Protocol
-
-The legacy backend routes DMA through the socket using a custom binary protocol.
-
-**gem5 reads from Guest RAM** (ring buffers / fences):
-
-```
-gem5 GPU model (PM4/SDMA/IH)
-  |
-  v cosimBridge->sendDmaRead(guestPhysAddr, length)
-  |
-  +- Construct DmaRead message (32-byte header)
-  |   { type=DmaRead, addr=guestPhysAddr, data=length }
-  |
-  +- sendAll(eventFd, &msg, 32)        -->  QEMU event thread
-  |                                           |
-  |                                           +- pci_dma_read(addr, buf, len)
-  |                                           |  (reads from /dev/shm/cosim-guest-ram)
-  |                                           |
-  |                                           +- sendAll(eventFd, &resp, 32)
-  |  <------------------------------------------+- sendAll(eventFd, data, len)
-  |
-  +- memcpy(dest, recvBuf, length)     // data arrives at gem5
-```
-
-**gem5 writes to Guest RAM** (fences / IH cookies):
-
-```
-gem5 GPU model
-  |
-  v cosimBridge->sendDmaWrite(guestPhysAddr, length, data)
-  |
-  +- Construct DmaWrite message + data payload
-  |   { type=DmaWrite, addr=guestPhysAddr, data=length, size=length }
-  |
-  +- sendAll(eventFd, &msg, 32)        -->  QEMU event thread
-  +- sendAll(eventFd, data, length)    -->    |
-  |                                           +- pci_dma_write(addr, buf, len)
-  |                                           |  (writes to /dev/shm/cosim-guest-ram)
-  |
-  +- Done (DMA writes don't wait for response)
-```
-
-Maximum single DMA transfer in the legacy backend is 4 MiB (`COSIM_DMA_BUF_SIZE`). In practice, the driver typically submits page-sized transfers.
-
 ### Interrupt Handler (IH) DMA
 
 The interrupt handler uses raw system physical addresses (not GART):
@@ -730,7 +655,7 @@ These are GPAs (Guest Physical Addresses) programmed by the driver. The IH write
 2. Write the updated write pointer to `WptrAddr`
 3. Call `intrPost()` to send an MSI-X interrupt to the guest
 
-In co-simulation mode, DMA writes land in shared guest RAM (`/dev/shm/cosim-guest-ram`), and interrupts are forwarded to QEMU via the vfio-user irq_fd mechanism (or event socket in the legacy backend).
+In co-simulation mode, DMA writes land in shared guest RAM (`/dev/shm/cosim-guest-ram`), and interrupts are forwarded to QEMU via the vfio-user irq_fd mechanism.
 
 ### Complete Data Flow Example
 
@@ -784,9 +709,8 @@ A fence write (RELEASE_MEM) example showing address translation detail:
 
 ### Interrupt Delivery Path
 
-The GPU signals completion events (fence write-backs, IH ring entries) to the guest via MSI-X interrupts. The interrupt delivery chain differs between backends:
-
-**vfio-user backend**:
+The GPU signals completion events (fence write-backs, IH ring entries) to the
+guest via MSI-X interrupts. The interrupt delivery chain is:
 
 ```
 gem5 AMDGPUDevice::intrPost()
@@ -802,24 +726,9 @@ gem5 AMDGPUDevice::intrPost()
        reads IH ring buffer from Guest RAM
 ```
 
-The vfio-user backend uses eventfd descriptors (`irq_fd`) registered with KVM. When gem5 triggers an interrupt, it writes to the eventfd, and KVM directly injects the interrupt into the guest -- no QEMU involvement in the hot path.
-
-**Legacy backend**:
-
-```
-gem5 AMDGPUDevice::intrPost()
-  |
-  +-> cosimBridge->sendIrqRaise(0)
-  |
-  +-> MI300XGem5Cosim: send IrqRaise message via event socket
-  |
-  +-> QEMU mi300x_gem5.c: event thread receives message
-  |     msix_notify(pci_dev, vector)
-  |
-  +-> KVM injects MSI-X interrupt into guest
-  |
-  +-> Guest IH handler processes interrupt
-```
+The vfio-user transport uses eventfd descriptors (`irq_fd`) registered with
+KVM. When gem5 triggers an interrupt, it writes to the eventfd, and KVM directly
+injects the interrupt into the guest -- no QEMU involvement in the hot path.
 
 The device supports 256 MSI-X vectors (BAR4).
 
@@ -914,13 +823,13 @@ Credit-based back-pressure prevents data loss:
 
 This section documents the key architectural decisions and critical bug-fix insights that shaped the co-simulation system.
 
-### Why vfio-user Over a Custom Protocol
+### vfio-user Transport Boundary
 
-The initial implementation used a custom binary protocol over two Unix socket connections (one synchronous for MMIO, one asynchronous for events). This worked but required maintaining a custom QEMU PCI device (`mi300x_gem5.c`) and a custom protocol definition.
+The vfio-user transport keeps the QEMU side on a stock, system-installed binary
+and concentrates the GPU model integration in gem5. The design is based on
+three factors:
 
-The migration to vfio-user was driven by three factors:
-
-1. **No custom QEMU code**: Any stock QEMU 10.0+ build can connect to gem5 directly via the built-in `vfio-user-pci` device, eliminating the need to maintain a QEMU fork.
+1. **No custom QEMU code**: Any stock QEMU 10.1+ build can connect to gem5 directly via the built-in `vfio-user-pci` device.
 2. **Protocol standardization**: BAR mapping, configuration space, interrupts, and DMA are all defined by the vfio-user specification, reducing the surface area for protocol bugs.
 3. **Simpler deployment**: Users only need to build gem5 with libvfio-user support; QEMU is used as-is.
 
@@ -948,24 +857,6 @@ The decision to use two separate POSIX shared memory files (`/dev/shm/cosim-gues
 
 Combining them into one file would introduce complex offset arithmetic and coupling between two independent address spaces.
 
-### SIGIO Edge-Triggered Drain
-
-gem5's `PollQueue` uses `FASYNC`/`SIGIO` for socket monitoring, which is edge-triggered: the kernel sends one `SIGIO` when the socket buffer transitions from empty to non-empty, and only one.
-
-The amdgpu driver frequently writes an INDEX register (selecting which internal register to access) then immediately reads the DATA register (getting the value). These two messages arrive back-to-back in gem5's socket buffer, but only one SIGIO fires. If the message handler reads only one message per invocation, the second message sits in the buffer with no signal to wake gem5. QEMU blocks waiting for the read response. Result: deadlock after 15 messages.
-
-The fix: a `do/while` drain loop with `poll(fd, POLLIN, 0)` that consumes all pending messages on each SIGIO arrival:
-
-```cpp
-do {
-    // read and process one message
-    ...
-    struct pollfd pfd = {fd, POLLIN, 0};
-} while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN));
-```
-
-This issue only affects the legacy backend. The vfio-user backend uses libvfio-user's non-blocking poll mechanism.
-
 ### GART Fallback Approach
 
 In standalone gem5 mode, GART entries are maintained in a hash map (`gartTable`), populated by `writeFrame()` and SDMA shadow copies. In co-simulation, the driver writes GART PTEs through QEMU's BAR0 mapping, going directly into shared VRAM without passing through gem5's `writeFrame()`. The hash map is empty.
@@ -990,8 +881,7 @@ The fix was a three-layer defense:
 
 | File | Purpose |
 |------|---------|
-| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | vfio-user server SimObject (default backend) |
-| `src/dev/amdgpu/mi300x_gem5_cosim.{cc,hh}` | Legacy socket bridge SimObject |
+| `src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | vfio-user server SimObject |
 | `src/dev/amdgpu/cosim_bridge.hh` | Abstract CosimBridge interface |
 | `src/dev/amdgpu/amdgpu_vm.{cc,hh}` | All translation generators (GART, AGP, MMHUB, User) |
 | `src/dev/amdgpu/pm4_packet_processor.{cc,hh}` | PM4 DMA routing, VRAM detection, `getGARTAddr` |
@@ -999,5 +889,5 @@ The fix was a three-layer defense:
 | `src/dev/amdgpu/interrupt_handler.cc` | IH ring buffer DMA and interrupt delivery |
 | `src/dev/amdgpu/amdgpu_device.cc` | Device-level `intrPost()`, `writeFrame()` |
 | `src/dev/amdgpu/xgmi_bridge.{cc,hh}` | xGMI interconnect bridge |
-| `configs/example/gpufs/mi300_cosim.py` | System config, memory setup, backend selection |
+| `configs/example/gpufs/mi300_cosim.py` | System config and memory setup |
 | `scripts/cosim_launch.sh` | Launch orchestration |

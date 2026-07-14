@@ -2,13 +2,13 @@
 
 ## Goal Description
 
-Extend cosim-gpu from single MI300X GPU co-simulation (QEMU + gem5) to multi-GPU hive simulation with xGMI interconnect modeling (Path A), and eventually to super-node scale-out via SST Merlin network simulation (Path B). The implementation follows a progressive architecture: single-process multi-GPU instances for initial phases (2–4 GPUs), transitioning to multi-process architecture for full 8-GPU hive scale. Only the vfio-user cosim backend is supported for multi-GPU; the legacy socket backend is not extended. Path A and Path B can proceed in parallel after the 2-GPU xGMI link model is validated.
+Extend cosim-gpu from single MI300X GPU co-simulation (QEMU + gem5) to multi-GPU hive simulation with xGMI interconnect modeling (Path A), and eventually to super-node scale-out via SST Merlin network simulation (Path B). The implementation follows a progressive architecture: single-process multi-GPU instances for initial phases (2–4 GPUs), transitioning to multi-process architecture for full 8-GPU hive scale. vfio-user is the sole QEMU ↔ gem5 transport. Path A and Path B can proceed in parallel after the 2-GPU xGMI link model is validated.
 
 ### Key Architecture Decisions (Clarified)
 
 1. **gem5 Process Model**: Progressive — single gem5 process with multiple GPU instances for Milestone 1–2 (up to ~4 GPUs); multi-process (one gem5 container per GPU with IPC) introduced at Milestone 3 for 8-GPU scale.
 2. **Dependency Relaxation**: SST Merlin integration (Milestone 4) depends only on the 2-GPU xGMI baseline from Milestone 2, NOT on the 8-GPU hive (Milestone 3). Milestones 3 and 4 can proceed in parallel.
-3. **Backend Scope**: Multi-GPU is implemented exclusively on the vfio-user backend. The legacy socket backend is not extended for multi-GPU.
+3. **Transport Scope**: Multi-GPU uses the standard vfio-user transport exclusively.
 4. **Bandwidth Targets**: 128 GB/s per link and ~310–330 GB/s aggregate are configurable model parameters calibrated to real hardware specs, NOT hard pass/fail acceptance criteria. Acceptance is based on correct data transfer and configurable timing, not measured throughput numbers.
 5. **Hardware Characterization**: Real hardware benchmarking (TransferBench, RCCL) is recommended for model calibration but not a gating prerequisite for any milestone.
 6. **SST PoC**: Milestone 4 includes a lightweight PoC sub-milestone before full integration.
@@ -218,7 +218,7 @@ The implementation includes:
   - SST Merlin for network topology simulation (Milestone 4+)
   - Docker containers for gem5 process isolation
 - **Cannot use**:
-  - Legacy cosim socket backend for multi-GPU (single-GPU legacy remains untouched)
+  - Additional QEMU ↔ gem5 communication backends
   - gem5 GarnetNetwork for xGMI (designed for on-chip, not inter-chip)
   - Modifications to upstream QEMU source code for multi-device support (use QEMU CLI parameters only)
   - Hardcoded GPU count assumptions (must be parameterized via `--num-gpus`)

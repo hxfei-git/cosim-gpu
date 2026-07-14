@@ -2,17 +2,11 @@
 # ==========================================================================
 # QEMU + gem5 MI300X Co-simulation Launcher
 #
-# gem5 runs inside Docker (GPU-only, no kernel), QEMU runs on the host
-# with KVM.  Two backends are supported:
-#
-#   vfio-user (default): Standard vfio-user protocol via libvfio-user.
-#     QEMU uses upstream vfio-user-pci — no custom QEMU code needed.
-#
-#   legacy: Custom cosim socket protocol with QEMU's mi300x-gem5 device.
+# gem5 runs inside Docker (GPU-only, no kernel), while a system-installed
+# QEMU runs on the host with KVM and connects through standard vfio-user.
 #
 # Usage:
 #   ./scripts/cosim_launch.sh                              # vfio-user
-#   ./scripts/cosim_launch.sh --cosim-backend legacy       # legacy
 #   ./scripts/cosim_launch.sh --gem5-debug MI300XCosim      # with debug
 #   ./scripts/cosim_launch.sh --help
 # ==========================================================================
@@ -42,10 +36,9 @@ GEM5_CONFIG="${GEM5_DIR}/configs/example/gpufs/mi300_cosim.py"
 GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
 GEM5_CONTAINER="$(cosim_container_name "$COSIM_RUN_ID")"
 
-QEMU_BIN="${COSIM_DIR}/qemu/build/qemu-system-x86_64"
+QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 2>/dev/null || true)}"
 DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
 KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
-GPU_ROM="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/files/mi300.rom"
 
 SOCKET_PATH="/tmp/gem5-mi300x-${COSIM_RUN_ID}.sock"
 SHMEM_PATH="/mi300x-vram-${COSIM_RUN_ID}"
@@ -59,7 +52,6 @@ GEM5_DEBUG=""
 GEM5_TIMEOUT=120
 QEMU_TRACE=""
 SHARE_DIR=""
-COSIM_BACKEND="vfio-user"
 NUM_GPUS="1"
 FORCE_CLEAN=""
 FORCE_CLEAN_CONFIRM=""
@@ -94,7 +86,7 @@ Usage: $0 [options]
 Options:
   --disk-image PATH       Disk image  (default: auto-detect in gem5-resources)
   --kernel PATH           vmlinux     (default: auto-detect in gem5-resources)
-  --qemu-bin PATH         QEMU binary (default: ../qemu/build/qemu-system-x86_64)
+  --qemu-bin PATH         QEMU binary (default: qemu-system-x86_64 from PATH)
   --gem5-bin PATH         gem5 binary (default: build/VEGA_X86/gem5.opt)
   --gem5-docker IMAGE     Docker image for gem5 (default: gem5-run:local)
   --socket-path PATH      Unix socket (default: /tmp/gem5-mi300x.sock)
@@ -103,9 +95,8 @@ Options:
   --vram-size SIZE        GPU VRAM    (default: 16GiB)
   --num-cus N             Compute units (default: 40)
   --gem5-debug FLAGS      gem5 debug flags (e.g. MI300XCosim,AMDGPUDevice)
-  --qemu-trace EVENTS     QEMU trace events (e.g. mi300x_gem5_*)
+  --qemu-trace EVENTS     QEMU trace events
   --share-dir PATH        Share host dir with guest via 9p (mount tag: cosim_share)
-  --cosim-backend MODE    vfio-user (default) or legacy
   --num-gpus N            Number of GPU instances (default: 1)
   --timeout SECS          gem5 init timeout (default: 120)
   --force-clean           List orphaned cosim resources (dry-run)
@@ -130,7 +121,6 @@ while [[ $# -gt 0 ]]; do
         --gem5-debug)    GEM5_DEBUG="$2";       shift 2 ;;
         --qemu-trace)    QEMU_TRACE="$2";       shift 2 ;;
         --share-dir)     SHARE_DIR="$2";        shift 2 ;;
-        --cosim-backend) COSIM_BACKEND="$2";   shift 2 ;;
         --num-gpus)      NUM_GPUS="$2";         shift 2 ;;
         --timeout)       GEM5_TIMEOUT="$2";     shift 2 ;;
         --force-clean)   FORCE_CLEAN=1;         shift ;;
@@ -158,10 +148,6 @@ fi
 if [[ "$NUM_GPUS" -lt 1 ]]; then
     error "--num-gpus must be >= 1"
 fi
-if [[ "$NUM_GPUS" -gt 1 && "$COSIM_BACKEND" != "vfio-user" ]]; then
-    error "Multi-GPU only supports vfio-user backend"
-fi
-
 # ---- Derived paths ----
 
 SHMEM_HOST_FILE="/dev/shm${SHMEM_HOST_PATH}"
@@ -195,10 +181,11 @@ C_GEM5_CONFIG="/gem5/configs/example/gpufs/mi300_cosim.py"
 # ---- Validation ----
 
 [[ -f "$GEM5_BIN" ]]   || error "gem5 not found: $GEM5_BIN\n  Build: scons build/VEGA_X86/gem5.opt -j\$(nproc)"
-[[ -f "$QEMU_BIN" ]]   || error "QEMU not found: $QEMU_BIN\n  Build: cd ../qemu && mkdir -p build && cd build && ../configure --target-list=x86_64-softmmu && make -j\$(nproc)"
+[[ -n "$QEMU_BIN" && -x "$QEMU_BIN" ]] || error "qemu-system-x86_64 not found. Install QEMU 10.1+ or pass --qemu-bin."
+"$QEMU_BIN" -device help 2>/dev/null | grep 'vfio-user-pci' >/dev/null || \
+    error "QEMU does not provide vfio-user-pci. Install QEMU 10.1+ or pass a compatible --qemu-bin."
 [[ -f "$DISK_IMAGE" ]] || error "Disk image not found: $DISK_IMAGE\n  Build: ./scripts/run_mi300x_fs.sh build-disk"
 [[ -f "$KERNEL" ]]     || error "Kernel not found: $KERNEL\n  Build: ./scripts/run_mi300x_fs.sh build-disk"
-[[ -f "$GPU_ROM" ]]    || error "GPU ROM not found: $GPU_ROM"
 [[ -r /dev/kvm ]]      || error "/dev/kvm not available. KVM is required for QEMU."
 
 docker info >/dev/null 2>&1 || error "Docker not running"
@@ -298,7 +285,6 @@ GEM5_DOCKER_CMD+=(
     "--dgpu-mem-size=$VRAM_SIZE"
     "--num-compute-units=$NUM_CUS"
     "--mem-size=$HOST_MEM"
-    "--cosim-backend=$COSIM_BACKEND"
     "--num-gpus=$NUM_GPUS"
 )
 
@@ -313,11 +299,7 @@ info "gem5 container '$GEM5_CONTAINER' started"
 step "Waiting for gem5 to initialize (timeout: ${GEM5_TIMEOUT}s)..."
 
 ELAPSED=0
-if [[ "$COSIM_BACKEND" == "vfio-user" ]]; then
-    READY_PATTERN="MI300XVfioUser: listening"
-else
-    READY_PATTERN="MI300XGem5Cosim: listening"
-fi
+READY_PATTERN="MI300XVfioUser: listening"
 
 # For multi-GPU, wait until all N bridges report "listening"
 EXPECTED_READY_COUNT="$NUM_GPUS"
@@ -325,7 +307,7 @@ EXPECTED_READY_COUNT="$NUM_GPUS"
 while true; do
     READY_COUNT=$(docker logs "$GEM5_CONTAINER" 2>&1 | grep -c "$READY_PATTERN" || true)
     if [[ "$READY_COUNT" -ge "$EXPECTED_READY_COUNT" ]]; then
-        info "gem5 cosim ready: $READY_COUNT/$EXPECTED_READY_COUNT GPU(s) (${ELAPSED}s, backend=$COSIM_BACKEND)"
+        info "gem5 cosim ready: $READY_COUNT/$EXPECTED_READY_COUNT GPU(s) (${ELAPSED}s, backend=vfio-user)"
         break
     fi
 
@@ -396,14 +378,12 @@ done
 # ==================================================================
 
 KCMDLINE="console=ttyS0,115200 root=/dev/vda1 drm_kms_helper.fbdev_emulation=0 modprobe.blacklist=amdgpu earlyprintk=serial,ttyS0,115200"
-VRAM_BYTES=$((16 * 1024 * 1024 * 1024))
-
-step "Starting QEMU (Q35 + KVM, backend=$COSIM_BACKEND)..."
+step "Starting QEMU (Q35 + KVM, backend=vfio-user)..."
 
 echo "============================================================"
 echo "  Run-ID:     $COSIM_RUN_ID"
 echo "  Machine:    Q35 + KVM"
-echo "  Backend:    $COSIM_BACKEND"
+echo "  Backend:    vfio-user"
 echo "  Num GPUs:   $NUM_GPUS"
 echo "  CPUs:       $HOST_CPUS"
 echo "  Memory:     $HOST_MEM"
@@ -451,17 +431,11 @@ QEMU_CMD=(
     -device "virtio-net-pci,netdev=net0"
 )
 
-if [[ "$COSIM_BACKEND" == "vfio-user" ]]; then
-    # Standard vfio-user protocol: one vfio-user-pci device per GPU
-    for ((g=0; g<NUM_GPUS; g++)); do
-        local_sock="$(gpu_socket_path "$g")"
-        QEMU_CMD+=(-device "{\"driver\":\"vfio-user-pci\",\"socket\":{\"type\":\"unix\",\"path\":\"$local_sock\"}}")
-    done
-else
-    # Legacy custom protocol: single GPU only
-    local_shmem="$(gpu_shmem_file 0)"
-    QEMU_CMD+=(-device "mi300x-gem5,gem5-socket=$SOCKET_PATH,shmem-path=$local_shmem,vram-size=$VRAM_BYTES,romfile=$GPU_ROM")
-fi
+# Standard vfio-user protocol: one vfio-user-pci device per GPU.
+for ((g=0; g<NUM_GPUS; g++)); do
+    local_sock="$(gpu_socket_path "$g")"
+    QEMU_CMD+=(-device "{\"driver\":\"vfio-user-pci\",\"socket\":{\"type\":\"unix\",\"path\":\"$local_sock\"}}")
+done
 
 QEMU_CMD+=(
     -nographic

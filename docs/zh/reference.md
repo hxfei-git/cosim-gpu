@@ -18,7 +18,6 @@ QEMU + gem5 MI300X 协同仿真系统的综合查阅参考。概念性说明请�
 | `--dgpu-mem-size` | `16GiB` | GPU VRAM 大小 |
 | `--num-compute-units` | `40` | GPU 计算单元数量 |
 | `--mem-size` | `8GiB` | Guest 物理内存大小 |
-| `--cosim-backend` | `vfio-user` | cosim 后端类型：`vfio-user`（原版 QEMU 10.0+）或 `legacy`（自定义 QEMU） |
 | `--gem5-debug` | （无） | gem5 调试标志，例如 `MI300XCosim`、`AMDGPUDevice,PM4PacketProcessor` |
 | `--vram-size` | `32GiB` | 自定义 VRAM 大小（`--dgpu-mem-size` 的别名） |
 | `--num-cus` | `80` | 自定义 CU 数量（`--num-compute-units` 的别名） |
@@ -91,7 +90,7 @@ console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu
 | gem5 构建目标 | VEGA_X86 |
 | GPU 设备 | MI300X (gfx942, DeviceID 0x74A0) |
 | 一致性协议 | GPU_VIPER |
-| QEMU | 10.0+（vfio-user 后端）或 cosim 分支（legacy 后端） |
+| QEMU | 系统安装的 QEMU 10.1+，并提供 `vfio-user-pci` |
 
 ### Docker 镜像
 
@@ -110,7 +109,7 @@ console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu
 | gem5 二进制 | `build/VEGA_X86/gem5.opt` | 约 1.1 GB |
 | 磁盘镜像 | `../gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | 约 55 GB |
 | 内核 | `../gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | 约 64 MB |
-| QEMU 二进制 | `qemu/build/qemu-system-x86_64` | -- |
+| QEMU 二进制 | 宿主机 `PATH` 中的 `qemu-system-x86_64` | -- |
 
 ---
 
@@ -168,7 +167,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | | |
 |---|---|
 | **症状** | `modprobe amdgpu` 导致内核空指针崩溃，位于 `amdgpu_atom_parse_data_header+0x1b`。调用链：`amdgpu_ras_init` -> `amdgpu_atomfirmware_mem_ecc_supported` -> `amdgpu_atom_parse_data_header`。RAX=0（NULL `atom_context`） |
-| **根因** | amdgpu 驱动的五种 BIOS 发现方法在 cosim 模式下全部失败（详见[第 1.3 节](#13-dd-命令参数vga-rom)）。驱动打印 `"Unable to locate a BIOS ROM"` 后继续执行，但 RAS 初始化路径无条件调用 `amdgpu_atom_parse_data_header()` 而不检查 NULL `atom_context`。QEMU 的 `romfile=` 属性无效 -- amdgpu 驱动通过 SMU 寄存器访问 ROM，而非 PCI ROM BAR |
+| **根因** | amdgpu 驱动的五种 BIOS 发现方法在 cosim 模式下全部失败（详见[第 1.3 节](#13-dd-命令参数vga-rom)）。驱动打印 `"Unable to locate a BIOS ROM"` 后继续执行，但 RAS 初始化路径无条件调用 `amdgpu_atom_parse_data_header()` 而不检查 NULL `atom_context`。驱动通过 SMU 寄存器访问 ROM，而非 PCI ROM BAR |
 | **修复** | 在 `modprobe` **之前**执行 `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128`。`cosim-gpu-setup.service` 会自动完成此操作 |
 
 ### 4.2 PSP / SMU 固件加载失败
@@ -179,23 +178,15 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | `ip_block_mask=0x6f` 启用了 PSP（检测顺序索引 3），但 cosim 不模拟 PSP 硬件。`amd_shared.h` 中的 `amd_ip_block_type` 枚举显示 PSP=4，但 mask 使用的是检测顺序，PSP 的索引为 3 |
 | **修复** | 使用 `ip_block_mask=0x67` 同时禁用 PSP（bit 3）和 SMU（bit 4）。详见[第 3 节](#3-ip-block-mask-参考) |
 
-### 4.3 SIGIO 合并导致的死锁（仅 Legacy 后端）
-
-| | |
-|---|---|
-| **症状** | 驱动在首次访问 INDEX2/DATA2 寄存器对时挂起。gem5 处理约 15 条消息后停止响应。QEMU socket 缓冲区被填满 |
-| **根因** | Linux FASYNC/SIGIO 是边沿触发的。当 QEMU 快速连续发送一个 write 和一个 read 时，两条消息在 gem5 的 SIGIO handler 触发前同时到达。系统只投递一个信号；handler 读取一条消息后第二条永远滞留 |
-| **修复** | `MI300XGem5Cosim::handleClientData()` 使用 `do/while` 排空循环配合 `poll(fd, POLLIN, 0)` 读取每次 SIGIO 到来时的所有待处理消息。不适用于 vfio-user 后端（使用 libvfio-user 的非阻塞 poll） |
-
-### 4.4 协同仿真模式下 GART 表未填充
+### 4.3 协同仿真模式下 GART 表未填充
 
 | | |
 |---|---|
 | **症状** | 大量 `GART translation for X not found` 警告。PM4 读到全零内存（opcode 0x0）。KIQ ring test 超时 |
-| **根因** | 在两种后端中，VRAM 均由共享内存（`/dev/shm/mi300x-vram`）支撑。驱动对 VRAM 的写入完全绕过 gem5 的内存系统，因此 `AMDGPUVM::gartTable` 哈希表不会通过 `AMDGPUDevice::writeFrame()` 被填充 |
+| **根因** | VRAM 由共享内存（`/dev/shm/mi300x-vram`）支撑。驱动对 VRAM 的写入完全绕过 gem5 的内存系统，因此 `AMDGPUVM::gartTable` 哈希表不会通过 `AMDGPUDevice::writeFrame()` 被填充 |
 | **修复** | `GARTTranslationGen::translate()` 中的协同仿真回退机制：当 `gartTable` 未命中时，直接从共享 VRAM 的 `vramShmemPtr + (gartBase - fbBase) + gart_byte_offset` 处读取 PTE。关键细节：`getGARTAddr()` 已将页索引乘以 8，因此 `bits(vaddr, 63, 12)` 已经是字节偏移 -- 不可再乘以 8 |
 
-### 4.5 GART 未映射页崩溃
+### 4.4 GART 未映射页崩溃
 
 | | |
 |---|---|
@@ -203,7 +194,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | GPU PM4/SDMA 引擎尝试 DMA 到驱动尚未映射的 GART 页（PTE=0）。原始代码创建 `GenericPageTableFault`，但 DMA 回调链无限重试同一个失败地址 |
 | **修复** | 未映射的 GART 页被映射到 sink（`paddr=0`）。DMA 读操作返回零，写操作被丢弃，仿真保持存活。这是正常现象：`ptStart` 处的第一页本身就是未映射的 |
 
-### 4.6 SDMA Ring 测试超时
+### 4.5 SDMA Ring 测试超时
 
 | | |
 |---|---|
@@ -211,7 +202,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | `sdma_engine.hh` 中 `sdma_delay` 默认值为 `1e9` ticks。在 cosim 模式下，对应约 500ms 墙钟时间，超过驱动约 200ms 的超时窗口。流程：驱动写入 SDMA ring 并敲 doorbell → gem5 以 `sdma_delay` ticks 延迟调度 SDMA 事件 → 驱动在 gem5 完成前超时 |
 | **修复** | 将 `sdma_delay` 从 `1e9` 减小到 `1000` ticks。将 `KEEPALIVE_INTERVAL` 增大到 `1e9` 以避免 keepalive 干扰时序 |
 
-### 4.7 VRAM 地址 GART 翻译错误
+### 4.6 VRAM 地址 GART 翻译错误
 
 | | |
 |---|---|
@@ -219,7 +210,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | SDMA rptr 回写地址和 PM4 RELEASE_MEM 目标地址可能指向 VRAM（地址 < 16 GiB）。这些地址经过 `getGARTAddr()` 处理时页号会被乘以 8，然后 GART 查找失败，因为 VRAM 没有对应的页表项 |
 | **修复** | 三层防护：(1) PM4：`writeData()`、`releaseMem()`、`queryStatus()` 检查 `isVRAMAddress(addr)` 并路由到 `getMemMgr()->writeRequest()`。(2) SDMA：`setGfxRptrLo/Hi()` 和 rptr 回写对 VRAM 地址跳过 `getGARTAddr()`。(3) GART 兜底：检测 VRAM 地址并映射到 sink（`paddr=0`） |
 
-### 4.8 共享内存文件偏移量不匹配
+### 4.7 共享内存文件偏移量不匹配
 
 | | |
 |---|---|
@@ -227,7 +218,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | QEMU Q35 配置 8 GiB RAM 时：`below_4g = 2 GiB`（当 `ram_size >= 0xB0000000` 时硬编码）。gem5 配置为 3 GiB 以下 / 5 GiB 以上。QEMU 将 4G 以上数据放在文件偏移 2 GiB 处；gem5 从偏移 3 GiB 处读取 -- 全为零 |
 | **修复** | `mi300_cosim.py` 复刻了 Q35 的拆分逻辑：`below_4g = min(total_mem, 0x80000000 if total_mem >= 0xB0000000 else 0xB0000000)` |
 
-### 4.9 定时器溢出崩溃
+### 4.8 定时器溢出崩溃
 
 | | |
 |---|---|
@@ -235,7 +226,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | RTC 和 PIT 定时器持续调度事件，在 cosim 的长期运行模式下导致 tick 计数器溢出 |
 | **修复** | 为 `Cmos` 添加了 `disable_rtc_events` 参数，为 `I8254` 添加了 `disable_timer_events` 参数。在 `mi300_cosim.py` 中均设为禁用。cosim 桥接中的 keepalive 事件防止事件队列变空 |
 
-### 4.10 PM4ReleaseMem.dataSelect Panic
+### 4.9 PM4ReleaseMem.dataSelect Panic
 
 | | |
 |---|---|
@@ -243,7 +234,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | `pm4_packet_processor.cc` 仅实现了 `dataSelect == 1`（32 位数据写入）。驱动在 GFX 初始化过程中使用其他模式 |
 | **修复** | 添加了所有常见 dataSelect 值：0 = 不写入数据（仅触发事件），1 = 32 位写入（已有），2 = 64 位写入，3 = 64 位 GPU 时钟计数器，其他 = 警告并视为空操作 |
 
-### 4.11 不支持的 PM4 操作码
+### 4.10 不支持的 PM4 操作码
 
 | | |
 |---|---|
@@ -251,7 +242,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | `ACQUIRE_MEM` (0x58) 和 `SET_RESOURCES` (0xA0) 未被处理 |
 | **修复** | 两者均已添加到 `pm4_defines.hh` 并在 `pm4_packet_processor.cc:decodeHeader()` 中作为跳过并继续（NOP）处理 |
 
-### 4.12 PCI Class Code 不匹配
+### 4.11 PCI Class Code 不匹配
 
 | | |
 |---|---|
@@ -259,7 +250,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | PCI class 为 `PCI_CLASS_DISPLAY_OTHER (0x0380)` 而非 `PCI_CLASS_DISPLAY_VGA (0x0300)` |
 | **修复** | 改为 `PCI_CLASS_DISPLAY_VGA`。内核随即将该地址范围识别为"带有 shadowed ROM 的视频设备" |
 
-### 4.13 QEMU 串口控制台冲突
+### 4.12 QEMU 串口控制台冲突
 
 | | |
 |---|---|
@@ -267,7 +258,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | `-nographic` 隐含了 `-serial mon:stdio`，创建映射到 stdio 的 serial0。显式的 `-serial unix:...` 变成 serial1（ttyS1），但内核使用的是 `console=ttyS0` |
 | **修复** | 单独使用 `-nographic`。如需程序化访问，在 `screen` 中运行 QEMU |
 
-### 4.14 gem5 链接时内存不足（OOM）
+### 4.13 gem5 链接时内存不足（OOM）
 
 | | |
 |---|---|
@@ -275,7 +266,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | 默认链接器占用内存过多 |
 | **修复** | 使用 `scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold` |
 
-### 4.15 DRM Client 错误 -13（缺少 DKMS 模块）
+### 4.14 DRM Client 错误 -13（缺少 DKMS 模块）
 
 | | |
 |---|---|
@@ -283,7 +274,7 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 | **根因** | 磁盘镜像缺少 `amddrm_exec.ko.zst` DKMS 模块。缺少此模块时 TTM 内存管理器初始化失败，`drm_dev_enter()` 返回 `-EACCES`（-13） |
 | **修复** | 使用最新的 `gem5-resources`（`origin/stable` 分支）重新构建磁盘镜像。用 `guestfish` 确认 `amddrm_exec.ko.zst` 存在于 `/lib/modules/6.8.0-79-generic/updates/dkms/` 中 |
 
-### 4.16 驱动 hw_init 失败后 rmmod 导致 oops
+### 4.15 驱动 hw_init 失败后 rmmod 导致 oops
 
 | | |
 |---|---|
@@ -314,12 +305,6 @@ MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
 build/VEGA_X86/gem5.opt --debug-flags=MI300XCosim,AMDGPUDevice ...
 ```
 
-### QEMU Trace 事件
-
-```bash
-./scripts/cosim_launch.sh --qemu-trace 'mi300x_gem5_*'
-```
-
 ### 日志检查命令
 
 ```bash
@@ -334,12 +319,6 @@ screen -S qemu-cosim -X stuff 'dmesg | tail -20\n'
 
 # Guest 串口输出（独立仿真）
 tail -f m5out/board.pc.com_1.device
-```
-
-### Socket 测试
-
-```bash
-python3 scripts/cosim_test_client.py /tmp/gem5-mi300x.sock
 ```
 
 ### 增量重建
@@ -365,7 +344,7 @@ docker run --rm -v "$PWD:/gem5" -w /gem5 \
 | MMIO 读取全部返回零 | gem5 未连接或已崩溃 |
 | `insmod: ERROR: could not load module` | 内核版本不匹配 |
 | `cosim-gpu-setup.service` 失败 | `journalctl -u cosim-gpu-setup` |
-| BAR 布局 probe 错误 -12 | 使用正确的 BAR5=MMIO 布局重建 QEMU |
+| BAR 布局 probe 错误 -12 | 检查 `MI300XVfioUser` 导出的 BAR 区域描述 |
 
 ---
 
@@ -474,11 +453,9 @@ git apply -R ../scripts/patches/0001-user-data-cn-mirror.patch
 
 | 文件 | 用途 |
 |------|------|
-| `mi300x_vfio_user.{cc,hh}` | vfio-user 服务端 SimObject（**默认后端**） |
+| `mi300x_vfio_user.{cc,hh}` | vfio-user 服务端 SimObject |
 | `MI300XVfioUser.py` | SimObject Python 封装（vfio-user） |
-| `cosim_bridge.hh` | 抽象 CosimBridge 接口（两种后端均实现此接口） |
-| `mi300x_gem5_cosim.{cc,hh}` | Legacy socket 桥接 SimObject |
-| `MI300XGem5Cosim.py` | SimObject Python 封装（legacy） |
+| `cosim_bridge.hh` | vfio-user 服务端使用的抽象 CosimBridge 接口 |
 | `amdgpu_device.cc` | GPU 设备模型核心，`readROM()`、`intrPost()`、`writeFrame()` |
 | `amdgpu_vm.{cc,hh}` | 所有转换生成器（GART、AGP、MMHUB、User），cosim VRAM 回退 |
 | `pm4_packet_processor.{cc,hh}` | PM4 包解码、DMA 路由、VRAM 写路由、`isVRAMAddress()` |
@@ -491,13 +468,12 @@ git apply -R ../scripts/patches/0001-user-data-cn-mirror.patch
 
 | 文件 | 用途 |
 |------|------|
-| `configs/example/gpufs/mi300_cosim.py` | cosim 系统配置（`--cosim-backend=vfio-user\|legacy`） |
+| `configs/example/gpufs/mi300_cosim.py` | vfio-user cosim 系统配置 |
 | `configs/example/gem5_library/x86-mi300x-gpu.py` | 独立 stdlib 仿真配置 |
 | `configs/example/gpufs/mi300.py` | Legacy 独立仿真配置 |
 | `scripts/cosim_launch.sh` | cosim 编排（Docker + QEMU 启动） |
 | `scripts/run_mi300x_fs.sh` | 构建编排（编译、磁盘镜像、运行） |
 | `scripts/Dockerfile.run` | 运行时 Docker 镜像定义 |
-| `scripts/cosim_test_client.py` | Socket 连通性测试工具 |
 | `scripts/patches/0001-user-data-cn-mirror.patch` | 磁盘镜像构建的国内镜像补丁 |
 
 ### gem5 修改的基础设施文件
@@ -514,21 +490,11 @@ git apply -R ../scripts/patches/0001-user-data-cn-mirror.patch
 | `src/python/gem5/prebuilt/viper/board.py` | ViperBoard：readfile 注入、驱动加载 |
 | `src/python/gem5/components/devices/gpus/amdgpu.py` | MI300X 设备定义 |
 
-### QEMU 文件（仅 Legacy 后端）
-
-| 文件 | 用途 |
-|------|------|
-| `qemu/hw/misc/mi300x_gem5.c` | 带 socket 桥接的 MI300X PCI 设备 |
-| `qemu/hw/misc/mi300x_gem5.h` | 头文件 |
-| `qemu/hw/misc/trace-events` | trace 事件定义 |
-
-> vfio-user 后端使用 QEMU 内建的 `vfio-user-pci` 设备，不需要任何自定义 QEMU 代码。
-
 ### 外部依赖
 
 | 路径 | 用途 |
 |------|------|
-| `ext/libvfio-user/` | libvfio-user 库（git 子模块，vfio-user 后端） |
+| `ext/libvfio-user/` | libvfio-user 库（git 子模块，vfio-user 传输层） |
 
 ### Guest 磁盘镜像内容
 
@@ -553,9 +519,9 @@ git apply -R ../scripts/patches/0001-user-data-cn-mirror.patch
 
 驱动常量：`AMDGPU_VRAM_BAR=0`、`AMDGPU_DOORBELL_BAR=2`、`AMDGPU_MMIO_BAR=5`。
 
-### 资源路由（两种后端通用）
+### 资源路由
 
-| 资源 | 通过 Socket/vfio-user？ | 通过共享内存？ |
+| 资源 | 通过 vfio-user？ | 通过共享内存？ |
 |------|------------------------|---------------|
 | MMIO 寄存器（BAR5） | 是 | 否 |
 | VRAM（BAR0，16 GiB） | **否** | 是（`/dev/shm/mi300x-vram`） |

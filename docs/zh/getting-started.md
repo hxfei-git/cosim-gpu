@@ -40,12 +40,12 @@ QEMU + gem5 MI300X 联合仿真项目的快速入门指南。
 | 宿主机系统 | Linux x86_64，支持 KVM（已在 WSL2 6.6.x 验证） |
 | Docker | 守护进程运行中，当前用户在 `docker` 组 |
 | KVM | `/dev/kvm` 可访问 |
-| QEMU | 安装 `qemu-system-x86_64`（用于 Packer 构建磁盘镜像） |
+| QEMU | 系统安装的 QEMU 10.1+，并提供 `vfio-user-pci` |
 | 磁盘空间 | 至少 120 GB（55G 磁盘镜像 + 构建中间产物） |
 | 内存 | 建议 16 GB 以上（gem5 编译和运行都比较占内存） |
 | 工具 | `git`、`screen`、`unzip` |
 
-## 编译 gem5 和 QEMU
+## 编译 gem5 与检查 QEMU
 
 ### 构建运行时 Docker 镜像
 
@@ -73,7 +73,7 @@ gem5 二进制链接了 Ubuntu 24.04 的库，需要在兼容环境中编译。
 **方式二：Docker 内手动编译**
 
 ```bash
-cd /home/zevorn/cosim/gem5
+cd /path/to/cosim-gpu/gem5
 
 docker run --rm \
     -v "$(pwd):/gem5" -w /gem5 \
@@ -85,25 +85,18 @@ docker run --rm \
 
 产出：`build/VEGA_X86/gem5.opt`（约 1.1 GB）。
 
-### 编译 QEMU
+### 检查系统 QEMU
 
-使用 vfio-user 后端时，**原版 QEMU 10.0+** 即可直接使用——内置 `vfio-user-pci` 设备，无需自定义 QEMU 代码。
-
-```bash
-mkdir -p qemu-build && cd qemu-build
-/path/to/qemu/configure --target-list=x86_64-softmmu
-make -j$(nproc)
-```
-
-或通过编排脚本：
+QEMU 是宿主机依赖，不再作为源码子模块提供。系统需要安装带内置
+`vfio-user-pci` 设备的**原版 QEMU 10.1+**。
 
 ```bash
-./scripts/run_mi300x_fs.sh build-qemu
+qemu-system-x86_64 --version
+qemu-system-x86_64 -device help | grep vfio-user-pci
 ```
 
-产出：`qemu-system-x86_64`。
-
-> **Legacy 后端：** 若使用 `--cosim-backend=legacy`，则需要 `cosim/qemu/` 中包含 `mi300x-gem5` 设备的源码。编译方式同上，但必须使用 cosim 分支的 QEMU 源码。
+非默认安装可通过 `--qemu-bin PATH` 传给启动脚本；构建磁盘镜像时可设置
+`QEMU_BIN`。
 
 ## 构建磁盘镜像
 
@@ -115,7 +108,7 @@ make -j$(nproc)
 ./scripts/run_mi300x_fs.sh build-disk
 ```
 
-若 `gem5-resources` 不存在，会自动克隆后开始构建。
+若 `gem5-resources` 尚未初始化，脚本会先初始化该子模块再开始构建。
 
 ### 手动构建
 
@@ -151,7 +144,6 @@ cd gem5-resources/src/x86-ubuntu-gpu-ml
 ./scripts/cosim_launch.sh --gem5-debug MI300XCosim   # 开启 gem5 调试输出
 ./scripts/cosim_launch.sh --vram-size 32GiB          # 自定义 VRAM 大小
 ./scripts/cosim_launch.sh --num-cus 80               # 自定义 CU 数量
-./scripts/cosim_launch.sh --cosim-backend=legacy     # 使用 legacy 自定义套接字后端
 ```
 
 ### 方式二：手动分步启动
@@ -160,7 +152,7 @@ cd gem5-resources/src/x86-ubuntu-gpu-ml
 
 ```bash
 docker run -d --name gem5-cosim \
-    -v /home/zevorn/cosim/gem5:/gem5 \
+    -v /path/to/cosim-gpu/gem5:/gem5 \
     -v /tmp:/tmp \
     -v /dev/shm:/dev/shm \
     -w /gem5 \
@@ -514,7 +506,8 @@ tail -f m5out/board.pc.com_1.device
 
 仿真使用 KVM 快进 Linux 启动过程，然后自动加载 GPU 驱动并运行指定的应用。Guest 在测试完成后调用 `m5 exit` 结束仿真。
 
-关于独立仿真流程的完整细节（包括 legacy 配置、使用 `guestfish` 验证磁盘镜像、构建过程内部原理），请参阅 gem5 文档了解更多详情。
+关于独立仿真流程的完整细节（包括另一套 `gpufs` 配置、使用 `guestfish`
+验证磁盘镜像以及构建过程内部原理），请参阅 gem5 文档。
 
 ## 常见问题排查
 

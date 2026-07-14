@@ -1,15 +1,11 @@
 [submodule "gem5"]
 	path = gem5
-	url = git@github.com:zevorn/gem5.git
-	branch = cosim-gpu
-[submodule "qemu"]
-	path = qemu
-	url = git@github.com:zevorn/qemu.git
-	branch = cosim-gpu
+	url = git@github.com:gevico/gem5.git
+	branch = cosim-gpu-on-develop
 [submodule "gem5-resources"]
 	path = gem5-resources
-	url = git@github.com:zevorn/gem5-resources.git
+	url = git@github.com:gevico/gem5-resources.git
 	branch = cosim-gpu
 [submodule ".agents"]
 	path = .agents
-	url = git@github.com:zevorn/cosim-gpu-skills.git
+	url = git@github.com:gevico/cosim-gpu-skills.git

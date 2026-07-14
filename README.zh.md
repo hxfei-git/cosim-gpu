@@ -39,6 +39,7 @@
 | 宿主机系统 | Linux x86_64，支持 KVM（已在 WSL2 6.6.x 验证） |
 | Docker | 守护进程运行中，当前用户在 `docker` 组 |
 | KVM | `/dev/kvm` 可访问 |
+| QEMU | 系统安装的 QEMU 10.1+，并提供 `vfio-user-pci` |
 | 磁盘空间 | 约 120 GB（55G 磁盘镜像 + 构建中间产物） |
 | 内存 | 建议 16 GB 以上 |
 
@@ -47,10 +48,10 @@
 ### 方案 A：脚本一键构建
 
 ```bash
-git clone --recurse-submodules git@github.com:zevorn/cosim.git
-cd cosim
+git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
+cd cosim-gpu
 
-# 构建 gem5 + QEMU + 磁盘镜像（总计约 2 小时，需要 KVM + Docker + 约 60GB 磁盘空间）
+# 构建 gem5 + 磁盘镜像（总计约 2 小时，需要 KVM + Docker + 约 60GB 磁盘空间）
 # 会自动构建包含 json-c 的 Docker 镜像（ext/libvfio-user 编译依赖）
 ./scripts/run_mi300x_fs.sh build-all
 
@@ -65,24 +66,22 @@ cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
 
 ```bash
 # 1. 克隆仓库（含子模块）
-git clone --recurse-submodules git@github.com:zevorn/cosim.git
-cd cosim
+git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
+cd cosim-gpu
 
-# 2. 构建 Docker 镜像（添加 ext/libvfio-user 编译所需的 json-c）
+# 2. 验证宿主机 QEMU（无需 QEMU 源码子模块）
+qemu-system-x86_64 --version
+qemu-system-x86_64 -device help | grep vfio-user-pci
+
+# 3. 构建 Docker 镜像（添加 ext/libvfio-user 编译所需的 json-c）
 cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
 
-# 3. 编译 gem5（Docker 内，约 30 分钟；链接阶段 OOM 可改用 -j1）
+# 4. 编译 gem5（Docker 内，约 30 分钟；链接阶段 OOM 可改用 -j1）
 cd gem5
 docker run --rm -v "$(pwd):/gem5" -w /gem5 \
     gem5-run:local \
     scons build/VEGA_X86/gem5.opt -j4
 cd ..
-
-# 4. 编译 QEMU（标准构建；vfio-user-pci 自 QEMU 10.0 起内置）
-cd qemu && mkdir -p build && cd build
-../configure --target-list=x86_64-softmmu
-make -j$(nproc)
-cd ../..
 
 # 5. 预编译 m5 工具（推荐 - 避免构建磁盘镜像时在 Guest 内 git clone）
 docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 \
@@ -139,18 +138,17 @@ EOF
 ## 仓库结构
 
 ```
-cosim/
+cosim-gpu/
 |-- gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
 |   |-- src/dev/amdgpu/      # MI300X GPU device model & vfio-user bridge
 |   |-- ext/libvfio-user/    # libvfio-user library (Nutanix)
 |   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
-|-- qemu/                    # QEMU emulator (submodule, stock QEMU 10.0+)
 |-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
+|-- .agents/                 # 可复用的仓库工作流（子模块）
 |-- scripts/                 # build & launch scripts
 |   |-- cosim_launch.sh      # one-click cosim launcher
 |   |-- run_mi300x_fs.sh     # build orchestration
 |   |-- cosim_guest_setup.sh # guest-side GPU setup
-|   |-- cosim_test_client.py # socket test client
 |   `-- Dockerfile.run       # gem5 runtime Docker image
 |-- docs/                    # technical documentation (zh + en)
 |   |-- en/                  # English
@@ -181,7 +179,7 @@ cosim/
 
 本项目采用 [Apache License 2.0](LICENSE) 许可证。
 
-注意：`gem5` 和 `qemu` 子模块分别遵循各自的许可证（gem5: BSD-3-Clause, QEMU: GPL-2.0）。
+注意：各子模块遵循各自的许可证。QEMU 仅作为宿主机运行时依赖，本仓库不再内置其源码。
 
 ## 致谢
 

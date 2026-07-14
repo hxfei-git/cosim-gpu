@@ -40,12 +40,12 @@ For a deeper dive into the memory architecture and BAR layout, see [Architecture
 | Host OS | Linux x86_64 with KVM support (verified on WSL2 6.6.x) |
 | Docker | Daemon running, current user in `docker` group |
 | KVM | `/dev/kvm` accessible |
-| QEMU | `qemu-system-x86_64` installed (used by Packer during disk image build) |
+| QEMU | System-installed QEMU 10.1+ with `vfio-user-pci` |
 | Disk Space | At least 120 GB (55G disk image + build artifacts) |
 | Memory | 16 GB or more recommended (gem5 compilation and runtime are memory-intensive) |
 | Tools | `git`, `screen`, `unzip` |
 
-## Building gem5 and QEMU
+## Building gem5 and Checking QEMU
 
 ### Build the Runtime Docker Image
 
@@ -73,7 +73,7 @@ The gem5 binary links against Ubuntu 24.04 libraries and must be compiled in a c
 **Option 2: Build inside Docker (Manual)**
 
 ```bash
-cd /home/zevorn/cosim/gem5
+cd /path/to/cosim-gpu/gem5
 
 docker run --rm \
     -v "$(pwd):/gem5" -w /gem5 \
@@ -85,25 +85,18 @@ docker run --rm \
 
 Output: `build/VEGA_X86/gem5.opt` (approximately 1.1 GB).
 
-### Build QEMU
+### Check the System QEMU
 
-With the vfio-user backend, a **stock QEMU 10.0+** build works out of the box -- the `vfio-user-pci` device is built-in and no custom QEMU code is needed.
-
-```bash
-mkdir -p qemu-build && cd qemu-build
-/path/to/qemu/configure --target-list=x86_64-softmmu
-make -j$(nproc)
-```
-
-Or via the orchestration script:
+QEMU is a host dependency rather than a source submodule. A **stock QEMU 10.1+**
+with the built-in `vfio-user-pci` device is required.
 
 ```bash
-./scripts/run_mi300x_fs.sh build-qemu
+qemu-system-x86_64 --version
+qemu-system-x86_64 -device help | grep vfio-user-pci
 ```
 
-Output: `qemu-system-x86_64`.
-
-> **Legacy backend:** If using `--cosim-backend=legacy`, the `cosim/qemu/` source containing the `mi300x-gem5` device is required. The build procedure is the same, but you must use the cosim branch QEMU source.
+Pass a non-default installation to the launcher with `--qemu-bin PATH`, or set
+`QEMU_BIN` when building the disk image.
 
 ## Building the Disk Image
 
@@ -115,7 +108,7 @@ The disk image contains Ubuntu 24.04 + ROCm 7.0 + kernel 6.8.0-79-generic with a
 ./scripts/run_mi300x_fs.sh build-disk
 ```
 
-If `gem5-resources` does not exist, it will be cloned automatically before the build begins.
+If `gem5-resources` is not initialized, the script initializes its submodule before the build begins.
 
 ### Manual Build
 
@@ -151,7 +144,6 @@ Common options:
 ./scripts/cosim_launch.sh --gem5-debug MI300XCosim   # enable gem5 debug output
 ./scripts/cosim_launch.sh --vram-size 32GiB          # custom VRAM size
 ./scripts/cosim_launch.sh --num-cus 80               # custom CU count
-./scripts/cosim_launch.sh --cosim-backend=legacy     # use legacy socket backend
 ```
 
 ### Option 2: Manual Step-by-step Launch
@@ -160,7 +152,7 @@ Common options:
 
 ```bash
 docker run -d --name gem5-cosim \
-    -v /home/zevorn/cosim/gem5:/gem5 \
+    -v /path/to/cosim-gpu/gem5:/gem5 \
     -v /tmp:/tmp \
     -v /dev/shm:/dev/shm \
     -w /gem5 \
@@ -514,7 +506,9 @@ tail -f m5out/board.pc.com_1.device
 
 The simulation uses KVM to fast-forward through Linux boot, then automatically loads the GPU driver and runs the specified application. The guest calls `m5 exit` when the test completes.
 
-For full details on the standalone workflow, including legacy configuration, disk image verification with `guestfish`, and build process internals, see the gem5 documentation for details.
+For full details on the standalone workflow, including the alternative `gpufs`
+configuration, disk image verification with `guestfish`, and build process
+internals, see the gem5 documentation.
 
 ## Quick Troubleshooting
 

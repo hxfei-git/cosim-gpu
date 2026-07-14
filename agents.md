@@ -4,7 +4,7 @@
 
 This repository hosts the QEMU + gem5 MI300X GPU co-simulation source tree.
 Reusable agent workflows are no longer stored as `.claude/commands`; they live in
-the `.agents` submodule, which points at `zevorn/cosim-gpu-skills`.
+the `.agents` submodule, which points at `gevico/cosim-gpu-skills`.
 
 `CLAUDE.md` is a symbolic mapping to this file so Claude-compatible tools read
 the same canonical rules.
@@ -30,12 +30,12 @@ cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
 Manual path when needed:
 
 ```bash
+qemu-system-x86_64 -device help | grep vfio-user-pci
 cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
 cd gem5 && docker run --rm -v "$(pwd):/gem5" -w /gem5 \
     gem5-run:local \
     scons build/VEGA_X86/gem5.opt -j4
-cd ../qemu && mkdir -p build && cd build && ../configure --target-list=x86_64-softmmu && make -j$(nproc)
-cd ../..
+cd ..
 docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 gem5-run:local \
     bash -c "cd util/m5 && scons build/x86/out/m5"
 cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
@@ -61,8 +61,9 @@ modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 di
 
 ## Architecture
 
-QEMU (Q35+KVM) communicates with gem5's MI300X model over a Unix socket. Guest
-RAM and VRAM are shared through `/dev/shm/cosim-guest-ram` and
+System QEMU (Q35+KVM) communicates with gem5's MI300X model through the standard
+vfio-user protocol over a Unix socket. No project-specific QEMU source is used.
+Guest RAM and VRAM are shared through `/dev/shm/cosim-guest-ram` and
 `/dev/shm/mi300x-vram`. BAR layout: 0+1=VRAM, 2+3=Doorbell, 4=MSI-X, 5=MMIO.
 
 Driver parameters for this cosim path:
@@ -74,7 +75,6 @@ ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
 ## Commit Rules
 
 - gem5: pre-commit hooks apply; use tags from `MAINTAINERS.yaml`.
-- QEMU: run checkpatch discipline for touched patches.
 - Top-level cosim-gpu: no project-specific hooks.
 - Sign commits with `Signed-off-by` from `git config user.name` and
   `git config user.email`.

@@ -144,7 +144,7 @@ cosim-gpu/
 |   |-- ext/libvfio-user/    # libvfio-user library (Nutanix)
 |   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
 |-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
-|-- .agents/                 # 可复用的仓库工作流（子模块）
+|-- .agents/                 # 可复用的仓库工作流（已内置）
 |-- scripts/                 # build & launch scripts
 |   |-- cosim_launch.sh      # one-click cosim launcher
 |   |-- run_mi300x_fs.sh     # build orchestration

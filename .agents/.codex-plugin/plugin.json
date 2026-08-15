@@ -1,0 +1,33 @@
+{
+  "name": "cosim-gpu-skills",
+  "version": "0.1.0",
+  "description": "Reusable Codex skills for cosim-gpu QEMU and gem5 workflows.",
+  "author": {
+    "name": "Chao Liu",
+    "email": "chao.liu@processmission.com",
+    "url": "https://github.com/zevorn"
+  },
+  "repository": "https://github.com/gevico/cosim-gpu-skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cosim-gpu",
+    "qemu",
+    "gem5",
+    "mi300x",
+    "skills"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "cosim-gpu skills",
+    "shortDescription": "QEMU+gem5 MI300X co-simulation workflows.",
+    "longDescription": "Reusable skills for debugging, guest interaction, and guest disk-image maintenance in the cosim-gpu project.",
+    "developerName": "Chao Liu",
+    "category": "Productivity",
+    "capabilities": [
+      "Code",
+      "Debug",
+      "Operations"
+    ],
+    "defaultPrompt": "Use the cosim-gpu skills to diagnose and verify a QEMU+gem5 MI300X co-simulation issue."
+  }
+}

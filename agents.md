@@ -3,8 +3,9 @@
 ## Scope
 
 This repository hosts the QEMU + gem5 MI300X GPU co-simulation source tree.
-Reusable agent workflows are no longer stored as `.claude/commands`; they live in
-the `.agents` submodule, which points at `gevico/cosim-gpu-skills`.
+Reusable agent workflows are no longer stored as `.claude/commands`; they are
+vendored in-tree under `.agents/skills/` (previously the
+`gevico/cosim-gpu-skills` submodule) and are tracked directly by this repository.
 
 `CLAUDE.md` is a symbolic mapping to this file so Claude-compatible tools read
 the same canonical rules.
@@ -15,10 +16,10 @@ Load the matching skill before running these workflows:
 
 - Debugging co-simulation failures: `.agents/skills/cosim-gpu-debug/SKILL.md`
 - Guest serial interaction and GPU test runs: `.agents/skills/cosim-gpu-guest/SKILL.md`
-- Guest disk-image edits with `guestmount`: `.agents/skills/cosim-gpu-disk-image/SKILL.md`
+- Guest disk-image edits with `guestmount`: `.agents/skills/cosim-gpu-disk-image-edit/SKILL.md`
 
 Do not add new project-specific command implementations under `.claude/commands`.
-Add reusable workflows to `cosim-gpu-skills` instead, then update this mapping.
+Add reusable workflows under `.agents/skills/` instead, then update this mapping.
 
 ## Build
 

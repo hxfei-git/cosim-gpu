@@ -48,7 +48,7 @@ commands as substitutes for the build script.
 | Component | Binary |
 |-----------|--------|
 | gem5 | `gem5/build/VEGA_X86/gem5.opt` |
-| QEMU | `qemu/build/qemu-system-x86_64` |
+| QEMU | `.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64` |
 
 The build script creates the Docker image from `scripts/Dockerfile.run` when it
 is missing.

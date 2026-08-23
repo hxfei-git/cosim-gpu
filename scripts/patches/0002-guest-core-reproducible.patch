@@ -1,0 +1,214 @@
+diff --git a/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh b/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh
+index 8a8fd056..67a32034 100755
+--- a/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh
++++ b/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh
+@@ -7,18 +7,25 @@
+ # All rights reserved.
+ # SPDX-License-Identifier: BSD 3-Clause
+ 
++set -euo pipefail
++export DEBIAN_FRONTEND=noninteractive
++
++readonly ROCM_KEY_SHA256="2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b"
++readonly AMDGPU_DKMS_VERSION="1:6.14.14.30100000-2204008.24.04"
++readonly ROCM_VERSION="7.0.0.70000-38~24.04"
++readonly KERNEL="6.8.0-79-generic"
++readonly KERNEL_PACKAGE_VERSION="6.8.0-79.79"
++readonly KERNEL_DEB_DIR="/home/gem5/kernel-debs"
++
+ # Installing the packages in this script instead of the user-data
+ # file dueing ubuntu autoinstall. The reason is that sometimes
+ # the package install failes. This method is more reliable.
+ echo 'installing packages'
+ apt-get update
+-apt-get install -y scons
+-apt-get install -y git
+-apt-get install -y vim
+-apt-get install -y build-essential
++apt-get install -y --no-install-recommends scons git vim build-essential ca-certificates gpg wget
+ 
+ # Remove the motd
+-rm /etc/update-motd.d/*
++rm -f /etc/update-motd.d/*
+ 
+ # Build the m5 util
+ if [ -f /home/gem5/m5 ]; then
+@@ -63,8 +69,11 @@ sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+ 
+ # Download the key, convert the signing-key to a full
+ # keyring required by apt and store in the keyring directory
+-wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+-        gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
++wget https://repo.radeon.com/rocm/rocm.gpg.key -O /tmp/rocm.gpg.key
++printf '%s  %s\n' "$ROCM_KEY_SHA256" /tmp/rocm.gpg.key | sha256sum --check --strict
++gpg --dearmor < /tmp/rocm.gpg.key | \
++        sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
++rm -f /tmp/rocm.gpg.key
+ 
+ echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/7.0/ubuntu noble main" \
+         | sudo tee /etc/apt/sources.list.d/amdgpu.list
+@@ -75,9 +84,11 @@ echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
+         | sudo tee /etc/apt/preferences.d/rocm-pin-600
+ sudo apt update
+ 
+-sudo apt -y install amdgpu-dkms
+-sudo apt -y install rocm
++sudo apt -y install "amdgpu-dkms=${AMDGPU_DKMS_VERSION}"
++sudo apt -y install "rocm=${ROCM_VERSION}"
+ sudo apt -y install cmake
++test -x /opt/rocm/bin/hipcc
++modinfo amdgpu >/dev/null
+ 
+ # Make directory for GPU BIOS. These are placed in /root for compatibility with
+ # the legacy GPUFS configs.
+@@ -93,10 +105,20 @@ sudo chmod 777 /usr/lib/firmware/amdgpu/ip_discovery.bin
+ 
+ # Install a known-working version of Linux as this might change after stable
+ # release. Install this after DKMS so they are rebuilt.
+-KERNEL=6.8.0-79-generic
+-
+-sudo apt -y install "linux-image-${KERNEL}"
+-sudo apt -y install "linux-headers-${KERNEL}" "linux-modules-extra-${KERNEL}"
++mapfile -d '' -t kernel_debs < <(
++    find "$KERNEL_DEB_DIR" -maxdepth 1 -type f -name '*.deb' -print0 | sort -z
++)
++if [[ "${#kernel_debs[@]}" -ne 5 ]]; then
++    echo "Expected exactly five pinned kernel packages in ${KERNEL_DEB_DIR}" >&2
++    exit 1
++fi
++sudo apt-get install -y "${kernel_debs[@]}"
++test "$(dpkg-query -W -f='${Version}' "linux-image-${KERNEL}")" = \
++    "$KERNEL_PACKAGE_VERSION"
++test "$(dpkg-query -W -f='${Version}' "linux-headers-${KERNEL}")" = \
++    "$KERNEL_PACKAGE_VERSION"
++modinfo -k "$KERNEL" amdgpu >/dev/null
++find "/lib/modules/${KERNEL}/updates/dkms" -type f -name 'amdgpu.ko*' -print -quit | grep -q .
+ 
+ echo "Extracting linux kernel"
+ sudo bash -c "/usr/src/linux-headers-${KERNEL}/scripts/extract-vmlinux /boot/vmlinuz-${KERNEL} > /home/gem5/vmlinux-gpu-ml"
+@@ -105,7 +125,7 @@ sudo bash -c "/usr/src/linux-headers-${KERNEL}/scripts/extract-vmlinux /boot/vm
+ 
+ # Build the gem5 Linux module containing symbols missing due to outdated ACPI support in gem5
+ pushd /home/gem5
+-make -C /lib/modules/${KERNEL}/build M=${PWD}
++make -C "/lib/modules/${KERNEL}/build" M="${PWD}"
+ if [ ! -f ./gem5_wmi.ko ]; then
+     echo "gem5_wmi module did not appear to build correctly. This disk will not be usable."
+     echo "Please post an issue at https://github.com/gem5/gem5/issues with this output log."
+@@ -118,25 +138,8 @@ touch /usr/lib/firmware/amdgpu/mi350_discovery
+ chmod 777 /usr/lib/firmware/amdgpu/mi300_discovery
+ chmod 777 /usr/lib/firmware/amdgpu/mi350_discovery
+ 
+-# Note about pip: This disk is created for the express purpose of being run in
+-# gem5 and is therefore effectively sandboxed enough that we can use the pip
+-# option --break-system-packages. If you plan to modify this disk image with
+-# pip packages that might conflict, it is up to you to resolve the conflicts.
+-
+-# See https://pytorch.org/.
+-# Build: 2.3.0
+-# OS: Linux
+-# Package: Pip
+-# Language: Python
+-# Compute Platfrom: ROCm 6.2.4
+-sudo apt -y install pip3
+-pip3 install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.0
+-
+-# For a newer version uncomment one below and remove the above install:
+-# Warning: Absurdly slow compared to ROCm 6.0 *in simulation*:
+-#pip3 install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4
+-# Warning: nightly build, may not work depending on day. Use at your own risk:
+-#pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm7.0 --break-system-packages
++# PyTorch is intentionally excluded from the driver/HIP baseline. It is large,
++# independently versioned, and not needed to validate KFD or HIP dispatch.
+ 
+ # Setup gem5 auto login.
+ mv /home/gem5/serial-getty@.service /lib/systemd/system/
+diff --git a/src/x86-ubuntu-gpu-ml/x86-ubuntu-gpu-ml.pkr.hcl b/src/x86-ubuntu-gpu-ml/x86-ubuntu-gpu-ml.pkr.hcl
+index e8fcc74b..a51d8cf4 100644
+--- a/src/x86-ubuntu-gpu-ml/x86-ubuntu-gpu-ml.pkr.hcl
++++ b/src/x86-ubuntu-gpu-ml/x86-ubuntu-gpu-ml.pkr.hcl
+@@ -6,7 +6,7 @@
+   required_plugins {
+     qemu = {
+       source  = "github.com/hashicorp/qemu"
+-      version = "~> 1"
++      version = "= 1.1.6"
+     }
+   }
+ }
+@@ -18,6 +18,7 @@
+
+ variable "ssh_password" {
+   type    = string
++  sensitive = true
+   default = "12345"
+ }
+
+@@ -31,12 +32,16 @@
+   default = "/usr/bin/qemu-system-x86_64"
+ }
+ 
++variable "serial_log" {
++  type = string
++}
++
+ source "qemu" "initialize" {
+   accelerator      = "kvm"
+   boot_command     = ["e<wait>",
+                       "<down><down><down>",
+                       "<end><bs><bs><bs><bs><wait>",
+-                      "autoinstall  ds=nocloud-net\\;s=http://{{ .HTTPIP }}:{{ .HTTPPort }}/ ---<wait>",
++                      "autoinstall console=ttyS0,115200n8 ds=nocloud-net\\;s=http://{{ .HTTPIP }}:{{ .HTTPPort }}/ ---<wait>",
+                       "<f10><wait>"
+                     ]
+   cpus             = "4"
+@@ -45,11 +50,11 @@
+   headless         = "true"
+   http_directory   = "http"
+   iso_checksum     = "sha256:d6dab0c3a657988501b4bd76f1297c053df710e06e0c3aece60dead24f270b4d"
+-  iso_urls         = ["https://releases.ubuntu.com/24.04.2/ubuntu-24.04.2-live-server-amd64.iso"]
++  iso_urls         = ["https://old-releases.ubuntu.com/releases/24.04.2/ubuntu-24.04.2-live-server-amd64.iso"]
+   memory           = "8192"
+   output_directory = "disk-image"
+   qemu_binary      = "${var.qemu_path}"
+-  qemuargs         = [["-cpu", "host"], ["-display", "none"]]
++  qemuargs         = [["-cpu", "host"], ["-display", "none"], ["-serial", "file:${var.serial_log}"]]
+   shutdown_command = "echo '${var.ssh_password}'|sudo -S shutdown -P now"
+   ssh_password     = "${var.ssh_password}"
+   ssh_username     = "${var.ssh_username}"
+@@ -91,6 +96,15 @@
+     source      = "files/m5"
+   }
+ 
++  provisioner "shell" {
++    inline = ["mkdir -p /home/gem5/kernel-debs"]
++  }
++
++  provisioner "file" {
++    destination = "/home/gem5/kernel-debs/"
++    source      = "files/kernel-debs/"
++  }
++
+   provisioner "file" {
+     destination = "/home/gem5/"
+     source      = "files/cosim-gpu-setup.sh"
+diff --git a/src/x86-ubuntu-gpu-ml/http/user-data b/src/x86-ubuntu-gpu-ml/http/user-data
+--- a/src/x86-ubuntu-gpu-ml/http/user-data
++++ b/src/x86-ubuntu-gpu-ml/http/user-data
+@@ -75,5 +75,16 @@ autoinstall:
+       device: format-0
+       type: mount
+       id: mount-0
++  reporting:
++    builtin:
++      type: print
++  early-commands:
++    - sh -c 'printf "COSIM_AUTOINSTALL_START\\n" > /dev/ttyS0'
++  shutdown: reboot
++  late-commands:
++    - sh -c 'printf "COSIM_AUTOINSTALL_COMPLETE\\n" > /dev/ttyS0'
++  error-commands:
++    - sh -c 'printf "COSIM_AUTOINSTALL_ERROR\\n" > /dev/ttyS0'
++    - sh -c 'systemctl --failed --no-legend --plain --no-pager > /dev/ttyS0 2>&1 || true'
+   updates: security
+   version: 1

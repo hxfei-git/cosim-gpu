@@ -101,7 +101,7 @@ gdb -q -batch \
   -ex 'break error.c:62 if *errp != NULL' \
   -ex run \
   -ex 'bt full' \
-  --args qemu/build/qemu-system-x86_64 [args...]
+  --args .local/cosim/qemu/10.1.5/bin/qemu-system-x86_64 [args...]
 ```
 
 ## Upstream status

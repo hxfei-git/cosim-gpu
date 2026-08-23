@@ -14,7 +14,7 @@
 #   sudo bash /path/to/cosim_guest_setup.sh
 # ==========================================================================
 
-set -e
+set -euo pipefail
 
 echo "=== MI300X Co-simulation Guest Setup ==="
 
@@ -24,12 +24,12 @@ export HSA_ENABLE_INTERRUPT=0
 export HCC_AMDGPU_TARGET=gfx942
 
 # ---- Detect GPU count ----
-GPU_COUNT=$(lspci -d 1002: | grep -c "Display\|VGA\|3D" || echo 0)
-if [ "$GPU_COUNT" -eq 0 ]; then
-    # Also try matching by known device IDs
-    GPU_COUNT=$(lspci -d 1002: | wc -l)
-fi
+GPU_COUNT="$(lspci -Dnnd 1002:74a0 | awk 'END {print NR}')"
 echo "Detected $GPU_COUNT AMD GPU device(s)"
+if [[ "$GPU_COUNT" -eq 0 ]]; then
+    echo "  ERROR: no 1002:74a0 MI300X device was enumerated"
+    exit 1
+fi
 
 # ---- Step 1: VGA ROM ----
 echo "[1/4] Loading VGA ROM..."
@@ -40,8 +40,8 @@ if [ -f /root/roms/mi300.rom ]; then
     dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128 2>/dev/null
     echo "  VGA ROM loaded for primary GPU."
 else
-    echo "  WARNING: /root/roms/mi300.rom not found, skipping ROM load."
-    echo "  Some GPU initialization may fail."
+    echo "  ERROR: /root/roms/mi300.rom not found"
+    exit 1
 fi
 
 # ---- Step 2: IP Discovery firmware ----
@@ -108,16 +108,40 @@ fi
 echo ""
 echo "Initialized AMD GPUs: $INITIALIZED_COUNT / $GPU_COUNT"
 
+if [[ "$INITIALIZED_COUNT" -ne "$GPU_COUNT" ]]; then
+    echo "  ERROR: not every enumerated MI300X device initialized"
+    exit 1
+fi
+if [[ ! -e /dev/kfd ]]; then
+    echo "  ERROR: /dev/kfd is missing"
+    exit 1
+fi
+if ! compgen -G '/dev/dri/renderD*' >/dev/null; then
+    echo "  ERROR: no DRM render node exists"
+    exit 1
+fi
+
 if command -v rocm-smi &>/dev/null; then
     echo ""
     echo "--- rocm-smi ---"
     rocm-smi || true
 fi
 
-if command -v rocminfo &>/dev/null; then
-    echo ""
-    echo "--- rocminfo (agents) ---"
-    rocminfo 2>/dev/null | head -60 || true
+if ! command -v rocminfo &>/dev/null; then
+    echo "  ERROR: rocminfo is not installed"
+    exit 1
+fi
+echo ""
+echo "--- rocminfo (agents) ---"
+ROCMINFO_OUTPUT="$(rocminfo 2>&1)" || {
+    printf '%s\n' "$ROCMINFO_OUTPUT"
+    echo "  ERROR: rocminfo failed"
+    exit 1
+}
+printf '%s\n' "$ROCMINFO_OUTPUT" | head -60
+if ! grep -q 'gfx942' <<<"$ROCMINFO_OUTPUT"; then
+    echo "  ERROR: rocminfo did not report a gfx942 agent"
+    exit 1
 fi
 
 echo ""

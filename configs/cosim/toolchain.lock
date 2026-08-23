@@ -1,0 +1,12 @@
+# Locked host-side QEMU source identity for cosim-gpu.
+#
+# The archive SHA-256 below was recorded only after the official detached
+# signature verified against the pinned primary-key fingerprint. The build
+# wrapper checks both the tracked hash and the signature before extraction.
+
+QEMU_VERSION=10.1.5
+QEMU_SOURCE_URL=https://download.qemu.org/qemu-10.1.5.tar.xz
+QEMU_SIGNATURE_URL=https://download.qemu.org/qemu-10.1.5.tar.xz.sig
+QEMU_RELEASE_KEY_FINGERPRINT=CEACC9E15534EBABB82D3FA03353C9CEF108B584
+QEMU_RELEASE_KEY_URL=https://keys.openpgp.org/vks/v1/by-fingerprint/CEACC9E15534EBABB82D3FA03353C9CEF108B584
+QEMU_SOURCE_SHA256=1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693

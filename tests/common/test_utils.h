@@ -87,5 +87,6 @@ struct Timer {
 static inline void print_summary(const char* test_name, int failures,
                                   double ms) {
     const char* status = (failures == 0) ? "PASS" : "FAIL";
-    printf("[%s] %s (%.1f ms)\n", status, test_name, ms);
+    printf("Timing: %.1f ms\n", ms);
+    printf("[%s] %s\n", status, test_name);
 }

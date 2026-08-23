@@ -53,6 +53,7 @@ int main() {
     timer.start();
     hipLaunchKernelGGL(reduce_sum, dim3(1), dim3(BLOCK_SIZE), 0, 0,
                        d_input, d_result, N);
+    HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     double ms = timer.elapsed_ms();
 
@@ -64,9 +65,9 @@ int main() {
     VERIFY("reduction correctness (rel_err < 1e-3)", rel_err < 1e-3f);
     printf("  ref=%.2f gpu=%.2f rel_err=%.6f\n", ref_sum, gpu_sum, rel_err);
 
-    print_summary("reduction", failures, ms);
-
-    (void)hipFree(d_input); (void)hipFree(d_result);
+    HIP_CHECK(hipFree(d_input));
+    HIP_CHECK(hipFree(d_result));
     free(h_input);
+    print_summary("reduction", failures, ms);
     return failures;
 }

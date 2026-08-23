@@ -86,6 +86,10 @@ int main(int argc, char **argv) {
     int device_count = 0;
     HIP_CHECK(hipGetDeviceCount(&device_count));
     printf("Detected %d GPU(s)\n", device_count);
+    if (device_count <= 0) {
+        fprintf(stderr, "[FAIL] multi_gpu_verify\n");
+        return 1;
+    }
 
     int expected = (argc > 1) ? atoi(argv[1]) : device_count;
     if (device_count < expected) {
@@ -170,5 +174,6 @@ int main(int argc, char **argv) {
     }
 
     printf("\nAll tests PASSED (%d GPU(s))\n", num_gpus);
+    printf("[PASS] multi_gpu_verify\n");
     return 0;
 }

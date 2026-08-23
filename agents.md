@@ -80,6 +80,16 @@ ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
 - Sign commits with `Signed-off-by` from `git config user.name` and
   `git config user.email`.
 
+## Change Completion & Push Policy
+
+- After completing and validating each scoped change, report the result and
+  wait for the user to explicitly confirm that the change is successful.
+- Treat that confirmation as authorization to create a topic-scoped, signed
+  commit and push it to the configured user remote; do not require a separate
+  push request.
+- Never include unrelated working-tree changes in the commit. Do not
+  force-push unless the user explicitly requests it and the target is verified.
+
 ## Documentation Rules
 
 - Project docs under `docs/` must keep both `docs/zh/` and `docs/en/` versions.

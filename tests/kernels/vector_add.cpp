@@ -10,7 +10,7 @@ __global__ void vector_add(const float* A, const float* B, float* C, int N) {
 }
 
 int main() {
-    const int N = 1 << 12;  // 4K elements
+    const int N = (1 << 12) + 13;  // Deliberately not a whole block.
     const size_t bytes = N * sizeof(float);
     int failures = 0;
     Timer timer;
@@ -30,6 +30,7 @@ int main() {
     HIP_CHECK(hipMalloc(&d_A, bytes));
     HIP_CHECK(hipMalloc(&d_B, bytes));
     HIP_CHECK(hipMalloc(&d_C, bytes));
+    HIP_CHECK(hipMemset(d_C, 0xa5, bytes));
 
     HIP_CHECK(hipMemcpy(d_A, h_A, bytes, hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_B, h_B, bytes, hipMemcpyHostToDevice));
@@ -39,6 +40,7 @@ int main() {
     int blocks = (N + threads - 1) / threads;
     hipLaunchKernelGGL(vector_add, dim3(blocks), dim3(threads), 0, 0,
                        d_A, d_B, d_C, N);
+    HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     double ms = timer.elapsed_ms();
 
@@ -47,9 +49,10 @@ int main() {
     int errs = check_float(h_ref, h_C, N);
     VERIFY("vector_add correctness", errs == 0);
 
-    print_summary("vector_add", failures, ms);
-
-    (void)hipFree(d_A); (void)hipFree(d_B); (void)hipFree(d_C);
+    HIP_CHECK(hipFree(d_A));
+    HIP_CHECK(hipFree(d_B));
+    HIP_CHECK(hipFree(d_C));
     free(h_A); free(h_B); free(h_C); free(h_ref);
+    print_summary("vector_add", failures, ms);
     return failures;
 }

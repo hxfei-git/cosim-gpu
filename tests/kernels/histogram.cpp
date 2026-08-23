@@ -42,6 +42,7 @@ int main() {
     timer.start();
     hipLaunchKernelGGL(histogram, dim3(1), dim3(1), 0, 0,
                        d_input, d_bins, N);
+    HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     double ms = timer.elapsed_ms();
 
@@ -55,9 +56,9 @@ int main() {
     for (int i = 0; i < NUM_BINS; i++) total += h_bins[i];
     VERIFY("histogram total count == N", total == N);
 
-    print_summary("histogram", failures, ms);
-
-    (void)hipFree(d_input); (void)hipFree(d_bins);
+    HIP_CHECK(hipFree(d_input));
+    HIP_CHECK(hipFree(d_bins));
     free(h_input); free(h_bins); free(h_ref);
+    print_summary("histogram", failures, ms);
     return failures;
 }

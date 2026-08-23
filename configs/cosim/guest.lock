@@ -1,0 +1,31 @@
+# Critical source and package identities for the reproducible GPU guest image.
+# Ordinary Ubuntu dependency resolution remains snapshot-unlocked; this lock
+# therefore promises functional, not byte-for-byte, reproducibility.
+
+GUEST_LOCK_VERSION=1
+PACKER_VERSION=1.10.0
+PACKER_URL=https://releases.hashicorp.com/packer/1.10.0/packer_1.10.0_linux_amd64.zip
+PACKER_SHA256=a8442e7041db0a7db48f468e353ee07fa6a7b35276ec62f60813c518ca3296c1
+PACKER_QEMU_PLUGIN_VERSION=1.1.6
+PACKER_QEMU_PLUGIN_URL=https://releases.hashicorp.com/packer-plugin-qemu/1.1.6/packer-plugin-qemu_1.1.6_linux_amd64.zip
+PACKER_QEMU_PLUGIN_SHA256=3f735539fbdd0368785babda272b85738866f736415dce59d04b4cb550c4db87
+UBUNTU_ISO_URL=https://old-releases.ubuntu.com/releases/24.04.2/ubuntu-24.04.2-live-server-amd64.iso
+UBUNTU_ISO_SHA256=d6dab0c3a657988501b4bd76f1297c053df710e06e0c3aece60dead24f270b4d
+ROCM_KEY_FINGERPRINT=CA8BB4727A47B4D09B4EE8969386B48A1A693C5C
+ROCM_KEY_SHA256=2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b
+AMDGPU_DKMS_VERSION=1:6.14.14.30100000-2204008.24.04
+ROCM_VERSION=7.0.0.70000-38~24.04
+GUEST_KERNEL=6.8.0-79-generic
+GUEST_KERNEL_PACKAGE_VERSION=6.8.0-79.79
+# Ubuntu removed this ABI from the rolling Noble package index in June 2026.
+# Keep the official Ubuntu snapshot artifacts immutable by timestamp and SHA-256.
+GUEST_KERNEL_IMAGE_DEB_URL=https://snapshot.ubuntu.com/ubuntu/20250829T000000Z/pool/main/l/linux-signed/linux-image-6.8.0-79-generic_6.8.0-79.79_amd64.deb
+GUEST_KERNEL_IMAGE_DEB_SHA256=24d948462eadec3309354f803fe8b7f5f14441498dcdd055044d579b65c83b5e
+GUEST_KERNEL_MODULES_DEB_URL=https://snapshot.ubuntu.com/ubuntu/20250829T000000Z/pool/main/l/linux/linux-modules-6.8.0-79-generic_6.8.0-79.79_amd64.deb
+GUEST_KERNEL_MODULES_DEB_SHA256=bc0031fcd160dc3cbb50734e1e173223a8fe29d006c17b9f28a6aa45f19d4e5b
+GUEST_KERNEL_MODULES_EXTRA_DEB_URL=https://snapshot.ubuntu.com/ubuntu/20250829T000000Z/pool/main/l/linux/linux-modules-extra-6.8.0-79-generic_6.8.0-79.79_amd64.deb
+GUEST_KERNEL_MODULES_EXTRA_DEB_SHA256=95802c55ad41be81e6511ff044d77f1528cd81ab4cf626e30714d39d6d64a22a
+GUEST_KERNEL_HEADERS_DEB_URL=https://snapshot.ubuntu.com/ubuntu/20250829T000000Z/pool/main/l/linux/linux-headers-6.8.0-79_6.8.0-79.79_all.deb
+GUEST_KERNEL_HEADERS_DEB_SHA256=80c1e08da84f88c8ca080a4fa513a879556b3e65d634bf760c32e6a1e092186d
+GUEST_KERNEL_HEADERS_GENERIC_DEB_URL=https://snapshot.ubuntu.com/ubuntu/20250829T000000Z/pool/main/l/linux/linux-headers-6.8.0-79-generic_6.8.0-79.79_amd64.deb
+GUEST_KERNEL_HEADERS_GENERIC_DEB_SHA256=54cb0dfd1564d57ef13728ca9efe7dedef65e54a3538f8c06f12c356d8801da2

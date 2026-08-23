@@ -53,6 +53,7 @@ int main() {
     timer.start();
     hipLaunchKernelGGL(transpose_smem, blocks, threads, 0, 0,
                        d_in, d_out, W, H);
+    HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     double ms_smem = timer.elapsed_ms();
     HIP_CHECK(hipMemcpy(h_out_smem, d_out, bytes, hipMemcpyDeviceToHost));
@@ -60,9 +61,9 @@ int main() {
     int errs = check_float(h_ref, h_out_smem, W * H);
     VERIFY("transpose_smem correctness", errs == 0);
 
-    print_summary("transpose", failures, ms_smem);
-
-    (void)hipFree(d_in); (void)hipFree(d_out);
+    HIP_CHECK(hipFree(d_in));
+    HIP_CHECK(hipFree(d_out));
     free(h_in); free(h_out_smem); free(h_ref);
+    print_summary("transpose", failures, ms_smem);
     return failures;
 }

@@ -24,6 +24,17 @@ REQUIRED_PARAMS=(
 
 FAILED=0
 CHECKED=0
+MISSING=0
+ALLOW_MISSING_SUBMODULE=0
+
+if [[ "${1:-}" == "--allow-missing-submodule" ]]; then
+    ALLOW_MISSING_SUBMODULE=1
+    shift
+fi
+[[ $# -eq 0 ]] || {
+    echo "Usage: $0 [--allow-missing-submodule]" >&2
+    exit 2
+}
 
 check_line() {
     local file="$1"
@@ -44,6 +55,7 @@ check_line() {
 check_file() {
     local filepath="$1"
     local contents
+    local checked_before="$CHECKED"
     contents="$(cat "$filepath")"
     local lineno=0
 
@@ -64,6 +76,11 @@ check_file() {
             check_line "$filepath" "$lineno" "$line"
         fi
     done <<< "$contents"
+
+    if [[ "$CHECKED" -eq "$checked_before" ]]; then
+        echo "FAIL: ${filepath} contains no amdgpu parameter definition/invocation"
+        FAILED=$((FAILED + 1))
+    fi
 }
 
 COSIM_SCRIPTS=(
@@ -75,12 +92,18 @@ for script in "${COSIM_SCRIPTS[@]}"; do
     if [[ -f "$script" ]]; then
         check_file "$script"
     else
-        echo "SKIP: ${script} not found (submodule not checked out?)"
+        echo "MISSING: ${script}"
+        MISSING=$((MISSING + 1))
     fi
 done
 
 echo ""
-echo "Checked $CHECKED definitions/invocations, $FAILED failures."
+echo "Checked $CHECKED definitions/invocations, $FAILED failures, $MISSING missing files."
+
+if [[ "$MISSING" -gt 0 && "$ALLOW_MISSING_SUBMODULE" -eq 0 ]]; then
+    echo "FAIL: Required source files are missing; initialize exact submodules first."
+    exit 1
+fi
 
 if [[ $FAILED -gt 0 ]]; then
     echo "FAIL: Missing required modprobe parameters (see issue #9)."

@@ -65,7 +65,8 @@ target=VEGA_X86
 If current commit and source fingerprint match metadata, the build is skipped.
 If rebuild is needed, rely on the script's incremental behavior.
 
-For QEMU, metadata lives in `qemu/build/.cosim-build-meta`. Rebuild
+For QEMU, metadata lives in
+`.local/cosim/build/qemu-10.1.5/.cosim-build-meta`. Rebuild
 incrementally only when binary or metadata is missing, metadata mismatches,
 source changed, or QEMU build behavior itself is under test.
 

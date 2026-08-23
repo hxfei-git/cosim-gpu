@@ -10,7 +10,7 @@
 #
 # Usage:
 #   ./scripts/run_mi300x_fs.sh build-gem5          # Build gem5 via Docker
-#   ./scripts/run_mi300x_fs.sh build-disk           # Build disk image (needs KVM + system QEMU)
+#   ./scripts/run_mi300x_fs.sh build-disk           # Build disk image (needs KVM + pinned local QEMU)
 #   ./scripts/run_mi300x_fs.sh build-app [name]     # Build GPU test app (default: square)
 #   ./scripts/run_mi300x_fs.sh build-all            # Full setup from scratch
 #   ./scripts/run_mi300x_fs.sh run [app]            # Run with stdlib config (KVM)
@@ -35,15 +35,17 @@ SQUARE_APP="${RESOURCES_DIR}/src/gpu/square/bin.default/square.default"
 GEM5_BIN="${GEM5_DIR}/build/VEGA_X86/gem5.opt"
 
 # QEMU is a host dependency, not a project submodule.
-QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 2>/dev/null || true)}"
-
-# Logs
-LOGS_DIR="${COSIM_DIR}/logs"
-BUILD_DISK_LOG="${LOGS_DIR}/build-disk.log"
+LOCAL_QEMU_BIN="${COSIM_DIR}/.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64"
+QEMU_BIN="${QEMU_BIN:-}"
+if [[ -z "$QEMU_BIN" && -x "$LOCAL_QEMU_BIN" ]]; then
+    QEMU_BIN="$LOCAL_QEMU_BIN"
+elif [[ -z "$QEMU_BIN" ]]; then
+    QEMU_BIN="$(command -v qemu-system-x86_64 2>/dev/null || true)"
+fi
 
 # Docker images
 GEM5_BUILD_IMAGE="gem5-build:local"
-GPU_APP_BUILD_IMAGE="${GPU_APP_BUILD_IMAGE:-ghcr.io/gem5/gpu-fs}"
+GPU_APP_BUILD_IMAGE="${GPU_APP_BUILD_IMAGE:-gem5-build:local}"
 
 # gem5 config files
 STDLIB_CONFIG="${GEM5_DIR}/configs/example/gem5_library/x86-mi300x-gpu.py"
@@ -95,40 +97,6 @@ run_gem5_docker() {
 }
 
 # ==========================
-# Build gem5 (via Docker)
-# ==========================
-build_gem5() {
-    info "Building gem5 (VEGA_X86) via Docker..."
-
-    if [ -f "$GEM5_BIN" ]; then
-        info "gem5 binary already exists: $GEM5_BIN"
-        read -p "Rebuild? [y/N] " -n 1 -r
-        echo
-        [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
-    fi
-
-    require_docker
-
-    local nproc_val
-    nproc_val="$(nproc)"
-
-    info "Building local image '$GEM5_BUILD_IMAGE' from Dockerfile.run..."
-    docker build -t "$GEM5_BUILD_IMAGE" -f "${SCRIPT_DIR}/Dockerfile.run" "${SCRIPT_DIR}"
-
-    info "Using image: $GEM5_BUILD_IMAGE"
-    info "Build parallelism: -j${nproc_val}"
-
-    docker run --rm \
-        -v "${GEM5_DIR}:/gem5" \
-        -w /gem5 \
-        "$GEM5_BUILD_IMAGE" \
-        scons build/VEGA_X86/gem5.opt -j"${nproc_val}"
-
-    [ -f "$GEM5_BIN" ] || error "gem5 build failed"
-    info "gem5 built: $GEM5_BIN"
-}
-
-# ==========================
 # Get gem5-resources
 # ==========================
 get_resources() {
@@ -146,36 +114,12 @@ get_resources() {
 # Build disk image
 # ==========================
 build_disk_image() {
-    info "Building disk image (Ubuntu 22.04 + ROCm)..."
-    info "This takes ~30 min and needs ~60GB disk space"
+    info "Building reproducible disk image (Ubuntu 24.04 + ROCm 7.0)..."
+    info "This needs KVM, about 8GB RAM, and about 60GB disk space"
+    "${SCRIPT_DIR}/cosim_build.sh" guest
 
-    if [ -z "$QEMU_BIN" ] || [ ! -x "$QEMU_BIN" ]; then
-        error "qemu-system-x86_64 not found. Install QEMU or set QEMU_BIN."
-    fi
-    command -v unzip >/dev/null || \
-        error "unzip not found. Install: sudo apt install unzip"
-    check_kvm || error "KVM required for disk image build"
-
-    if [ -f "$DISK_IMAGE" ]; then
-        info "Disk image exists: $DISK_IMAGE"
-        read -p "Rebuild? [y/N] " -n 1 -r
-        echo
-        [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
-    fi
-
-    info "Using QEMU: $QEMU_BIN"
-    info "Build log:  $BUILD_DISK_LOG"
-
-    mkdir -p "$LOGS_DIR"
-    cd "${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml"
-    local proxy_args=()
-    if [ -n "${https_proxy:-}" ]; then
-        proxy_args+=(-var "http_proxy=${https_proxy}")
-    fi
-    ./build.sh -var "qemu_path=${QEMU_BIN}" "${proxy_args[@]}" \
-        2>&1 | awk '{ print strftime("[%H:%M:%S]"), $0; fflush() }' | tee "$BUILD_DISK_LOG"
-
-    [ -f "$DISK_IMAGE" ] || error "Disk image build failed"
+    [ -f "$DISK_IMAGE" ] || error "disk image build did not produce $DISK_IMAGE"
+    [ -f "$KERNEL" ] || error "disk image build did not produce $KERNEL"
     info "Disk image: $DISK_IMAGE"
     info "Kernel:     $KERNEL"
 }
@@ -381,7 +325,8 @@ Commands:
 Environment variables:
   GPU_APP_BUILD_IMAGE  Docker image for GPU app build
                      (default: $GPU_APP_BUILD_IMAGE)
-  QEMU_BIN            System QEMU binary used to build the disk image
+  QEMU_BIN            QEMU binary used to build the disk image; qemu-img is
+                      taken from the same directory
 
 Layout:
   gem5 source:       $GEM5_DIR
@@ -402,15 +347,14 @@ main() {
 
     case "$cmd" in
         build-all)
-            build_gem5
             get_resources
-            build_disk_image
+            "${SCRIPT_DIR}/cosim_build.sh" all
             build_gpu_app "${1:-square}"
             info "All components built!"
             info "Run: $0 run"
             ;;
         build-gem5)
-            build_gem5
+            "${SCRIPT_DIR}/cosim_build.sh" gem5
             ;;
         build-disk)
             get_resources
@@ -427,6 +371,7 @@ main() {
             run_simulation_legacy "${1:-$SQUARE_APP}"
             ;;
         status)
+            "${SCRIPT_DIR}/cosim_build.sh" status
             show_status
             ;;
         help|*)

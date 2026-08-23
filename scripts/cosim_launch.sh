@@ -36,7 +36,13 @@ GEM5_CONFIG="${GEM5_DIR}/configs/example/gpufs/mi300_cosim.py"
 GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
 GEM5_CONTAINER="$(cosim_container_name "$COSIM_RUN_ID")"
 
-QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-x86_64 2>/dev/null || true)}"
+LOCAL_QEMU_BIN="${COSIM_DIR}/.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64"
+QEMU_BIN="${QEMU_BIN:-}"
+if [[ -z "$QEMU_BIN" && -x "$LOCAL_QEMU_BIN" ]]; then
+    QEMU_BIN="$LOCAL_QEMU_BIN"
+elif [[ -z "$QEMU_BIN" ]]; then
+    QEMU_BIN="$(command -v qemu-system-x86_64 2>/dev/null || true)"
+fi
 DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
 KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
 
@@ -61,6 +67,7 @@ SCREEN_LOG="/tmp/cosim-${COSIM_RUN_ID}.log"
 ARTIFACT_DIR="${COSIM_DIR}/artifacts/standalone/${COSIM_RUN_ID}"
 COSIM_FAILURE_CATEGORY=""
 COSIM_SECONDARY_STATUS=""
+GEM5_LOG_PID=""
 
 # ---- Colors ----
 
@@ -71,6 +78,8 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+# Called from EXIT-trap paths that static analysis cannot always follow.
+# shellcheck disable=SC2317
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
@@ -86,7 +95,7 @@ Usage: $0 [options]
 Options:
   --disk-image PATH       Disk image  (default: auto-detect in gem5-resources)
   --kernel PATH           vmlinux     (default: auto-detect in gem5-resources)
-  --qemu-bin PATH         QEMU binary (default: qemu-system-x86_64 from PATH)
+  --qemu-bin PATH         QEMU binary (default: pinned repository-local QEMU)
   --gem5-bin PATH         gem5 binary (default: build/VEGA_X86/gem5.opt)
   --gem5-docker IMAGE     Docker image for gem5 (default: gem5-run:local)
   --socket-path PATH      Unix socket (default: /tmp/gem5-mi300x.sock)
@@ -99,8 +108,9 @@ Options:
   --share-dir PATH        Share host dir with guest via 9p (mount tag: cosim_share)
   --num-gpus N            Number of GPU instances (default: 1)
   --timeout SECS          gem5 init timeout (default: 120)
+  --artifact-dir PATH     Run artifact directory under this repository
   --force-clean           List orphaned cosim resources (dry-run)
-  --confirm               With --force-clean, actually delete orphans
+  --confirm               Reserved; unscoped deletion is refused
   -h, --help              Show this help
 EOF
     exit 0
@@ -123,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --share-dir)     SHARE_DIR="$2";        shift 2 ;;
         --num-gpus)      NUM_GPUS="$2";         shift 2 ;;
         --timeout)       GEM5_TIMEOUT="$2";     shift 2 ;;
+        --artifact-dir)  ARTIFACT_DIR="$2";     shift 2 ;;
         --force-clean)   FORCE_CLEAN=1;         shift ;;
         --confirm)       FORCE_CLEAN_CONFIRM=1; shift ;;
         -h|--help)       usage ;;
@@ -130,12 +141,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ "$COSIM_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || \
+    error "unsafe COSIM_RUN_ID: $COSIM_RUN_ID"
+[[ "$COSIM_RUN_ID" != *..* ]] || error "unsafe COSIM_RUN_ID: $COSIM_RUN_ID"
+for numeric_name in HOST_CPUS NUM_CUS NUM_GPUS GEM5_TIMEOUT; do
+    numeric_value="${!numeric_name}"
+    [[ "$numeric_value" =~ ^[1-9][0-9]*$ ]] || error "${numeric_name} must be a positive integer"
+done
+ARTIFACT_DIR="$(realpath -m -- "$ARTIFACT_DIR")"
+case "$ARTIFACT_DIR" in
+    "${COSIM_DIR}/artifacts/"*) ;;
+    *) error "--artifact-dir must be below ${COSIM_DIR}/artifacts" ;;
+esac
+
 # Handle --force-clean mode
 if [[ -n "$FORCE_CLEAN" ]]; then
     info "Force-clean mode (run-ID: $COSIM_RUN_ID)"
     if [[ -n "$FORCE_CLEAN_CONFIRM" ]]; then
-        warn "Deleting orphaned cosim resources..."
-        force_clean_orphans "true"
+        error "Unscoped deletion is refused; use cosim_cleanup.sh with a valid manifest."
     else
         info "Dry-run: listing orphaned cosim resources..."
         force_clean_orphans "false"
@@ -180,22 +203,33 @@ C_GEM5_CONFIG="/gem5/configs/example/gpufs/mi300_cosim.py"
 
 # ---- Validation ----
 
-[[ -f "$GEM5_BIN" ]]   || error "gem5 not found: $GEM5_BIN\n  Build: scons build/VEGA_X86/gem5.opt -j\$(nproc)"
+[[ -f "$GEM5_BIN" ]]   || error "gem5 not found: $GEM5_BIN\n  Build: ./scripts/cosim_build.sh gem5"
 [[ -n "$QEMU_BIN" && -x "$QEMU_BIN" ]] || error "qemu-system-x86_64 not found. Install QEMU 10.1+ or pass --qemu-bin."
 "$QEMU_BIN" -device help 2>/dev/null | grep 'vfio-user-pci' >/dev/null || \
     error "QEMU does not provide vfio-user-pci. Install QEMU 10.1+ or pass a compatible --qemu-bin."
 [[ -f "$DISK_IMAGE" ]] || error "Disk image not found: $DISK_IMAGE\n  Build: ./scripts/run_mi300x_fs.sh build-disk"
 [[ -f "$KERNEL" ]]     || error "Kernel not found: $KERNEL\n  Build: ./scripts/run_mi300x_fs.sh build-disk"
-[[ -r /dev/kvm ]]      || error "/dev/kvm not available. KVM is required for QEMU."
+[[ -r /dev/kvm && -w /dev/kvm ]] || error "/dev/kvm must be readable and writable."
+[[ "$SOCKET_PATH" == "/tmp/gem5-mi300x-${COSIM_RUN_ID}.sock" ]] || \
+    error "--socket-path must remain run-scoped: /tmp/gem5-mi300x-${COSIM_RUN_ID}.sock"
+if [[ -n "$SHARE_DIR" ]]; then
+    SHARE_DIR="$(realpath -e -- "$SHARE_DIR")"
+    [[ -d "$SHARE_DIR" ]] || error "--share-dir is not a directory: $SHARE_DIR"
+fi
 
 docker info >/dev/null 2>&1 || error "Docker not running"
 docker image inspect "$GEM5_DOCKER_IMAGE" >/dev/null 2>&1 || \
-    error "Docker image '$GEM5_DOCKER_IMAGE' not found.\n  Build: cd scripts && docker build -t gem5-run:local -f Dockerfile.run ."
+    error "Docker image '$GEM5_DOCKER_IMAGE' not found.\n  Build: ./scripts/cosim_build.sh gem5"
 
 # ---- Session and manifest setup ----
 
-mkdir -p "$SESSION_DIR"
-manifest_init "$SESSION_DIR"
+mkdir -p "${COSIM_DIR}/.local/cosim"
+exec 8>"${COSIM_DIR}/.local/cosim/runtime.lock"
+flock -n 8 || error "another cosim session owns ${COSIM_DIR}/.local/cosim/runtime.lock"
+
+[[ ! -e "$SESSION_DIR" && ! -L "$SESSION_DIR" ]] || \
+    error "stale or symlinked session directory exists: $SESSION_DIR"
+manifest_init "$SESSION_DIR" "$COSIM_RUN_ID" "$COSIM_DIR"
 
 manifest_add "runtime" "container" "$GEM5_CONTAINER"
 manifest_add "runtime" "shmem" "$SHMEM_HOST_FILE"
@@ -211,22 +245,21 @@ manifest_add "artifact" "directory" "$ARTIFACT_DIR"
 # shellcheck disable=SC2317
 cleanup() {
     local exit_code="${1:-$?}"
+    local cleanup_result="PASS"
     echo ""
 
-    # If runner signaled normal completion, treat as test_pass regardless
-    if [[ -f "/tmp/cosim-test-done-${COSIM_RUN_ID}" ]]; then
-        rm -f "/tmp/cosim-test-done-${COSIM_RUN_ID}"
-        COSIM_FAILURE_CATEGORY="$COSIM_CAT_TEST_PASS"
-    elif [[ -z "$COSIM_FAILURE_CATEGORY" ]]; then
+    if [[ -z "$COSIM_FAILURE_CATEGORY" ]]; then
         if [[ "$exit_code" -eq 0 ]]; then
-            COSIM_FAILURE_CATEGORY="$COSIM_CAT_TEST_PASS"
+            COSIM_FAILURE_CATEGORY="$COSIM_CAT_LAUNCHER_EXIT"
         else
             COSIM_FAILURE_CATEGORY="$COSIM_CAT_INFRA_UNKNOWN"
         fi
     fi
 
-    # Write category to a file outside session dir (session dir is deleted during cleanup)
-    echo "$COSIM_FAILURE_CATEGORY" > "/tmp/cosim-launcher-category-${COSIM_RUN_ID}.txt" 2>/dev/null || true
+    # Persist infrastructure status with the immutable run evidence.
+    mkdir -p "$ARTIFACT_DIR"
+    printf '%s\n' "$COSIM_FAILURE_CATEGORY" > \
+        "${ARTIFACT_DIR}/launcher-category.txt" 2>/dev/null || true
 
     if [[ "$COSIM_FAILURE_CATEGORY" != "$COSIM_CAT_TEST_PASS" ]]; then
         info "Capturing diagnostic artifacts (category: $COSIM_FAILURE_CATEGORY)..."
@@ -235,14 +268,28 @@ cleanup() {
     fi
 
     info "Shutting down co-simulation (run-ID: $COSIM_RUN_ID)..."
-    cleanup_from_manifest "$GEM5_CONTAINER"
+    if ! cleanup_from_manifest "$GEM5_CONTAINER"; then
+        COSIM_SECONDARY_STATUS="$COSIM_CAT_CLEANUP_FAIL"
+        cleanup_result="FAIL"
+        warn "Cleanup manifest contained an unsafe or failed entry."
+    fi
+    if [[ -n "$GEM5_LOG_PID" ]]; then
+        wait "$GEM5_LOG_PID" 2>/dev/null || true
+    fi
 
     if verify_cleanup 10 "$GEM5_CONTAINER"; then
         info "Teardown verified."
     else
         COSIM_SECONDARY_STATUS="$COSIM_CAT_CLEANUP_FAIL"
+        cleanup_result="FAIL"
         warn "Teardown verification failed: some resources may remain."
     fi
+
+    {
+        echo "result=${cleanup_result}"
+        echo "primary_category=${COSIM_FAILURE_CATEGORY}"
+        echo "secondary_category=${COSIM_SECONDARY_STATUS:-none}"
+    } > "${ARTIFACT_DIR}/cleanup-status.txt"
 
     info "Run: $COSIM_RUN_ID | Category: $COSIM_FAILURE_CATEGORY${COSIM_SECONDARY_STATUS:+ | Secondary: $COSIM_SECONDARY_STATUS}"
 }
@@ -260,8 +307,10 @@ run_preflight_audit | tee "${SESSION_DIR}/preflight.log"
 step "Starting gem5 MI300X GPU model in Docker..."
 
 GEM5_DOCKER_CMD=(
-    docker run -d --rm
+    docker run -d
     --name "$GEM5_CONTAINER"
+    --label "io.cosim-gpu.run-id=${COSIM_RUN_ID}"
+    --label "io.cosim-gpu.repo-root=${COSIM_DIR}"
     --user "$(id -u):$(id -g)"
     -v "${GEM5_DIR}:/gem5"
     -v /tmp:/tmp
@@ -291,6 +340,10 @@ GEM5_DOCKER_CMD+=(
 "${GEM5_DOCKER_CMD[@]}" >/dev/null
 
 info "gem5 container '$GEM5_CONTAINER' started"
+mkdir -p "$ARTIFACT_DIR"
+docker logs --follow --timestamps "$GEM5_CONTAINER" \
+    > "${ARTIFACT_DIR}/gem5.log" 2>&1 &
+GEM5_LOG_PID=$!
 
 # ==================================================================
 # Step 2: Wait for gem5 cosim socket to be ready

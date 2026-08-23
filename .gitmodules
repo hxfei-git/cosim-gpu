@@ -1,8 +1,6 @@
 [submodule "gem5"]
 	path = gem5
-	url = git@github.com:gevico/gem5.git
-	branch = cosim-gpu-on-develop
+	url = https://github.com/gevico/gem5.git
 [submodule "gem5-resources"]
 	path = gem5-resources
-	url = git@github.com:gevico/gem5-resources.git
-	branch = cosim-gpu
+	url = https://github.com/gevico/gem5-resources.git

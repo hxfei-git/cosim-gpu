@@ -73,17 +73,20 @@ int main() {
     // Step 1: scan within each block
     hipLaunchKernelGGL(inclusive_scan, dim3(num_blocks), dim3(BLOCK_SIZE),
                        0, 0, d_input, d_output, d_block_sums, N);
+    HIP_CHECK(hipGetLastError());
 
     // Step 2: scan the block sums (fits in one block for small N)
     if (num_blocks > 1) {
         hipLaunchKernelGGL(inclusive_scan, dim3(1), dim3(BLOCK_SIZE),
                            0, 0, d_block_sums, d_scanned_sums, nullptr,
                            num_blocks);
+        HIP_CHECK(hipGetLastError());
 
         // Step 3: add block offsets
         hipLaunchKernelGGL(add_block_offset, dim3(num_blocks),
                            dim3(BLOCK_SIZE), 0, 0,
                            d_output, d_scanned_sums, N);
+        HIP_CHECK(hipGetLastError());
     }
 
     HIP_CHECK(hipDeviceSynchronize());
@@ -97,10 +100,11 @@ int main() {
     // Spot-check last element
     printf("  last element: ref=%d gpu=%d\n", h_ref[N - 1], h_output[N - 1]);
 
-    print_summary("prefix_scan", failures, ms);
-
-    (void)hipFree(d_input); (void)hipFree(d_output);
-    (void)hipFree(d_block_sums); (void)hipFree(d_scanned_sums);
+    HIP_CHECK(hipFree(d_input));
+    HIP_CHECK(hipFree(d_output));
+    HIP_CHECK(hipFree(d_block_sums));
+    HIP_CHECK(hipFree(d_scanned_sums));
     free(h_input); free(h_output); free(h_ref);
+    print_summary("prefix_scan", failures, ms);
     return failures;
 }

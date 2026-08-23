@@ -8,3 +8,8 @@ build/
 .codex
 .codex/
 .claude/
+artifacts/
+m5out/
+local-cosim-runs/
+.local/cosim/
+*.qcow2

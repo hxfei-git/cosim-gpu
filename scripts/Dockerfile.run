@@ -1,4 +1,4 @@
-FROM ghcr.io/gem5/gpu-fs:latest
+FROM ghcr.io/gem5/gpu-fs@sha256:b956faf2f16ab75fedc4e984fc1e00a54bbfbac2af6d94b19c9cc82acb244264
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 \
         libjson-c-dev \

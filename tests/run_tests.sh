@@ -10,7 +10,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build"
+BUILD_DIR="${TEST_BUILD_DIR:-${SCRIPT_DIR}/build}"
 FILTER=""
 JSON=0
 TEST_TIMEOUT_SECS="${TEST_TIMEOUT_SECS:-60}"
@@ -18,9 +18,25 @@ TEST_TIMEOUT_SECS="${TEST_TIMEOUT_SECS:-60}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --json)  JSON=1; shift ;;
-        *)       FILTER="$1"; shift ;;
+        *)
+            [[ -z "$FILTER" ]] || {
+                echo "Only one exact test name may be supplied." >&2
+                exit 2
+            }
+            FILTER="$1"
+            shift
+            ;;
     esac
 done
+
+[[ "$TEST_TIMEOUT_SECS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "TEST_TIMEOUT_SECS must be a positive integer." >&2
+    exit 2
+}
+[[ -z "$FILTER" || "$FILTER" =~ ^[a-z0-9_]+$ ]] || {
+    echo "Invalid test name: $FILTER" >&2
+    exit 2
+}
 
 if [[ ! -d "$BUILD_DIR" ]]; then
     echo "Build directory not found. Run 'make' first."
@@ -31,7 +47,7 @@ TESTS=()
 for bin in "$BUILD_DIR"/*; do
     [[ -x "$bin" ]] || continue
     name="$(basename "$bin")"
-    if [[ -n "$FILTER" && "$name" != *"$FILTER"* ]]; then
+    if [[ -n "$FILTER" && "$name" != "$FILTER" ]]; then
         continue
     fi
     TESTS+=("$bin")
@@ -63,22 +79,6 @@ run_with_timeout() {
     while kill -0 "$pid" 2>/dev/null; do
         now=$(date +%s)
         if (( now - start_ts >= timeout_secs )); then
-            if grep -q '^\[PASS\] ' "$output_file"; then
-                kill -TERM "$pid" 2>/dev/null || true
-                sleep 1
-                kill -KILL "$pid" 2>/dev/null || true
-                wait "$pid" 2>/dev/null || true
-                return 0
-            fi
-
-            if grep -q '^\[FAIL\] ' "$output_file"; then
-                kill -TERM "$pid" 2>/dev/null || true
-                sleep 1
-                kill -KILL "$pid" 2>/dev/null || true
-                wait "$pid" 2>/dev/null || true
-                return 1
-            fi
-
             kill -TERM "$pid" 2>/dev/null || true
             sleep 1
             kill -KILL "$pid" 2>/dev/null || true
@@ -91,11 +91,13 @@ run_with_timeout() {
     wait "$pid"
 }
 
-echo "============================================================"
-echo "  cosim GPU Operator Tests"
-echo "  Tests: $TOTAL"
-echo "============================================================"
-echo ""
+if [[ $JSON -eq 0 ]]; then
+    echo "============================================================"
+    echo "  cosim GPU Operator Tests"
+    echo "  Tests: $TOTAL"
+    echo "============================================================"
+    echo ""
+fi
 
 for test_bin in "${TESTS[@]}"; do
     name="$(basename "$test_bin")"
@@ -113,6 +115,15 @@ for test_bin in "${TESTS[@]}"; do
     output="$(cat "$tmp_output")"
     rm -f "$tmp_output"
 
+    if [[ "$rc" -eq 0 ]]; then
+        pass_count="$(awk -v marker="[PASS] ${name}" \
+            '$0 == marker {count++} END {print count + 0}' <<<"$output")"
+        fail_count="$(awk '/^\[FAIL\] / {count++} END {print count + 0}' <<<"$output")"
+        if [[ "$pass_count" -ne 1 || "$fail_count" -ne 0 ]]; then
+            rc=1
+        fi
+    fi
+
     case "$rc" in
         0)
             status="PASS"
@@ -128,8 +139,8 @@ for test_bin in "${TESTS[@]}"; do
             ;;
     esac
 
-    # Extract timing from output (look for pattern like "(123.4 ms)")
-    ms=$(echo "$output" | grep -oP '\([\d.]+ ms\)' | head -1 | tr -d '()ms ')
+    # Extract the first standard timing line.
+    ms="$(sed -n 's/^Timing: \([0-9.][0-9.]*\) ms$/\1/p' <<<"$output" | head -n 1)"
     ms=${ms:-"?"}
 
     if [[ $JSON -eq 0 ]]; then
@@ -143,12 +154,7 @@ for test_bin in "${TESTS[@]}"; do
     RESULTS+=("{\"name\":\"$name\",\"status\":\"$status\",\"time_ms\":\"$ms\"}")
 done
 
-echo "============================================================"
-echo "  Results: ${PASSED}/${TOTAL} passed, ${FAILED} failed"
-echo "============================================================"
-
 if [[ $JSON -eq 1 ]]; then
-    echo ""
     echo "{"
     echo "  \"total\": $TOTAL,"
     echo "  \"passed\": $PASSED,"
@@ -161,6 +167,10 @@ if [[ $JSON -eq 1 ]]; then
     done
     echo "  ]"
     echo "}"
+else
+    echo "============================================================"
+    echo "  Results: ${PASSED}/${TOTAL} passed, ${FAILED} failed"
+    echo "============================================================"
 fi
 
 [[ $FAILED -eq 0 ]]

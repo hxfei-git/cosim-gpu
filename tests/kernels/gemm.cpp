@@ -79,6 +79,7 @@ int main() {
     timer.start();
     hipLaunchKernelGGL(gemm_tiled, blocks, threads, 0, 0,
                        d_A, d_B, d_C, M, N, K);
+    HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     double ms = timer.elapsed_ms();
 
@@ -87,9 +88,10 @@ int main() {
     int errs = check_float(h_ref, h_C, M * N);
     VERIFY("gemm_tiled correctness", errs == 0);
 
-    print_summary("gemm_tiled", failures, ms);
-
-    (void)hipFree(d_A); (void)hipFree(d_B); (void)hipFree(d_C);
+    HIP_CHECK(hipFree(d_A));
+    HIP_CHECK(hipFree(d_B));
+    HIP_CHECK(hipFree(d_C));
     free(h_A); free(h_B); free(h_C); free(h_ref);
+    print_summary("gemm", failures, ms);
     return failures;
 }

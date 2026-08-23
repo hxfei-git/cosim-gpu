@@ -12,12 +12,15 @@ LAUNCH_SCRIPT="${SCRIPT_DIR}/cosim_launch.sh"
 
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/cosim_lib.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/cosim_guest_env.sh"
 
 SESSION_NAME="${SESSION_NAME:-qemu-cosim-tests}"
 SCREEN_LOG="${SCREEN_LOG:-}"
 BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-240}"
 TEST_TIMEOUT_SECS="${TEST_TIMEOUT_SECS:-60}"
 GUEST_RUN_TIMEOUT_SECS="${GUEST_RUN_TIMEOUT_SECS:-1800}"
+GUEST_TEST_PREFIX="${GUEST_TEST_PREFIX:-}"
 KEEP_ALIVE_ON_SUCCESS=0
 RUN_ALL=0
 REPEAT_COUNT=0
@@ -61,6 +64,10 @@ Options:
   -h, --help             Show this help
 
 Unknown options are passed through to cosim_launch.sh.
+
+Environment:
+  GUEST_TEST_PREFIX       Empty, HSA_ENABLE_INTERRUPT=0, or
+                          HSA_ENABLE_INTERRUPT=1 (default: empty -> 0)
 EOF
     exit 0
 }
@@ -88,6 +95,9 @@ for timeout_name in BOOT_TIMEOUT_SECS TEST_TIMEOUT_SECS GUEST_RUN_TIMEOUT_SECS; 
         error "${timeout_name} must be a positive integer"
 done
 [[ "$REPEAT_COUNT" =~ ^[0-9]+$ ]] || error "--repeat must be a non-negative integer"
+if ! GUEST_HSA_ENABLE_INTERRUPT="$(cosim_guest_hsa_interrupt "$GUEST_TEST_PREFIX")"; then
+    error "invalid GUEST_TEST_PREFIX"
+fi
 
 COSIM_RUN_ID="${COSIM_RUN_ID:-$(generate_run_id)}"
 export COSIM_RUN_ID
@@ -401,6 +411,19 @@ GUEST_SCRIPT_HOST="${STAGING_DIR}/${GUEST_SCRIPT}"
 
 PATCH_DIR="${RUNNER_ARTIFACT_DIR}/patch"
 mkdir -p "$PATCH_DIR"
+
+git -C "$COSIM_DIR" status --short --untracked-files=all > \
+    "${PATCH_DIR}/repo-status.txt"
+git -C "$COSIM_DIR" diff --binary --no-ext-diff HEAD > \
+    "${PATCH_DIR}/repo.patch"
+git -C "$COSIM_DIR" ls-files --others --exclude-standard > \
+    "${PATCH_DIR}/repo-untracked-files.txt"
+if [[ -s "${PATCH_DIR}/repo-untracked-files.txt" ]]; then
+    git -C "$COSIM_DIR" ls-files -z --others --exclude-standard | \
+        tar -C "$COSIM_DIR" --null --files-from=- -cf \
+            "${PATCH_DIR}/repo-untracked-files.tar"
+fi
+
 SOURCE_FINGERPRINT="$(
     cd "$STAGING_DIR"
     find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
@@ -409,6 +432,15 @@ SOURCE_FINGERPRINT="$(
     echo "head_commit=$(git -C "$COSIM_DIR" rev-parse HEAD)"
     echo "source_fingerprint=${SOURCE_FINGERPRINT}"
     echo "program=${TEST_NAME}"
+    echo "runner_sha256=$(sha256sum "${SCRIPT_DIR}/run_cosim_tests.sh" | awk '{print $1}')"
+    echo "guest_env_helper_sha256=$(sha256sum "${SCRIPT_DIR}/cosim_guest_env.sh" | awk '{print $1}')"
+    echo "repo_patch_sha256=$(sha256sum "${PATCH_DIR}/repo.patch" | awk '{print $1}')"
+    echo "repo_untracked_list_sha256=$(sha256sum "${PATCH_DIR}/repo-untracked-files.txt" | awk '{print $1}')"
+    if [[ -f "${PATCH_DIR}/repo-untracked-files.tar" ]]; then
+        echo "repo_untracked_archive_sha256=$(sha256sum "${PATCH_DIR}/repo-untracked-files.tar" | awk '{print $1}')"
+    else
+        echo "repo_untracked_archive_sha256=none"
+    fi
 } > "${PATCH_DIR}/source-snapshot.txt"
 
 git -C "${COSIM_DIR}/gem5" status --short > "${PATCH_DIR}/gem5-status.txt"
@@ -466,7 +498,7 @@ cat >"$GUEST_SCRIPT_HOST" <<EOF
 #!/bin/bash
 set -uo pipefail
 
-export HSA_ENABLE_INTERRUPT="\${HSA_ENABLE_INTERRUPT:-0}"
+export HSA_ENABLE_INTERRUPT="${GUEST_HSA_ENABLE_INTERRUPT}"
 case "\$HSA_ENABLE_INTERRUPT" in
     0|1) ;;
     *) echo "invalid HSA_ENABLE_INTERRUPT=\$HSA_ENABLE_INTERRUPT"; exit 2 ;;
@@ -578,6 +610,8 @@ docker inspect "$cname" > "${RUNNER_ARTIFACT_DIR}/docker-inspect.json" 2>&1 || t
     echo "program_source=tests/kernels/${TEST_NAME}.cpp"
     echo "program_binary=tests/build/${TEST_NAME}"
     echo "runner_argument=${TEST_NAME}"
+    echo "guest_test_prefix=${GUEST_TEST_PREFIX}"
+    echo "expected_hsa_enable_interrupt=${GUEST_HSA_ENABLE_INTERRUPT}"
     echo "compile_exit_code=${compile_rc}"
     echo "test_exit_code=${result_rc}"
     echo "exit_code=${result_rc}"
@@ -640,8 +674,7 @@ if [[ -f "${RUNNER_ARTIFACT_DIR}/verdict.json" ]]; then
     verdict_reason="$(python3 -c \
         'import json,sys; print(json.load(open(sys.argv[1]))["reason"])' \
         "${RUNNER_ARTIFACT_DIR}/verdict.json")"
-    hsa_interrupt="$(awk -F= '/^\[COSIM_ENV\] HSA_ENABLE_INTERRUPT=[01]$/ {print $2; exit}' \
-        <<<"$normalised_output")"
+    hsa_interrupt="$(cosim_guest_hsa_interrupt_from_log "$SCREEN_LOG" || true)"
     {
         printf 'program\thsa_interrupt\trun\tsession_id\toutcome\texit_code\treason\tartifact_dir\n'
         printf '%s\t%s\t1\t%s\t%s\t%s\t%s\t%s\n' \

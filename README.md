@@ -1,209 +1,82 @@
-# QEMU + gem5 MI300X Co-simulation
+# cosim-gpu
 
-[中文文档](README.zh.md)
+[中文说明](README.zh.md)
 
-Co-simulation framework that pairs **QEMU** (host CPU/system via KVM) with
-**gem5** (cycle-accurate MI300X GPU model) to run real AMD ROCm/HIP workloads
-on a simulated GPU without physical hardware.
+`cosim-gpu` connects a KVM/Q35 guest in QEMU to the MI300X GPU model in gem5 through vfio-user. The supported workflow is repository-owned and evidence-first: initialize the pinned sources, run preflight, build through the wrapper, and validate a real HIP program in a fresh co-simulation session.
 
-```
-+-----------------------------+       +----------------------------+
-|  QEMU  (Q35 + KVM)          |       |  gem5  (Docker)            |
-|  +-----------------------+  |       |  +----------------------+  |
-|  | Guest Linux           |  |       |  | MI300X GPU Model     |  |
-|  | amdgpu driver         |  |       |  |  Shader / CU / SDMA  |  |
-|  | ROCm 7.0 / HIP        |  |       |  |  PM4 / Ruby caches   |  |
-|  +----------+------------+  |       |  +---------+------------+  |
-|  +----------v------------+  |       |  +---------v------------+  |
-|  | vfio-user-pci         |<-------->|  | MI300XVfioUser       |  |
-|  | (QEMU built-in)       |  |vfio-  |  | (libvfio-user)       |  |
-|  +-----------------------+  |user   |  +----------------------+  |
-+-----------------------------+       +----------------------------+
-        |                                       |
-        v                                       v
-  /dev/shm/cosim-guest-ram            /dev/shm/mi300x-vram
-  (shared guest RAM)                  (shared GPU VRAM)
+```text
+HIP program in Guest Linux
+  -> ROCm / KFD / amdgpu
+  -> PCI BARs, MMIO, queues and GPU virtual memory
+  -> QEMU vfio-user transport
+  -> gem5 MI300X GPU model
+  -> result and classified evidence returned to the host
 ```
 
-## Features
+The default single-GPU profile models 16 GiB of VRAM and 40 compute units, with 8 GiB of guest RAM. QEMU is not taken from the host `PATH`: [`configs/cosim/toolchain.lock`](configs/cosim/toolchain.lock) pins the repository-local QEMU 10.1.5 toolchain.
 
-- **Full amdgpu driver load** — DRM initialized, 7 XCP partitions, gfx942
-- **HIP compute verified** — hipMalloc, kernel dispatch, hipDeviceSynchronize
-- **MSI-X interrupts** — gem5 → QEMU interrupt forwarding, IH ring buffer
-- **Shared memory DMA** — zero-copy VRAM and guest RAM via `/dev/shm`
-- **Auto driver load** — systemd service for `ip_block_mask=0x67 discovery=2`
+## Quick start
 
-## Prerequisites
+The host must be x86_64 Linux (native or WSL 2), with working KVM and a reachable Docker daemon. Docker group membership is root-equivalent; review the trust boundary before granting it. See the complete [Getting Started guide](docs/en/getting-started.md) for resource requirements, group refresh, WSL details, proxy checks, and recovery.
 
-| Requirement | Details |
+```bash
+git submodule update --init --recursive
+
+./scripts/cosim_preflight.sh build \
+    --output-dir artifacts/preflight/build
+
+./scripts/cosim_build.sh all
+./scripts/cosim_build.sh status
+
+./scripts/cosim_preflight.sh run \
+    --output-dir artifacts/preflight/run
+
+GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh vector_add
+```
+
+`run_cosim_tests.sh` creates a fresh QEMU/gem5 session, builds the exact staged test inside the guest, runs it, classifies the evidence, and cleans up its own run-scoped resources. The command prints the artifact directory. Completion means all of these agree—not merely that compilation succeeded:
+
+- `verdict.json` reports `"outcome": "PASS"` and an acceptance reason.
+- `matrix.tsv` records the program, effective interrupt mode, session, outcome, exit code, and artifact path.
+- `patch/source-snapshot.txt` and `patch/binary-provenance.txt` identify the source tree and binary used.
+- `cleanup-status.txt` reports verified cleanup.
+
+Use `./scripts/run_cosim_tests.sh --all` only after the single-program smoke test passes. Each operator still receives a fresh session.
+
+## Reproducible entry points
+
+| Task | Supported entry point |
 |---|---|
-| Host OS | Linux x86_64 with KVM (tested on WSL2 6.6.x) |
-| Docker | Running daemon, user in `docker` group |
-| KVM | `/dev/kvm` accessible |
-| QEMU | System-installed QEMU 10.1+ with `vfio-user-pci` |
-| Disk space | ~120 GB (55G disk image + build artifacts) |
-| RAM | 16 GB+ recommended |
+| Read-only host/build/runtime checks | `./scripts/cosim_preflight.sh host\|build\|run` |
+| Pinned QEMU, gem5, m5, or guest build | `./scripts/cosim_build.sh qemu\|gem5\|m5\|guest\|all` |
+| Build and provenance status | `./scripts/cosim_build.sh status` |
+| Interactive co-simulation | `./scripts/cosim_launch.sh` |
+| Fresh-session classified test | `./scripts/run_cosim_tests.sh <program>` |
+| Run-scoped cleanup | `./scripts/cosim_cleanup.sh --run-id <id>` |
 
-## Quick Start
+Do not replace these entry points with hand-written Docker, SCons, Packer, or QEMU commands. The wrappers enforce pinned inputs, run-scoped names, manifests, provenance, evidence capture, and cleanup checks.
 
-### Option A: Script-based
+## Repository map
 
-```bash
-git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
-cd cosim-gpu
+- `gem5/` — simulator and MI300X GPU model submodule.
+- `gem5-resources/` — guest image recipe, kernel, ROCm payload, and workloads submodule.
+- `configs/cosim/` — lockfiles and co-simulation configuration.
+- `scripts/` — preflight, build, launch, test, classification, audit, and cleanup entry points.
+- `tests/kernels/` — HIP integration programs; `tests/common/` contains shared helpers.
+- `docs/en/` and `docs/zh/` — paired English and Chinese documentation.
 
-# Build gem5 + disk image (~2h total, needs KVM + Docker + ~60GB disk)
-# This auto-builds the Docker image with json-c (needed by ext/libvfio-user)
-./scripts/run_mi300x_fs.sh build-all
+## Documentation and labs
 
-# Build runtime Docker image (for running gem5 inside Docker)
-cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
+- [Getting Started](docs/en/getting-started.md) — host setup, reproducible build, launch, validation, evidence, and cleanup.
+- [Learning labs](docs/en/labs.md) — source-guided experiments for PCI/BAR/MMIO, memory translation, queues, PM4, SDMA, interrupts, and HIP dispatch.
+- [Architecture](docs/en/architecture.md) — transport, memory sharing, GPUVM/GART, DMA, and MSI-X data paths.
+- [Reference and debugging](docs/en/reference.md) — parameters, source map, known limitations, and diagnostic signatures.
 
-# Launch co-simulation
-./scripts/cosim_launch.sh
-```
+## Local checkpoint
 
-### Option B: Manual step-by-step
-
-```bash
-# 1. Clone with submodules
-git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
-cd cosim-gpu
-
-# 2. Verify the host QEMU installation (no QEMU source submodule is required)
-qemu-system-x86_64 --version
-qemu-system-x86_64 -device help | grep vfio-user-pci
-
-# 3. Build Docker image (adds json-c needed by ext/libvfio-user)
-cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
-
-# 4. Build gem5 (in Docker, ~30min; use -j1 if OOM-killed during linking)
-cd gem5
-docker run --rm -v "$(pwd):/gem5" -w /gem5 \
-    gem5-run:local \
-    scons build/VEGA_X86/gem5.opt -j4
-cd ..
-
-# 5. Pre-build m5 utility (recommended — avoids git clone inside guest VM)
-docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 \
-    gem5-run:local \
-    bash -c "cd util/m5 && scons build/x86/out/m5"
-cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
-
-# 6. Build disk image (Ubuntu 24.04 + ROCm 7.0, ~40min, needs KVM + ~60GB disk)
-./scripts/run_mi300x_fs.sh build-disk
-
-# 7. Launch co-simulation
-./scripts/cosim_launch.sh
-```
-
-After guest boots (auto-login as root), the GPU driver loads automatically
-via `cosim-gpu-setup.service` (~40s). Verify:
-
-```bash
-rocm-smi          # should show device 0x74a0
-rocminfo          # should show gfx942
-
-# Manual setup (if the systemd service is not installed):
-dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
-modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
-
-# Run a HIP test
-cat > /tmp/test.cpp << 'EOF'
-#include <hip/hip_runtime.h>
-#include <cstdio>
-__global__ void add(int *a, int *b, int *c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] + b[i];
-}
-int main() {
-    const int N = 4;
-    int ha[] = {1,2,3,4}, hb[] = {10,20,30,40}, hc[4] = {};
-    int *da, *db, *dc;
-    hipMalloc(&da, N*4); hipMalloc(&db, N*4); hipMalloc(&dc, N*4);
-    hipMemcpy(da, ha, N*4, hipMemcpyHostToDevice);
-    hipMemcpy(db, hb, N*4, hipMemcpyHostToDevice);
-    add<<<1, N>>>(da, db, dc, N);
-    hipMemcpy(hc, dc, N*4, hipMemcpyDeviceToHost);
-    printf("Result: %d %d %d %d\n", hc[0], hc[1], hc[2], hc[3]);
-    printf("%s\n", (hc[0]==11&&hc[1]==22&&hc[2]==33&&hc[3]==44) ? "PASSED!" : "FAILED!");
-    hipFree(da); hipFree(db); hipFree(dc);
-}
-EOF
-/opt/rocm/bin/hipcc --offload-arch=gfx942 -o /tmp/test /tmp/test.cpp
-/tmp/test
-# Expected: Result: 11 22 33 44
-#           PASSED!
-```
-
-## Repository Structure
-
-```
-cosim-gpu/
-|-- gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
-|   |-- src/dev/amdgpu/      # MI300X GPU device model & vfio-user bridge
-|   |-- ext/libvfio-user/    # libvfio-user library (Nutanix)
-|   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
-|-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
-|-- .agents/                 # reusable repository workflows (vendored)
-|-- scripts/                 # build & launch scripts
-|   |-- cosim_launch.sh      # one-click cosim launcher
-|   |-- run_mi300x_fs.sh     # build orchestration
-|   |-- cosim_guest_setup.sh # guest-side GPU setup
-|   `-- Dockerfile.run       # gem5 runtime Docker image
-|-- docs/                    # technical documentation (zh + en)
-|   |-- en/                  # English
-|   `-- zh/                  # Chinese
-|-- LICENSE                  # Apache 2.0
-`-- README.md                # this file
-```
-
-## Key Components
-
-### QEMU Side (stock `vfio-user-pci`)
-
-Uses QEMU's built-in `vfio-user-pci` device (no custom QEMU code). QEMU connects
-to gem5's vfio-user server and maps all BARs through the standard vfio-user protocol:
-- **BAR0+1**: VRAM (64-bit, prefetchable, shared memory backed)
-- **BAR2+3**: Doorbell (64-bit, forwarded to gem5 via vfio-user)
-- **BAR4**: MSI-X (256 vectors, eventfd-based KVM injection)
-- **BAR5**: MMIO registers (32-bit, forwarded to gem5 via vfio-user)
-
-### gem5 Side (`gem5/src/dev/amdgpu/`)
-
-- **MI300XVfioUser** — vfio-user server (libvfio-user), BAR/config/IRQ dispatch
-- **AMDGPUDevice** — MI300X GPU device model (MMIO, doorbell, config space)
-- **PM4PacketProcessor** — command processor with VRAM-aware fence routing
-- **SDMAEngine** — DMA engine with VRAM write-back support
-- **AMDGPUVM** — GART translation with cosim fallback (shared VRAM PTE reads)
-
-## Version Matrix
-
-| Component | Version |
-|---|---|
-| Guest OS | Ubuntu 24.04.2 LTS |
-| Guest kernel | 6.8.0-79-generic |
-| ROCm | 7.0.0 |
-| GPU device | MI300X (gfx942, DeviceID 0x74A0) |
-| gem5 build | VEGA_X86, GPU_VIPER coherence |
-
-## Documentation
-
-Detailed technical documentation is available in [`docs/`](docs/README.md):
-
-- [Getting Started](docs/en/getting-started.md) — build, launch, and run your first HIP test
-- [Architecture](docs/en/architecture.md) — system design, memory sharing, address translation
-- [Reference](docs/en/reference.md) — parameters, troubleshooting, debugging commands
+A local checkpoint on 2026-08-24 validated the pinned build and fresh-session guest driver/ROCm/HIP path. Its generated `artifacts/` are intentionally ignored by Git and are not a substitute for reproducing `verdict.json` on another host.
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE).
-
-Note: The submodules are governed by their own licenses. QEMU is a host runtime
-dependency and is not vendored by this repository.
-
-## Acknowledgments
-
-- [gem5](https://www.gem5.org/) — modular computer architecture simulator
-- [QEMU](https://www.qemu.org/) — open-source machine emulator
-- [ROCm](https://rocm.docs.amd.com/) — AMD GPU computing platform
+See [LICENSE](LICENSE).

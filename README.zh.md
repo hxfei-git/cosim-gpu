@@ -1,188 +1,82 @@
-# QEMU + gem5 MI300X 联合仿真
+# cosim-gpu
 
 [English](README.md)
 
-将 **QEMU**（KVM 加速的宿主机 CPU/系统仿真）与 **gem5**（周期精确的 MI300X GPU
-模型）相结合的联合仿真框架，无需物理 GPU 硬件即可运行真实的 AMD ROCm/HIP 工作负载。
+`cosim-gpu` 通过 vfio-user，把 QEMU 中运行的 KVM/Q35 Guest 连接到 gem5 的 MI300X GPU 模型。项目支持的流程由仓库脚本统一管理，并以证据为准：初始化锁定的源码、执行 preflight、通过 wrapper 构建，再在全新的协同仿真会话中验证真实 HIP 程序。
 
-```
-+-----------------------------+       +----------------------------+
-|  QEMU  (Q35 + KVM)          |       |  gem5  (Docker)            |
-|  +-----------------------+  |       |  +----------------------+  |
-|  | Guest Linux           |  |       |  | MI300X GPU Model     |  |
-|  | amdgpu driver         |  |       |  |  Shader / CU / SDMA  |  |
-|  | ROCm 7.0 / HIP        |  |       |  |  PM4 / Ruby caches   |  |
-|  +----------+------------+  |       |  +---------+------------+  |
-|  +----------v------------+  |       |  +---------v------------+  |
-|  | vfio-user-pci         |<-------->|  | MI300XVfioUser       |  |
-|  | (QEMU built-in)       |  |vfio-  |  | (libvfio-user)       |  |
-|  +-----------------------+  |user   |  +----------------------+  |
-+-----------------------------+       +----------------------------+
-        |                                       |
-        v                                       v
-  /dev/shm/cosim-guest-ram            /dev/shm/mi300x-vram
-  (shared guest RAM)                  (shared GPU VRAM)
+```text
+Guest Linux 中的 HIP 程序
+  -> ROCm / KFD / amdgpu
+  -> PCI BAR、MMIO、队列与 GPU 虚拟内存
+  -> QEMU vfio-user 传输
+  -> gem5 MI300X GPU 模型
+  -> 结果与分类后的证据返回 Host
 ```
 
-## 功能特性
-
-- **完整驱动加载** — amdgpu DRM 初始化，7 个 XCP 分区，gfx942 架构
-- **HIP 计算验证** — hipMalloc、内核调度、hipDeviceSynchronize 全流程通过
-- **MSI-X 中断转发** — gem5 → QEMU 中断转发，IH ring buffer 正常工作
-- **共享内存 DMA** — 通过 `/dev/shm` 实现 VRAM 和 Guest RAM 的零拷贝共享
-- **驱动自动加载** — systemd 服务自动以 `ip_block_mask=0x67 discovery=2` 加载
-
-## 前置条件
-
-| 需求       | 说明                                           |
-| ---------- | ---------------------------------------------- |
-| 宿主机系统 | Linux x86_64，支持 KVM（已在 WSL2 6.6.x 验证） |
-| Docker     | 守护进程运行中，当前用户在`docker` 组        |
-| KVM        | `/dev/kvm` 可访问                            |
-| QEMU       | 系统安装的 QEMU 10.1+，并提供`vfio-user-pci` |
-| 磁盘空间   | 约 120 GB（55G 磁盘镜像 + 构建中间产物）       |
-| 内存       | 建议 16 GB 以上                                |
+默认单 GPU 配置包含 16 GiB VRAM、40 个建模 CU 和 8 GiB Guest 内存。QEMU 不从 Host 的 `PATH` 获取；[`configs/cosim/toolchain.lock`](configs/cosim/toolchain.lock) 锁定仓库本地的 QEMU 10.1.5 工具链。
 
 ## 快速开始
 
-### 方案 A：脚本一键构建
+Host 必须是 x86_64 Linux（原生 Linux 或 WSL 2），并且 KVM 可用、Docker daemon 可访问。Docker 组权限等价于 root；授权前必须确认这一信任边界。资源要求、组权限刷新、WSL、代理检查和恢复方法见完整的[入门指南](docs/zh/getting-started.md)。
 
 ```bash
-git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
-cd cosim-gpu
+git submodule update --init --recursive
 
-# 构建 gem5 + 磁盘镜像（总计约 2 小时，需要 KVM + Docker + 约 60GB 磁盘空间）
-# 会自动构建包含 json-c 的 Docker 镜像（ext/libvfio-user 编译依赖）
-./scripts/run_mi300x_fs.sh build-all
+./scripts/cosim_preflight.sh build \
+    --output-dir artifacts/preflight/build
 
-# 构建运行时 Docker 镜像（用于在 Docker 内运行 gem5）
-cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
+./scripts/cosim_build.sh all
+./scripts/cosim_build.sh status
 
-# 启动联合仿真
-./scripts/cosim_launch.sh
+./scripts/cosim_preflight.sh run \
+    --output-dir artifacts/preflight/run
+
+GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh vector_add
 ```
 
-### 方案 B：手动分步构建
+`run_cosim_tests.sh` 会创建新的 QEMU/gem5 会话，在 Guest 中构建精确暂存的测试、执行测试、分类证据，并清理该次运行自己拥有的资源。命令会打印 artifact 目录。完成标准是以下证据一致，而不仅是“编译成功”：
 
-```bash
-# 1. 克隆仓库（含子模块）
-git clone --recurse-submodules git@github.com:gevico/cosim-gpu.git
-cd cosim-gpu
+- `verdict.json` 报告 `"outcome": "PASS"` 和验收原因。
+- `matrix.tsv` 记录程序、实际中断模式、会话、结果、退出码和 artifact 路径。
+- `patch/source-snapshot.txt` 与 `patch/binary-provenance.txt` 标识实际使用的源码树和二进制。
+- `cleanup-status.txt` 报告清理验证通过。
 
-# 2. 验证宿主机 QEMU（无需 QEMU 源码子模块）
-qemu-system-x86_64 --version
-qemu-system-x86_64 -device help | grep vfio-user-pci
+单程序 smoke test 通过后再使用 `./scripts/run_cosim_tests.sh --all`；其中每个算子仍使用全新会话。
 
-# 3. 构建 Docker 镜像（添加 ext/libvfio-user 编译所需的 json-c）
-cd scripts && docker build -t gem5-run:local -f Dockerfile.run . && cd ..
+## 可复现入口
 
-# 4. 编译 gem5（Docker 内，约 30 分钟；链接阶段 OOM 可改用 -j1）
-cd gem5
-docker run --rm -v "$(pwd):/gem5" -w /gem5 \
-    gem5-run:local \
-    scons build/VEGA_X86/gem5.opt -j4
-cd ..
+| 任务 | 支持的入口 |
+|---|---|
+| 只读 Host/构建/运行检查 | `./scripts/cosim_preflight.sh host\|build\|run` |
+| 锁定的 QEMU、gem5、m5 或 Guest 构建 | `./scripts/cosim_build.sh qemu\|gem5\|m5\|guest\|all` |
+| 构建和 provenance 状态 | `./scripts/cosim_build.sh status` |
+| 交互式协同仿真 | `./scripts/cosim_launch.sh` |
+| 全新会话的分类测试 | `./scripts/run_cosim_tests.sh <program>` |
+| 运行范围内的清理 | `./scripts/cosim_cleanup.sh --run-id <id>` |
 
-# 5. 预编译 m5 工具（推荐 - 避免构建磁盘镜像时在 Guest 内 git clone）
-docker run --rm -v "$(pwd)/gem5:/gem5" -w /gem5 \
-    gem5-run:local \
-    bash -c "cd util/m5 && scons build/x86/out/m5"
-cp gem5/util/m5/build/x86/out/m5 gem5-resources/src/x86-ubuntu-gpu-ml/files/
-
-# 6. 构建磁盘镜像（Ubuntu 24.04 + ROCm 7.0，约 40 分钟，需要 KVM + 约 60GB 磁盘空间）
-./scripts/run_mi300x_fs.sh build-disk
-
-# 7. 启动联合仿真
-./scripts/cosim_launch.sh
-```
-
-Guest 启动后（自动以 root 登录），GPU 驱动通过 `cosim-gpu-setup.service`
-自动加载（约 40 秒）。验证：
-
-```bash
-rocm-smi          # 应显示设备 0x74a0
-rocminfo          # 应显示 gfx942
-
-# 手动加载（如果 systemd 服务未安装）：
-dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
-modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
-
-# 运行 HIP 测试
-cat > /tmp/test.cpp << 'EOF'
-#include <hip/hip_runtime.h>
-#include <cstdio>
-__global__ void add(int *a, int *b, int *c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] + b[i];
-}
-int main() {
-    const int N = 4;
-    int ha[] = {1,2,3,4}, hb[] = {10,20,30,40}, hc[4] = {};
-    int *da, *db, *dc;
-    hipMalloc(&da, N*4); hipMalloc(&db, N*4); hipMalloc(&dc, N*4);
-    hipMemcpy(da, ha, N*4, hipMemcpyHostToDevice);
-    hipMemcpy(db, hb, N*4, hipMemcpyHostToDevice);
-    add<<<1, N>>>(da, db, dc, N);
-    hipMemcpy(hc, dc, N*4, hipMemcpyDeviceToHost);
-    printf("Result: %d %d %d %d\n", hc[0], hc[1], hc[2], hc[3]);
-    printf("%s\n", (hc[0]==11&&hc[1]==22&&hc[2]==33&&hc[3]==44) ? "PASSED!" : "FAILED!");
-    hipFree(da); hipFree(db); hipFree(dc);
-}
-EOF
-/opt/rocm/bin/hipcc --offload-arch=gfx942 -o /tmp/test /tmp/test.cpp
-/tmp/test
-# 预期输出: Result: 11 22 33 44
-#           PASSED!
-```
+不要用手写 Docker、SCons、Packer 或 QEMU 命令替换这些入口。Wrapper 会强制使用锁定输入、运行范围内的资源名和 manifest，并执行 provenance、证据归档与清理检查。
 
 ## 仓库结构
 
-```
-cosim-gpu/
-|-- gem5/                    # gem5 simulator (submodule, cosim-gpu branch)
-|   |-- src/dev/amdgpu/      # MI300X GPU device model & vfio-user bridge
-|   |-- ext/libvfio-user/    # libvfio-user library (Nutanix)
-|   `-- configs/example/gpufs/mi300_cosim.py  # cosim configuration
-|-- gem5-resources/          # disk images, kernels, GPU apps (submodule)
-|-- .agents/                 # 可复用的仓库工作流（已内置）
-|-- scripts/                 # build & launch scripts
-|   |-- cosim_launch.sh      # one-click cosim launcher
-|   |-- run_mi300x_fs.sh     # build orchestration
-|   |-- cosim_guest_setup.sh # guest-side GPU setup
-|   `-- Dockerfile.run       # gem5 runtime Docker image
-|-- docs/                    # technical documentation (zh + en)
-|   |-- en/                  # English
-|   `-- zh/                  # Chinese
-|-- LICENSE                  # Apache 2.0
-`-- README.md
-```
+- `gem5/` — 仿真器和 MI300X GPU 模型 submodule。
+- `gem5-resources/` — Guest 镜像配方、内核、ROCm 内容和 workload submodule。
+- `configs/cosim/` — lockfile 与协同仿真配置。
+- `scripts/` — preflight、构建、启动、测试、分类、审计和清理入口。
+- `tests/kernels/` — HIP 集成程序；`tests/common/` 提供共享辅助代码。
+- `docs/en/` 与 `docs/zh/` — 成对维护的中英文文档。
 
-## 技术文档
+## 文档与实验
 
-详细技术文档位于 [`docs/`](docs/README.md) 目录下：
+- [入门指南](docs/zh/getting-started.md) — Host 设置、可复现构建、启动、验证、证据和清理。
+- [学习实验](docs/zh/labs.md) — 面向源码的 PCI/BAR/MMIO、内存转换、队列、PM4、SDMA、中断与 HIP Dispatch 实验。
+- [系统架构](docs/zh/architecture.md) — 传输、内存共享、GPUVM/GART、DMA 和 MSI-X 数据流。
+- [参考与调试](docs/zh/reference.md) — 参数、源码地图、已知限制和诊断特征。
 
-- [快速入门](docs/zh/getting-started.md) — 从编译到运行首个 HIP 测试的全流程
-- [架构文档](docs/zh/architecture.md) — 系统设计、内存共享、地址翻译
-- [参考手册](docs/zh/reference.md) — 参数表、故障排查、调试命令
+## 本地检查点
 
-## 版本矩阵
-
-| 组件           | 版本                             |
-| -------------- | -------------------------------- |
-| Guest 操作系统 | Ubuntu 24.04.2 LTS               |
-| Guest 内核     | 6.8.0-79-generic                 |
-| ROCm           | 7.0.0                            |
-| GPU 设备       | MI300X (gfx942, DeviceID 0x74A0) |
-| gem5 构建目标  | VEGA_X86, GPU_VIPER 一致性协议   |
+2026-08-24 的本地检查点验证了锁定构建以及全新会话中的 Guest driver/ROCm/HIP 链路。生成的 `artifacts/` 按设计被 Git 忽略，不能替代在另一台 Host 上重新得到 `verdict.json`。
 
 ## 许可证
 
-本项目采用 [Apache License 2.0](LICENSE) 许可证。
-
-注意：各子模块遵循各自的许可证。QEMU 仅作为宿主机运行时依赖，本仓库不再内置其源码。
-
-## 致谢
-
-- [gem5](https://www.gem5.org/) — 模块化计算机体系结构仿真器
-- [QEMU](https://www.qemu.org/) — 开源机器模拟器
-- [ROCm](https://rocm.docs.amd.com/) — AMD GPU 计算平台
+见 [LICENSE](LICENSE)。

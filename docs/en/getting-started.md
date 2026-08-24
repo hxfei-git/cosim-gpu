@@ -1,525 +1,306 @@
-[中文](../zh/getting-started.md)
-
 # Getting Started
 
-A quick-start guide for newcomers to the QEMU + gem5 MI300X co-simulation project.
-From building the components to running your first HIP GPU compute test.
+[中文](../zh/getting-started.md) | [Project README](../../README.md) | [Learning Labs](labs.md)
 
-## Overview
+This guide is the public, reproducible path from a new checkout to a classified HIP execution through Guest Linux, amdgpu/KFD/ROCm, QEMU vfio-user, and the gem5 MI300X model. Use the repository wrappers shown here. They encode the source locks, build provenance, run-scoped resources, evidence contract, and cleanup rules that ad-hoc commands omit.
 
-```
-+-----------------------------+       +----------------------------+
-|  QEMU  (Q35 + KVM)          |       |  gem5  (Docker)            |
-|  +-----------------------+  |       |  +----------------------+  |
-|  | Guest Linux           |  |       |  | MI300X GPU Model     |  |
-|  | amdgpu driver         |  |       |  |  Shader / CU / SDMA  |  |
-|  | ROCm 7.0 / HIP        |  |       |  |  PM4 / Ruby caches   |  |
-|  +----------+------------+  |       |  +---------+------------+  |
-|  +----------v------------+  |       |  +---------v------------+  |
-|  | vfio-user-pci         |<-------->|  | MI300XVfioUser       |  |
-|  | (QEMU built-in)       |  |vfio-  |  | (libvfio-user)       |  |
-|  +-----------------------+  |user   |  +----------------------+  |
-+-----------------------------+       +----------------------------+
-        |                                       |
-        v                                       v
-  /dev/shm/cosim-guest-ram            /dev/shm/mi300x-vram
-  (shared guest RAM)                  (shared GPU VRAM)
+## Supported workflow
+
+```text
+submodules
+  -> host/build preflight
+  -> pinned QEMU + gem5 + m5 + guest build
+  -> runtime preflight
+  -> one fresh QEMU/gem5 session per HIP program
+  -> verdict + matrix + provenance + verified cleanup
 ```
 
-- **QEMU** handles CPU execution, Linux kernel boot, PCIe enumeration, and amdgpu driver loading.
-- **gem5** models the MI300X GPU: Shader, Compute Units, Cache hierarchy, and DMA engines.
-- They communicate via the **vfio-user protocol** over a Unix domain socket. QEMU uses its built-in `vfio-user-pci` device; gem5 runs `MI300XVfioUser` as the server.
-- Guest RAM and GPU VRAM are shared via **shared memory** under `/dev/shm/`.
+A successful compilation is an intermediate result. Acceptance requires the complete runtime path and a classifier-produced `PASS` with matching provenance and cleanup evidence.
 
-For a deeper dive into the memory architecture and BAR layout, see [Architecture](architecture.md#memory-sharing-architecture).
+Do not build or launch this stack with direct Docker, SCons, Packer, or QEMU commands. Do not invent fixed container names, sockets, or shared-memory paths. The wrappers generate a run ID and a resource manifest so concurrent and interrupted runs remain attributable.
 
-## Prerequisites
+## Host and WSL requirements
 
-| Requirement | Description |
+### Platform and resources
+
+`cosim_preflight.sh` enforces the following host baseline:
+
+| Requirement | Required state |
 |---|---|
-| Host OS | Linux x86_64 with KVM support (verified on WSL2 6.6.x) |
-| Docker | Daemon running, current user in `docker` group |
-| KVM | `/dev/kvm` accessible |
-| QEMU | System-installed QEMU 10.1+ with `vfio-user-pci` |
-| Disk Space | At least 120 GB (55G disk image + build artifacts) |
-| Memory | 16 GB or more recommended (gem5 compilation and runtime are memory-intensive) |
-| Tools | `git`, `screen`, `unzip` |
+| OS and architecture | Linux on x86_64 |
+| CPU | At least 2 online host CPUs |
+| Memory | At least 12 GiB total host RAM |
+| Workspace | At least 80 GiB free on the repository filesystem |
+| Virtualization | `/dev/kvm` exists and is readable/writable by the current process |
+| Runtime storage | `/dev/shm` and `/tmp` exist and are writable |
+| Containers | Docker daemon is reachable and reports amd64/x86_64 |
+| Network | GitHub, QEMU downloads, and GHCR are reachable for a build profile |
 
-## Building gem5 and Checking QEMU
+Native Linux is the simplest host. WSL must be WSL 2 and must expose a usable `/dev/kvm` to Linux. Enabling CPU virtualization in BIOS/UEFI, enabling nested virtualization, restarting Windows, and restarting WSL are host-owner actions; the repository cannot perform them. This project does not require or automatically edit `.wslconfig`.
 
-### Build the Runtime Docker Image
+The default launch uses 8 GiB of guest RAM, 4 guest CPUs, one GPU with 16 GiB of modeled VRAM, and 40 modeled compute units. These are guest/model settings, not substitutes for the host minimums above.
 
-Before building gem5, create the runtime Docker image:
+### Dependency and access wrapper
 
-```bash
-cd scripts
-docker build -t gem5-run:local -f Dockerfile.run .
-```
-
-This image is based on `ghcr.io/gem5/gpu-fs` with Python 3.12 support added.
-
-### Build gem5
-
-The gem5 binary links against Ubuntu 24.04 libraries and must be compiled in a compatible environment.
-
-> **Note:** The vfio-user backend requires `libjson-c-dev` (build-time) and `libjson-c5` (runtime). The `gem5-run:local` image already includes this dependency.
-
-**Option 1: Orchestration Script**
+Audit first. The audit is read-only and reports installed packages, WSL/native Linux, resources, Docker, KVM, and account group state:
 
 ```bash
-./scripts/run_mi300x_fs.sh build-gem5
+./scripts/cosim_host_setup.sh audit --for-user "$USER"
 ```
 
-**Option 2: Build inside Docker (Manual)**
+On a Debian/Ubuntu host with systemd, ask the wrapper to print the exact privileged plan before installing anything:
 
 ```bash
-cd /path/to/cosim-gpu/gem5
-
-docker run --rm \
-    -v "$(pwd):/gem5" -w /gem5 \
-    gem5-run:local \
-    scons build/VEGA_X86/gem5.opt -j4
+./scripts/cosim_host_setup.sh plan --for-user "$USER"
 ```
 
-> **Tip:** Reduce parallelism (`-j1` or `-j2`) if OOM-killed during linking.
-
-Output: `build/VEGA_X86/gem5.opt` (approximately 1.1 GB).
-
-### Check the System QEMU
-
-QEMU is a host dependency rather than a source submodule. A **stock QEMU 10.1+**
-with the built-in `vfio-user-pci` device is required.
+The installation action must run as root. It installs the repository's fixed package set and enables Docker, but leaves group membership unchanged by default:
 
 ```bash
-qemu-system-x86_64 --version
-qemu-system-x86_64 -device help | grep vfio-user-pci
+sudo ./scripts/cosim_host_setup.sh install --for-user "$USER"
 ```
 
-Pass a non-default installation to the launcher with `--qemu-bin PATH`, or set
-`QEMU_BIN` when building the disk image.
-
-## Building the Disk Image
-
-The disk image contains Ubuntu 24.04 + ROCm 7.0 + kernel 6.8.0-79-generic with amdgpu DKMS modules.
-
-### Automated Build
+If the host owner has explicitly accepted both memberships, add `--grant-runtime-groups` to the `plan` and `install` actions. The `kvm` group grants access to hardware virtualization. The `docker` group is a stronger trust boundary: it is effectively root-equivalent because members can ask the daemon to mount or modify host resources.
 
 ```bash
-./scripts/run_mi300x_fs.sh build-disk
+./scripts/cosim_host_setup.sh plan --for-user "$USER" \
+    --grant-runtime-groups
+sudo ./scripts/cosim_host_setup.sh install --for-user "$USER" \
+    --grant-runtime-groups
 ```
 
-If `gem5-resources` is not initialized, the script initializes its submodule before the build begins.
+The setup wrapper never reads credentials, changes sudoers, edits WSL/Windows configuration, or stores proxy values. Any sudo authentication is handled by the host's normal privilege broker, outside the script.
 
-### Manual Build
+If Docker is supplied by an external host integration such as Docker Desktop, do not blindly run the systemd installation action. Use `audit`, configure the provider deliberately, and continue only when preflight can reach its amd64 daemon.
+
+### Group refresh
+
+Adding an account to `docker` or `kvm` does not update existing shells, terminals, IDEs, or an already-running Codex process.
+
+- On native Linux, end the login session completely and sign in again.
+- On WSL, close Linux shells, run `wsl --shutdown` from Windows PowerShell, then relaunch the distribution. This is a manual Windows boundary.
+- Do not infer access from account membership alone. The later preflight checks the permissions of the process that will actually launch co-simulation.
+
+After opening a fresh session, run:
 
 ```bash
-cd gem5-resources/src/x86-ubuntu-gpu-ml
-./build.sh -var "qemu_path=/usr/sbin/qemu-system-x86_64"
+./scripts/cosim_host_setup.sh verify --for-user "$USER"
 ```
 
-> On Arch Linux the QEMU path is `/usr/sbin/`; other distributions may use `/usr/bin/`.
+Then run the `host` preflight below. The two checks are complementary: setup verification checks packages and account configuration; preflight checks current-process KVM and Docker access plus resource limits.
 
-### Output
+### Network and proxies
 
-| Artifact | Path | Size |
-|---|---|---|
-| Disk Image | `gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | ~55 GB |
-| Kernel | `gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | ~64 MB |
+The host preflight records only whether standard uppercase and lowercase proxy variables are set; it redacts their values and credentials. The build preflight also probes GitHub, `download.qemu.org`, and GHCR. If a proxy is required, configure the shell and Docker daemon through normal host policy, then rerun preflight. Never put proxy credentials in repository files, command history examples, or artifacts intended for sharing.
 
-> **Tip (China network):** If the build hangs on package downloads, apply the China mirror patch to speed up `apt` inside the VM. See [Reference §7](reference.md#7-china-mirror-configuration) for instructions.
+## Initialize pinned sources
 
-## Launching Co-simulation
+From the repository root:
 
-### Option 1: One-click Launch Script (Recommended)
+```bash
+git submodule update --init --recursive
+git submodule status --recursive
+```
+
+Both `gem5/` and `gem5-resources/` must match the gitlinks recorded by the top-level commit. Do not update either submodule merely to solve a local build problem; that changes the experiment identity and must be reviewed as a source change.
+
+## Run preflight
+
+Use repository-relative artifact directories. Preflight refuses output outside `artifacts/` and writes human-readable evidence plus JSON when requested.
+
+```bash
+./scripts/cosim_preflight.sh host \
+    --output-dir artifacts/preflight/host
+
+./scripts/cosim_preflight.sh build \
+    --output-dir artifacts/preflight/build
+```
+
+| Profile | What it checks |
+|---|---|
+| `host` | Linux/x86_64, CPUs, RAM, disk, KVM, Docker, temporary storage, proxy state, and download endpoints |
+| `build` | All host checks plus pinned submodules, compilers/tools, and QEMU development libraries |
+| `run` | Runtime host checks plus pinned QEMU provenance/features, gem5, m5/guest assets, disk image, and stale-resource safety |
+
+Add `--json` when machine-readable preflight evidence is needed. A required `FAIL` or `UNKNOWN` returns exit code 1; invalid arguments return 2. Do not build past a required preflight failure—use its check ID and remediation text to repair the host, then rerun the same profile.
+
+## Reproducible build
+
+[`configs/cosim/toolchain.lock`](../../configs/cosim/toolchain.lock) pins QEMU 10.1.5, its official source identity, and signature key. The build wrapper installs it under `.local/cosim/qemu/10.1.5/`; launch prefers that repository-local binary instead of a host `PATH` copy. Guest inputs are independently pinned by [`configs/cosim/guest.lock`](../../configs/cosim/guest.lock).
+
+### Build actions
+
+| Action | Behavior |
+|---|---|
+| `status` | Read-only report of QEMU, gem5, m5, and guest paths, metadata, hashes, and readiness |
+| `qemu` | Verify the lock and build repository-local QEMU 10.1.5 incrementally |
+| `gem5` | Build the repository Docker images and `VEGA_X86/gem5.opt` with provenance |
+| `m5` | Ensure gem5 is built, build the x86 m5 utility, and stage it into guest files |
+| `guest` | Ensure QEMU and m5 are ready, then build and validate the pinned guest image and kernel |
+| `all` | Execute the complete dependency chain through `guest` |
+
+The normal full build is:
+
+```bash
+./scripts/cosim_build.sh status
+./scripts/cosim_build.sh all
+./scripts/cosim_build.sh status
+```
+
+For a focused build, replace `all` with `qemu`, `gem5`, `m5`, or `guest`. `--force` reruns the selected normal incremental path and never deletes build trees, for example:
+
+```bash
+./scripts/cosim_build.sh gem5 --force
+```
+
+QEMU, gem5, and m5 build parallelism defaults to 4 jobs. Tune only through `QEMU_BUILD_JOBS`, `GEM5_BUILD_JOBS`, and `M5_BUILD_JOBS` on the wrapper invocation; reducing jobs is the first response to host memory pressure.
+
+Do not invoke `lock-qemu-source` during ordinary setup: the tracked lock already contains the accepted source SHA-256. A mismatch is a provenance failure, not permission to replace the lock locally.
+
+After the build, require a runtime preflight:
+
+```bash
+./scripts/cosim_preflight.sh run \
+    --output-dir artifacts/preflight/run
+```
+
+Proceed only when required checks pass and `status` identifies the pinned local QEMU, standard gem5 binary, staged m5, guest image, and guest kernel.
+
+## Launch and inspect a guest
+
+For an interactive architecture/debugging session, use:
 
 ```bash
 ./scripts/cosim_launch.sh
 ```
 
-This script automatically starts the gem5 container, waits for readiness, fixes permissions, starts QEMU, and enters the serial console in interactive mode.
+The launcher assigns a unique run ID, creates run-scoped socket/container/shared-memory names, records a resource manifest, starts gem5 in its runtime image, waits for model readiness, and starts QEMU/KVM in the foreground. Its default artifact directory is `artifacts/standalone/<generated-run-id>`.
 
-Common options:
+The Guest auto-login console should eventually show the `cosim-gpu-setup.service` path completing. Observational checks printed by the launcher include `rocm-smi` and `rocminfo`; expected identity is the modeled AMD device with a `gfx942` agent. For the acceptance path, also expect PCI enumeration, an amdgpu-bound device, `/dev/kfd` and DRM nodes, and no fatal GPUVM/PM4/SDMA/IH error before the HIP result.
 
-```bash
-./scripts/cosim_launch.sh --gem5-debug MI300XCosim   # enable gem5 debug output
-./scripts/cosim_launch.sh --vram-size 32GiB          # custom VRAM size
-./scripts/cosim_launch.sh --num-cus 80               # custom CU count
-```
+Press `Ctrl-A X` to leave QEMU. Allow the launcher trap to capture logs and verify cleanup. Interactive launch is useful for inspection, but it is not a classified test and does not replace the fresh-session runner.
 
-### Option 2: Manual Step-by-step Launch
+### Partial driver initialization
 
-#### Start gem5 (Docker Container)
+If PCI enumeration succeeds but amdgpu initialization, KFD, or ROCm only partially appears, treat that guest as contaminated evidence:
 
-```bash
-docker run -d --name gem5-cosim \
-    -v /path/to/cosim-gpu/gem5:/gem5 \
-    -v /tmp:/tmp \
-    -v /dev/shm:/dev/shm \
-    -w /gem5 \
-    -e PYTHONPATH=/usr/lib/python3.12/lib-dynload \
-    gem5-run:local \
-    /gem5/build/VEGA_X86/gem5.opt --listener-mode=on \
-    /gem5/configs/example/gpufs/mi300_cosim.py \
-    --socket-path=/tmp/gem5-mi300x.sock \
-    --shmem-path=/mi300x-vram \
-    --shmem-host-path=/cosim-guest-ram \
-    --dgpu-mem-size=16GiB \
-    --num-compute-units=40 \
-    --mem-size=8G
-```
+1. Preserve the printed run ID and artifact directory.
+2. Exit through the launcher so its manifest-scoped cleanup runs.
+3. Inspect the captured QEMU console, gem5 log, launcher category, and cleanup status.
+4. Start a new session for every retry.
 
-#### Wait for gem5 to be Ready
+Do not unload/reload amdgpu repeatedly after `hw_init` fails, and do not use a manually repaired guest as a passing baseline. Driver initialization changes kernel and device state; retrying in place can hide the first failure. See [Known Issues and Pitfalls](reference.md#4-known-issues-and-pitfalls) before choosing a debug experiment.
+
+## Run fresh-session HIP tests
+
+The test runner accepts an exact stem from `tests/kernels/<stem>.cpp`, stages that test tree, compiles it in the guest, requires exactly one matching `[PASS]` marker and no `[FAIL]` marker, classifies the raw evidence, and verifies cleanup.
+
+Start with the repository's `vector_add` program:
 
 ```bash
-docker logs -f gem5-cosim
+GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh vector_add
 ```
 
-The following output indicates readiness:
-
-```
-============================================================
-gem5 MI300X co-simulation server ready
-  Socket:     /tmp/gem5-mi300x.sock
-  VRAM SHM:   /mi300x-vram
-  Host SHM:   /cosim-guest-ram
-  VRAM size:  16GiB
-  Host RAM:   8GiB
-  CUs:        40
-Waiting for QEMU to connect...
-============================================================
-```
-
-#### Fix Permissions
-
-Files created by Docker are owned by root; permissions must be fixed so QEMU can access them:
+The empty `GUEST_TEST_PREFIX` also means `HSA_ENABLE_INTERRUPT=0`. Use one of only these explicit values when comparing runtime behavior:
 
 ```bash
-docker exec gem5-cosim chmod 777 /tmp/gem5-mi300x.sock
-docker exec gem5-cosim chmod 666 /dev/shm/mi300x-vram
+GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh vector_add
+
+GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
+    ./scripts/run_cosim_tests.sh vector_add
 ```
 
-#### Start QEMU
+Record the two modes as separate experiments. Mode 1 exercises interrupt-backed HSA signaling and is not interchangeable with the mode-0 baseline. `matrix.tsv` must contain the effective value observed from the guest; an unknown or unexpected value invalidates the row.
+
+Current runner timeouts are 240 seconds to reach the guest login prompt, 60 seconds for the program inside the guest, and a 1,800-second host deadline for guest compilation plus execution. Override them only through `run_cosim_tests.sh` options and record the resulting command with the evidence.
+
+Once the smoke test passes:
 
 ```bash
-qemu-system-x86_64 \
-    -machine q35 -enable-kvm -cpu host \
-    -m 8G -smp 4 \
-    -object memory-backend-file,id=mem0,size=8G,mem-path=/dev/shm/cosim-guest-ram,share=on \
-    -numa node,memdev=mem0 \
-    -kernel /home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70 \
-    -append "console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu" \
-    -drive file=/home/zevorn/cosim/gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70,format=raw,if=virtio \
-    -device 'vfio-user-pci,socket={"type":"unix","path":"/tmp/gem5-mi300x.sock"}' \
-    -nographic -no-reboot
+./scripts/run_cosim_tests.sh --repeat 3 vector_add
+./scripts/run_cosim_tests.sh --all
 ```
 
-> **Important:** The kernel command line must include `modprobe.blacklist=amdgpu` to prevent auto-loading the driver before the VGA ROM is written to shared memory. The `cosim-gpu-setup.service` handles the correct initialization order.
+`--repeat` creates a fresh session for each iteration. `--all` discovers the sorted `tests/kernels/*.cpp` set and creates a fresh child session and artifact directory for every program; the current set is `gemm`, `histogram`, `multi_gpu_verify`, `prefix_scan`, `reduction`, `transpose`, and `vector_add`. A later source change can change this set, so the directory and archived source snapshot remain authoritative.
 
-#### SSH Access to Guest
+Avoid `--keep-alive` for acceptance rows. It deliberately preserves a live session and therefore cannot satisfy verified-cleanup acceptance until that session is closed and cleaned.
 
-The `cosim_launch.sh` script enables user networking and SSH port forwarding by default. After configuring a network interface inside the guest with `netplan`, connect from the host:
+## Evidence and acceptance
+
+The runner prints the exact artifact directory. A custom `--output-dir` is allowed only below the repository's `artifacts/` directory and must be empty; use a new directory for every row.
+
+| Evidence | Meaning |
+|---|---|
+| `verdict.json` | Authoritative classifier outcome, primary reason, all reasons, identity checks, and evidence completeness |
+| `matrix.tsv` | Program, effective HSA interrupt value, run/session, outcome, exit code, reason, and artifact path |
+| `runner-metadata.txt` | Exact program/source/binary identity, expected environment, compile/test exit codes, markers, and cleanup state |
+| `patch/source-snapshot.txt` | Top-level commit and hashes for the staged source, runner, repository diff, and untracked-file inventory/archive |
+| `patch/binary-provenance.txt` | gem5 commit/binary hash and exact test binary hash |
+| `patch/repo-status.txt`, `patch/repo.patch` | Top-level tracked and uncommitted source state used by the row |
+| `patch/gem5-status.txt`, `patch/gem5.patch` | gem5 submodule state used by the row |
+| `qemu.log`, `gem5.log` | Full guest console and simulator evidence retained for diagnosis |
+| `cleanup-status.txt` | Manifest-scoped resource cleanup result |
+
+A row is accepted only when the runner exits 0, `verdict.json` says `PASS` with `all_acceptance_gates_passed`, `matrix.tsv` agrees, the effective HSA value matches the intended mode, exact source/binary provenance is present, and cleanup is verified. Missing evidence is a failure, even if the HIP output looks correct.
+
+Generated build and test evidence under `artifacts/` and local toolchains under `.local/cosim/` are Git-ignored. Preserve or archive them outside Git when a review needs durable evidence; never add generated images, binaries, or logs to a source commit.
+
+## Manifest-scoped cleanup
+
+Normal runner and launcher exits clean up their own run. If a process was interrupted, use the exact run ID printed by the wrapper. First preview the owned resources:
 
 ```bash
-ssh -p 2222 gem5@localhost
-# Default password: 12345
+RUN_ID=replace-with-the-printed-run-id
+./scripts/cosim_cleanup.sh --run-id "$RUN_ID"
 ```
 
-### Shutting Down
+The first command is a dry run. If the manifest, run ID, paths, and container labels are correct, confirm the same scope:
 
 ```bash
-# In the QEMU serial console:
-poweroff
-# Or force quit: Ctrl-A X
-
-# Clean up Docker container and shared memory:
-docker rm -f gem5-cosim
-rm -f /dev/shm/mi300x-vram /dev/shm/cosim-guest-ram
-rm -f /tmp/gem5-mi300x.sock
+./scripts/cosim_cleanup.sh --run-id "$RUN_ID" --confirm
 ```
 
-> When using `cosim_launch.sh`, cleanup is performed automatically after exiting QEMU.
+The cleanup wrapper accepts only the validated `/tmp/cosim-<run-id>.session/resources.manifest` ownership model and verifies removal. Never substitute broad process kills, bare container deletion, wildcard socket removal, or recursive deletion. If no unique valid manifest exists, stop and diagnose ownership instead of guessing.
 
-## GPU Driver Initialization
+## Learning labs
 
-The MI300X GPU driver can be loaded **automatically** or **manually** after the QEMU guest boots. All required files (ROM, firmware, kernel modules) are already included in the disk image.
+After the mode-0 `vector_add` baseline passes, continue with the paired [AMD GPU Driver / Architecture Learning Labs](labs.md). The labs use real repository code and classified runs to cover:
 
-### Automatic Loading (Default)
+- PCI configuration, BARs, and MMIO transport.
+- amdgpu discovery and initialization.
+- VRAM, GTT, GART, GPUVM, and address translation.
+- Rings, queues, doorbells, PM4, and SDMA.
+- Fences, IH, MSI-X, and HSA signaling.
+- The HIP → ROCm/KFD/amdgpu → GPU dispatch chain.
+- gem5 GPU-model debug points and cosim-specific transport/workarounds.
 
-The disk image ships with `cosim-gpu-setup.service`, which runs at boot and performs:
+Each lab distinguishes real AMD GPU behavior, gem5 modeling, and cosim-gpu-specific implementation. Keep the [Architecture](architecture.md) data-flow diagrams and [Reference](reference.md) source map open while running them.
 
-1. `dd` the VGA ROM to `0xC0000` (required for gem5's `readROM()` via shared memory)
-2. Symlink IP discovery firmware
-3. `modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2`
+## Troubleshooting order
 
-The service completes in ~40 seconds. After guest login, the GPU is ready:
+Diagnose the first failing layer and keep the original artifact directory intact:
 
-```bash
-rocm-smi          # should show device 0x74a0
-rocminfo          # should show gfx942
-```
+| Symptom | First action |
+|---|---|
+| Host, KVM, Docker, disk, or network failure | Rerun the matching `cosim_preflight.sh` profile and use its check ID/remediation |
+| QEMU/gem5/m5/guest build failure | Preserve the wrapper's build log/provenance, check `cosim_build.sh status`, then retry only the failing build action |
+| Model never becomes ready | Inspect the run's `gem5.log`, launcher category, and manifest; do not start QEMU separately |
+| Guest never reaches login | Inspect `qemu.log` together with `gem5.log`; keep the same run ID for attribution |
+| PCI visible but driver/KFD/ROCm incomplete | End the session, preserve evidence, clean by manifest, and retry in a fresh session |
+| HIP timeout, GPUVM, PM4, SDMA, fence, or IH failure | Use `verdict.json` reasons and the bounded raw-log windows described in the debug reference; do not accept a pass marker in isolation |
+| Cleanup not verified | Treat the row as failed and use only `cosim_cleanup.sh` with its exact manifest |
 
-The service file:
+For signatures and source locations, continue with [Reference and Debugging](reference.md). Preserve full raw logs before extracting smaller windows; QEMU exits can be secondary to a gem5 failure.
 
-```ini
-# /etc/systemd/system/cosim-gpu-setup.service
-[Unit]
-Description=MI300X GPU Setup for Co-simulation
-After=local-fs.target
-Before=multi-user.target
+## Local checkpoint
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/cosim-gpu-setup.sh
+On 2026-08-24, this workspace had a local checkpoint covering the pinned build, guest driver/ROCm enumeration, and classified fresh-session HIP baselines. The evidence remained under ignored `artifacts/` and was not committed. This date is context, not a release guarantee: every host must reproduce its own preflight, hashes, verdict, matrix, and cleanup result.
 
-[Install]
-WantedBy=multi-user.target
-```
+## Next reading
 
-> **Note:** `modprobe.blacklist=amdgpu` must remain in the kernel command line to prevent the PCI subsystem from auto-loading the driver before the ROM is written to shared memory. The systemd service handles the explicit `modprobe` after `dd`.
-
-### Manual Loading
-
-If the systemd service is not installed, or you need to reload the driver, run these commands manually after guest boot.
-
-**Prerequisites:** `cosim_launch.sh` is running (gem5 + QEMU are connected), the guest has booted with a root shell, and `modprobe.blacklist=amdgpu` was passed on the kernel command line.
-
-**Quick reference (copy-paste ready):**
-
-```bash
-dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
-ln -sf /usr/lib/firmware/amdgpu/mi300_discovery /usr/lib/firmware/amdgpu/ip_discovery.bin
-modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
-```
-
-### Detailed Steps
-
-#### Step 1: Load the VGA BIOS ROM
-
-```bash
-dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
-```
-
-Writes the MI300X VBIOS ROM image to the legacy VGA ROM region at physical address `0xC0000` (768 KB). The amdgpu driver reads the VBIOS from this address during initialization. Without the ROM, the driver will report `"Unable to locate a BIOS ROM"`.
-
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `if`      | `/root/roms/mi300.rom` | ROM binary file (in the disk image) |
-| `of`      | `/dev/mem`             | Physical memory device |
-| `bs`      | `1k`                   | Block size = 1024 bytes |
-| `seek`    | `768`                  | Seek to 768 x 1024 = `0xC0000` |
-| `count`   | `128`                  | Write 128 x 1024 = 128 KB |
-
-#### Step 2: Symlink the IP Discovery Firmware
-
-```bash
-ln -sf /usr/lib/firmware/amdgpu/mi300_discovery \
-       /usr/lib/firmware/amdgpu/ip_discovery.bin
-```
-
-Points the driver's IP discovery firmware path to the MI300X-specific discovery binary. The `discovery=2` mode reads GPU IP block information from this firmware file rather than from GPU ROM/registers.
-
-#### Step 3: Load the amdgpu Kernel Module
-
-```bash
-modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
-```
-
-Key parameters:
-
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `ip_block_mask` | `0x67` | Disable PSP (bit 3) and SMU (bit 4); cosim does not model these |
-| `ppfeaturemask` | `0` | Disable PowerPlay features; cosim has no power management hardware |
-| `dpm` | `0` | Disable Dynamic Power Management |
-| `audio` | `0` | Disable audio; no HDMI/DP audio in cosim |
-| `ras_enable` | `0` | Disable RAS -- prevents NULL deref when VBIOS is minimal |
-| `discovery` | `2` | Use firmware file for IP discovery |
-
-> **Warning**: Using `ip_block_mask=0x6f` (only disables SMU) will cause PSP firmware load failure and kernel panic. Always use `0x67`.
-
-> **Warning**: The `dd` step (Step 1) is **mandatory** before `modprobe`. Without it, the driver's BIOS discovery chain fails, resulting in a NULL pointer crash in `amdgpu_atom_parse_data_header`.
-
-### Verification
-
-```bash
-# Check dmesg for amdgpu initialization
-dmesg | grep -i amdgpu | tail -20
-
-# Check PCI device
-lspci | grep -i amd
-
-# Verify device recognition and capabilities
-rocm-smi
-rocminfo | head -40
-```
-
-Expected output:
-
-```
-# rocm-smi
-GPU[0]  : Device Name: 0x74a0
-GPU[0]  : Partition: SPX
-
-# rocminfo
-Name:                    gfx942
-Compute Unit:            320
-KERNEL_DISPATCH capable
-```
-
-> Approximately 80 fence fallback timer warnings may appear during loading. This is normal -- the DRM subsystem uses a polling-mode timeout fallback when probing ring buffers.
-
-### File Locations (Inside the Guest Disk Image)
-
-| File | Path |
-|------|------|
-| VGA BIOS ROM | `/root/roms/mi300.rom` |
-| IP Discovery firmware | `/usr/lib/firmware/amdgpu/mi300_discovery` |
-| Auto-load service | `/etc/systemd/system/cosim-gpu-setup.service` |
-| Auto-load script | `/usr/local/bin/cosim-gpu-setup.sh` |
-| amdgpu module | `/lib/modules/$(uname -r)/updates/dkms/amdgpu.ko.zst` |
-
-## Running HIP Tests
-
-### Compile a HIP Test Program
-
-Write a simple vector addition program inside the guest:
-
-```bash
-cat > /tmp/vec_add.cpp << 'EOF'
-#include <hip/hip_runtime.h>
-#include <cstdio>
-
-__global__ void vec_add(int *a, int *b, int *c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] + b[i];
-}
-
-int main() {
-    const int N = 4;
-    int ha[N] = {1, 2, 3, 4};
-    int hb[N] = {10, 20, 30, 40};
-    int hc[N] = {0};
-
-    int *da, *db, *dc;
-    hipMalloc(&da, N * sizeof(int));
-    hipMalloc(&db, N * sizeof(int));
-    hipMalloc(&dc, N * sizeof(int));
-
-    hipMemcpy(da, ha, N * sizeof(int), hipMemcpyHostToDevice);
-    hipMemcpy(db, hb, N * sizeof(int), hipMemcpyHostToDevice);
-
-    vec_add<<<1, N>>>(da, db, dc, N);
-
-    hipMemcpy(hc, dc, N * sizeof(int), hipMemcpyDeviceToHost);
-
-    printf("Result: %d %d %d %d\n", hc[0], hc[1], hc[2], hc[3]);
-
-    bool pass = (hc[0]==11 && hc[1]==22 && hc[2]==33 && hc[3]==44);
-    printf("%s\n", pass ? "PASSED!" : "FAILED!");
-
-    hipFree(da); hipFree(db); hipFree(dc);
-    return pass ? 0 : 1;
-}
-EOF
-```
-
-Compile and run:
-
-```bash
-# Compile (gfx942 = MI300X architecture)
-/opt/rocm/bin/hipcc --offload-arch=gfx942 -o /tmp/vec_add /tmp/vec_add.cpp
-
-# Run
-/tmp/vec_add
-```
-
-### Expected Output
-
-```
-Result: 11 22 33 44
-PASSED!
-```
-
-### Using the square Test from gem5-resources
-
-You can also use the `square` test program included in gem5-resources. Compile it on the host:
-
-```bash
-./scripts/run_mi300x_fs.sh build-app square
-```
-
-Then copy the compiled binary into the guest (via `scp -P 2222` or by mounting the disk image) and run it:
-
-```bash
-./square.default
-```
-
-Expected output:
-
-```
-info: running on device AMD Instinct MI300X
-info: allocate host and device mem (  7.63 MB)
-info: launch 'vector_square' kernel
-info: check result
-PASSED!
-```
-
-## Appendix: Standalone gem5 GPU FS Simulation
-
-The co-simulation workflow described above uses QEMU for fast KVM-accelerated boot with gem5 providing only the GPU model. An alternative workflow runs **everything inside gem5** (CPU + GPU), with no QEMU involved. This is the standard gem5 full-system GPU simulation.
-
-### Key Differences
-
-| Aspect | Co-simulation (QEMU + gem5) | Standalone gem5 |
-|---|---|---|
-| CPU execution | KVM (near-native speed) | gem5 atomic/timing model |
-| Boot time | ~30 seconds | ~2-5 minutes (KVM fast-forward) |
-| GPU model | gem5 MI300X via vfio-user | gem5 MI300X (same model) |
-| Driver loading | systemd service or manual `modprobe` | Automated via `m5 readfile` |
-| Use case | Driver development, interactive debugging | Microarchitecture research, benchmarking |
-
-### Quick Start
-
-**1. Build gem5 and disk image** (same as the co-simulation steps above).
-
-**2. Build a GPU test application:**
-
-```bash
-./scripts/run_mi300x_fs.sh build-app square
-```
-
-**3. Run the simulation:**
-
-```bash
-./scripts/run_mi300x_fs.sh run \
-    ../gem5-resources/src/gpu/square/bin.default/square.default
-```
-
-> **Important:** The `--app` parameter must always be specified. Without it, the driver is never loaded inside the guest.
-
-**4. Monitor output:**
-
-```bash
-tail -f m5out/board.pc.com_1.device
-```
-
-The simulation uses KVM to fast-forward through Linux boot, then automatically loads the GPU driver and runs the specified application. The guest calls `m5 exit` when the test completes.
-
-For full details on the standalone workflow, including the alternative `gpufs`
-configuration, disk image verification with `guestfish`, and build process
-internals, see the gem5 documentation.
-
-## Quick Troubleshooting
-
-The five most common issues and their fixes:
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| gem5 container exits immediately | `gem5.opt` not compiled, wrong path, or Python import failure | Run `docker logs gem5-cosim` to see the error |
-| `Failed to connect to /tmp/gem5-mi300x.sock` | gem5 not ready or socket permissions wrong | Wait for "Waiting for QEMU to connect" in gem5 logs; run `chmod 777` on the socket |
-| NULL deref crash at `amdgpu_atom_parse_data_header` | VGA ROM was not written before `modprobe` | Run `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128` before loading the driver |
-| PSP GPU reset kernel panic | Wrong `ip_block_mask` (e.g., `0x6f` instead of `0x67`) | Always use `ip_block_mask=0x67` to disable both PSP and SMU |
-| `hipcc` error: cannot find ROCm device library | ROCm not installed or wrong arch flag | Verify `/opt/rocm/lib/` exists; use `--offload-arch=gfx942` |
-
-For the complete troubleshooting table and debugging techniques, see [Reference §4](reference.md#4-known-issues-and-pitfalls).
+- [Learning Labs](labs.md)
+- [System Architecture](architecture.md)
+- [Reference and Debugging](reference.md)
+- [Chinese Getting Started](../zh/getting-started.md)

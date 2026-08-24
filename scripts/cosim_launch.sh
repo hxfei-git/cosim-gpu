@@ -2,8 +2,8 @@
 # ==========================================================================
 # QEMU + gem5 MI300X Co-simulation Launcher
 #
-# gem5 runs inside Docker (GPU-only, no kernel), while a system-installed
-# QEMU runs on the host with KVM and connects through standard vfio-user.
+# gem5 runs inside Docker (GPU-only, no kernel), while the pinned local QEMU
+# runs on the host with KVM and connects through standard vfio-user.
 #
 # Usage:
 #   ./scripts/cosim_launch.sh                              # vfio-user
@@ -37,11 +37,21 @@ GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
 GEM5_CONTAINER="$(cosim_container_name "$COSIM_RUN_ID")"
 
 LOCAL_QEMU_BIN="${COSIM_DIR}/.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64"
+LOCAL_QEMU_IMG="${COSIM_DIR}/.local/cosim/qemu/10.1.5/bin/qemu-img"
 QEMU_BIN="${QEMU_BIN:-}"
+QEMU_IMG="${QEMU_IMG:-}"
 if [[ -z "$QEMU_BIN" && -x "$LOCAL_QEMU_BIN" ]]; then
     QEMU_BIN="$LOCAL_QEMU_BIN"
 elif [[ -z "$QEMU_BIN" ]]; then
     QEMU_BIN="$(command -v qemu-system-x86_64 2>/dev/null || true)"
+fi
+if [[ -z "$QEMU_IMG" && -x "$LOCAL_QEMU_IMG" ]]; then
+    QEMU_IMG="$LOCAL_QEMU_IMG"
+elif [[ -z "$QEMU_IMG" && -n "$QEMU_BIN" && \
+        -x "$(dirname "$QEMU_BIN")/qemu-img" ]]; then
+    QEMU_IMG="$(dirname "$QEMU_BIN")/qemu-img"
+elif [[ -z "$QEMU_IMG" ]]; then
+    QEMU_IMG="$(command -v qemu-img 2>/dev/null || true)"
 fi
 DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
 KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
@@ -63,6 +73,7 @@ FORCE_CLEAN=""
 FORCE_CLEAN_CONFIRM=""
 
 SESSION_DIR="/tmp/cosim-${COSIM_RUN_ID}.session"
+GUEST_OVERLAY="${SESSION_DIR}/guest-overlay.qcow2"
 SCREEN_LOG="/tmp/cosim-${COSIM_RUN_ID}.log"
 ARTIFACT_DIR="${COSIM_DIR}/artifacts/standalone/${COSIM_RUN_ID}"
 COSIM_FAILURE_CATEGORY=""
@@ -205,6 +216,8 @@ C_GEM5_CONFIG="/gem5/configs/example/gpufs/mi300_cosim.py"
 
 [[ -f "$GEM5_BIN" ]]   || error "gem5 not found: $GEM5_BIN\n  Build: ./scripts/cosim_build.sh gem5"
 [[ -n "$QEMU_BIN" && -x "$QEMU_BIN" ]] || error "qemu-system-x86_64 not found. Install QEMU 10.1+ or pass --qemu-bin."
+[[ -n "$QEMU_IMG" && -x "$QEMU_IMG" ]] || \
+    error "qemu-img not found beside the selected QEMU or on PATH."
 "$QEMU_BIN" -device help 2>/dev/null | grep 'vfio-user-pci' >/dev/null || \
     error "QEMU does not provide vfio-user-pci. Install QEMU 10.1+ or pass a compatible --qemu-bin."
 [[ -f "$DISK_IMAGE" ]] || error "Disk image not found: $DISK_IMAGE\n  Build: ./scripts/run_mi300x_fs.sh build-disk"
@@ -237,6 +250,7 @@ for ((g=0; g<NUM_GPUS; g++)); do
     manifest_add "runtime" "shmem" "$(gpu_shmem_file "$g")"
     manifest_add "runtime" "socket" "$(gpu_socket_path "$g")"
 done
+manifest_add "runtime" "file" "$GUEST_OVERLAY"
 manifest_add "runtime" "directory" "$SESSION_DIR"
 manifest_add "artifact" "directory" "$ARTIFACT_DIR"
 
@@ -297,6 +311,21 @@ trap 'cleanup' EXIT
 trap 'COSIM_FAILURE_CATEGORY="$COSIM_CAT_INTERRUPT"; exit 130' INT TERM
 
 # ---- Preflight audit ----
+
+mkdir -p "$ARTIFACT_DIR"
+"$QEMU_IMG" create -q -f qcow2 -F raw -b "$DISK_IMAGE" "$GUEST_OVERLAY" || \
+    error "failed to create run-scoped Guest overlay: $GUEST_OVERLAY"
+"$QEMU_IMG" info --output=json "$GUEST_OVERLAY" > \
+    "${ARTIFACT_DIR}/guest-overlay.json"
+{
+    echo "path=${DISK_IMAGE}"
+    stat -c 'size=%s' "$DISK_IMAGE"
+    stat -c 'mtime=%y' "$DISK_IMAGE"
+} > "${ARTIFACT_DIR}/guest-base-stat.txt"
+if [[ -f "${COSIM_DIR}/.local/cosim/build/guest/.cosim-build-meta" ]]; then
+    cp "${COSIM_DIR}/.local/cosim/build/guest/.cosim-build-meta" \
+        "${ARTIFACT_DIR}/guest-build-meta.txt"
+fi
 
 run_preflight_audit | tee "${SESSION_DIR}/preflight.log"
 
@@ -440,7 +469,8 @@ echo "  Backend:    vfio-user"
 echo "  Num GPUs:   $NUM_GPUS"
 echo "  CPUs:       $HOST_CPUS"
 echo "  Memory:     $HOST_MEM"
-echo "  Disk:       $(basename "$DISK_IMAGE")"
+echo "  Disk base:  $(basename "$DISK_IMAGE") (read-only backing)"
+echo "  Disk layer: $GUEST_OVERLAY"
 echo "  Kernel:     $(basename "$KERNEL")"
 for ((g=0; g<NUM_GPUS; g++)); do
     echo "  GPU $g:"
@@ -479,7 +509,7 @@ QEMU_CMD=(
     -numa "node,memdev=mem0"
     -kernel "$KERNEL"
     -append "$KCMDLINE"
-    -drive "file=$DISK_IMAGE,format=raw,if=virtio"
+    -drive "file=$GUEST_OVERLAY,format=qcow2,if=virtio"
     -netdev "user,id=net0,hostfwd=tcp::2222-:22"
     -device "virtio-net-pci,netdev=net0"
 )

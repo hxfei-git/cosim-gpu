@@ -82,8 +82,12 @@ done
 
 grep -Fq 'ORIGINAL_ARGS=("$@")' "$HOST_RUNNER" || \
     fail "runner does not preserve the original argv"
-grep -Fq "printf ' %q' \"\${ORIGINAL_ARGS[@]}\"" "$HOST_RUNNER" || \
+grep -Fq "cosim_print_shell_words \"\${ORIGINAL_ARGS[@]}\"" "$HOST_RUNNER" || \
     fail "runner argv does not preserve argument boundaries"
+grep -Fq "cosim_print_shell_words \"\${PASSTHROUGH_ARGS[@]}\"" "$HOST_RUNNER" || \
+    fail "runner passthrough argv 没有使用统一序列化合同"
+grep -Fq "cosim_print_shell_words \"\${ORIGINAL_ARGS[@]}\"" "$LAUNCHER" || \
+    fail "launcher argv 没有使用统一序列化合同"
 grep -Fq -- '--share-dir|--artifact-dir)' "$HOST_RUNNER" || \
     fail "runner-owned launcher paths are not rejected"
 # shellcheck disable=SC2016
@@ -389,6 +393,19 @@ grep -Fq "gem5_source_fingerprint=${FIXTURE_GEM5_FINGERPRINT}" \
     fail "binary provenance lacks the validated gem5 source fingerprint"
 grep -Fq 'strict_acceptance=0' "${VALID_ARTIFACT}/runner-invocation.txt" || \
     fail "default producer invocation does not record strict_acceptance=0"
+grep -Fxq 'passthrough_args=' "${VALID_ARTIFACT}/runner-invocation.txt" || \
+    fail "空 passthrough 没有序列化为零个参数"
+
+if run_producer_case producer-valid-passthrough \
+        --gem5-debug ContractDebugFlag; then
+    fail "非空 passthrough producer fixture 意外完成了 fake launch"
+fi
+PASSTHROUGH_ARTIFACT="${PRODUCER_ROOT}/artifacts/producer-valid-passthrough"
+grep -Fq '[FAKE_LAUNCH_REACHED]' "${PASSTHROUGH_ARTIFACT}/qemu.log" || \
+    fail "非空 passthrough producer fixture 未到达 launcher 边界"
+grep -Fxq 'passthrough_args= --gem5-debug ContractDebugFlag' \
+    "${PASSTHROUGH_ARTIFACT}/runner-invocation.txt" || \
+    fail "非空 passthrough 的参数数量、顺序或值没有原样归档"
 
 if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-valid-strict; then
     fail "strict producer fixture unexpectedly completed a fake launch"

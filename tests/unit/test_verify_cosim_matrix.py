@@ -1589,6 +1589,21 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("invocation_passthrough_mismatch", error_codes(result))
 
+    def test_quoted_empty_passthrough_is_not_zero_arguments(self) -> None:
+        runner_invocation = self.fixture.artifact / "runner-invocation.txt"
+        runner_invocation.write_text(
+            runner_invocation.read_text(encoding="utf-8").replace(
+                "passthrough_args=\n",
+                "passthrough_args= ''\n",
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invocation_passthrough_mismatch", error_codes(result))
+        self.assertIn("invocation_argv_mismatch", error_codes(result))
+
     def test_runner_argv_passthrough_not_launched_fails(self) -> None:
         invocation = self.fixture.artifact / "runner-invocation.txt"
         invocation.write_text(

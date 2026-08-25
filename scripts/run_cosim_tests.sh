@@ -743,10 +743,10 @@ fi
     echo "cwd=$(pwd -P)"
     printf 'argv0=%q\n' "$0"
     printf 'argv='
-    printf ' %q' "${ORIGINAL_ARGS[@]}"
+    cosim_print_shell_words "${ORIGINAL_ARGS[@]}"
     printf '\n'
     printf 'passthrough_args='
-    printf ' %q' "${PASSTHROUGH_ARGS[@]}"
+    cosim_print_shell_words "${PASSTHROUGH_ARGS[@]}"
     printf '\n'
 } > "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"
 

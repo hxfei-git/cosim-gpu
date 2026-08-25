@@ -65,6 +65,15 @@ cosim_artifact_dir() {
     echo "${cosim_dir}/artifacts/${operator}/${run_id}"
 }
 
+# ---- Shell argv 证据序列化 ----
+
+cosim_print_shell_words() {
+    local argument
+    for argument in "$@"; do
+        printf ' %q' "$argument"
+    done
+}
+
 # ---- Failure Taxonomy (exported for use by sourcing scripts) ----
 
 export COSIM_CAT_TEST_PASS="test_pass"

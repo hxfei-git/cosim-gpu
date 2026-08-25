@@ -7,11 +7,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COSIM_DIR="$(dirname "$SCRIPT_DIR")"
 ARTIFACT_ROOT="${COSIM_DIR}/artifacts"
 GUEST_LOCK="${COSIM_DIR}/configs/cosim/guest.lock"
+GEM5_BASELINE_LOCK="${COSIM_DIR}/configs/cosim/gem5-baseline.lock"
 
 PROFILE="host"
 JSON_STDOUT=0
 OUTPUT_DIR=""
 GENERATED_AT="$(date -Iseconds)"
+STRICT_ACCEPTANCE="${COSIM_STRICT_ACCEPTANCE:-0}"
 
 declare -a CHECK_IDS=()
 declare -a CHECK_STATUSES=()
@@ -127,6 +129,31 @@ metadata_value() {
     local key="$2"
     awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' \
         "$file" 2>/dev/null || true
+}
+
+metadata_has_single_keys() {
+    local file="$1"
+    shift
+    local key count value
+
+    [[ -f "$file" && -r "$file" && ! -L "$file" ]] || return 1
+    for key in "$@"; do
+        count="$(awk -F= -v wanted="$key" \
+            '$1 == wanted {count++} END {print count + 0}' "$file")"
+        [[ "$count" -eq 1 ]] || return 1
+        value="$(metadata_value "$file" "$key")"
+        [[ -n "$value" ]] || return 1
+    done
+}
+
+metadata_has_exact_keys() {
+    local file="$1"
+    shift
+    local populated_lines
+
+    metadata_has_single_keys "$file" "$@" || return 1
+    populated_lines="$(awk 'NF {count++} END {print count + 0}' "$file")"
+    [[ "$populated_lines" -eq "$#" ]]
 }
 
 check_host_core() {
@@ -530,6 +557,7 @@ check_run_profile() {
     local resources_dir="${COSIM_DIR}/gem5-resources"
     local gem5_bin="${gem5_dir}/build/VEGA_X86/gem5.opt"
     local gem5_meta="${gem5_dir}/build/VEGA_X86/.cosim-build-meta"
+    local gem5_lock_rel="configs/cosim/gem5-baseline.lock"
     local gem5_config="${gem5_dir}/configs/example/gpufs/mi300_cosim.py"
     local resource_root="${resources_dir}/src/x86-ubuntu-gpu-ml"
     local disk_image="${resource_root}/disk-image/x86-ubuntu-rocm70"
@@ -549,45 +577,14 @@ check_run_profile() {
 
     check_regular_file run.gem5_binary "$gem5_bin" 1 true
     check_regular_file run.gem5_config "$gem5_config" 1 false
-    if [[ -r "$gem5_meta" && -f "$gem5_bin" ]]; then
-        local meta_commit meta_fingerprint meta_binary_sha actual_commit actual_binary_sha
-        meta_commit="$(metadata_value "$gem5_meta" commit)"
-        meta_fingerprint="$(metadata_value "$gem5_meta" source_fingerprint)"
-        meta_binary_sha="$(metadata_value "$gem5_meta" binary_sha256)"
-        actual_commit="$(git -C "$gem5_dir" rev-parse HEAD 2>/dev/null || true)"
-        actual_binary_sha="$(sha256sum -- "$gem5_bin" 2>/dev/null | awk '{print $1}' || true)"
-        if [[ "$meta_commit" =~ ^[0-9a-f]{40}$ && \
-              "$meta_commit" == "$actual_commit" && \
-              "$meta_fingerprint" =~ ^[0-9a-f]{64}$ && \
-              "$meta_binary_sha" =~ ^[0-9a-f]{64}$ && \
-              "$meta_binary_sha" == "$actual_binary_sha" ]]; then
-            add_check run.gem5_provenance PASS true \
-                "gem5 provenance matches the selected source and binary" "$gem5_meta"
-        else
-            add_check run.gem5_provenance FAIL true \
-                "gem5 provenance does not match the selected source or binary" "$gem5_meta"
-        fi
-    elif [[ -r "$gem5_meta" ]]; then
-        add_check run.gem5_provenance FAIL true \
-            "gem5 provenance cannot be verified without the binary" "$gem5_meta"
-    else
-        add_check run.gem5_provenance FAIL true "gem5 provenance metadata is missing" "$gem5_meta"
-    fi
-
-    check_regular_file run.disk_image "$disk_image" $((1024 * 1024 * 1024)) false
-    check_regular_file run.kernel "$kernel" $((1024 * 1024)) false
-    check_regular_file run.m5 "$m5_binary" 1 true
-    # This is a Packer source template, not the installed Guest executable.
-    # rocm-install.sh marks the uploaded copy executable before installing it.
-    check_regular_file run.guest_setup "$guest_setup" 1 false
 
     local image_name="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
+    local image_id=""
     if ! command -v docker >/dev/null 2>&1; then
         add_check run.docker_image UNKNOWN true "runtime Docker image was not checked"
     else
-        local image_id
         image_id="$(docker image inspect --format '{{.Id}}' "$image_name" 2>/dev/null || true)"
-        if [[ -n "$image_id" ]]; then
+        if [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             add_check run.docker_image PASS true "gem5 runtime Docker image exists" \
                 "image=${image_name}; id=${image_id}"
         else
@@ -595,6 +592,133 @@ check_run_profile() {
                 "image=${image_name}"
         fi
     fi
+
+    local provenance_ok=true
+    local -a provenance_failures=()
+    local actual_commit="" actual_fingerprint="" actual_binary_sha="" gem5_status=""
+    local repo_status=""
+    local meta_commit="" meta_algorithm="" meta_fingerprint="" meta_target=""
+    local meta_binary="" meta_binary_sha="" meta_docker_image=""
+    local lock_schema="" lock_commit="" lock_algorithm="" lock_fingerprint=""
+    local lock_binary_sha="" lock_docker_image=""
+    local lock_head_sha="" lock_worktree_sha=""
+
+    if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+        if ! git -C "$COSIM_DIR" ls-files --error-unmatch -- "$gem5_lock_rel" \
+            >/dev/null 2>&1 || \
+           ! git -C "$COSIM_DIR" diff --quiet HEAD -- "$gem5_lock_rel"; then
+            provenance_ok=false
+            provenance_failures+=("baseline lock is not tracked and identical to HEAD")
+        fi
+        lock_head_sha="$(git -C "$COSIM_DIR" show "HEAD:${gem5_lock_rel}" 2>/dev/null | \
+            sha256sum | awk '{print $1}' || true)"
+        lock_worktree_sha="$(sha256sum "$GEM5_BASELINE_LOCK" 2>/dev/null | \
+            awk '{print $1}' || true)"
+        [[ "$lock_head_sha" =~ ^[0-9a-f]{64}$ && \
+           "$lock_head_sha" == "$lock_worktree_sha" ]] || {
+            provenance_ok=false
+            provenance_failures+=("baseline lock content does not match its HEAD blob")
+        }
+    fi
+    if metadata_has_exact_keys "$GEM5_BASELINE_LOCK" schema gem5_commit \
+        source_fingerprint_algorithm source_fingerprint binary_sha256 docker_image; then
+        lock_schema="$(metadata_value "$GEM5_BASELINE_LOCK" schema)"
+        lock_commit="$(metadata_value "$GEM5_BASELINE_LOCK" gem5_commit)"
+        lock_algorithm="$(metadata_value "$GEM5_BASELINE_LOCK" source_fingerprint_algorithm)"
+        lock_fingerprint="$(metadata_value "$GEM5_BASELINE_LOCK" source_fingerprint)"
+        lock_binary_sha="$(metadata_value "$GEM5_BASELINE_LOCK" binary_sha256)"
+        lock_docker_image="$(metadata_value "$GEM5_BASELINE_LOCK" docker_image)"
+    else
+        provenance_ok=false
+        provenance_failures+=("baseline lock is missing, symlinked, or malformed")
+    fi
+
+    if metadata_has_single_keys "$gem5_meta" commit source_fingerprint_algorithm \
+        source_fingerprint target binary binary_sha256 docker_image; then
+        meta_commit="$(metadata_value "$gem5_meta" commit)"
+        meta_algorithm="$(metadata_value "$gem5_meta" source_fingerprint_algorithm)"
+        meta_fingerprint="$(metadata_value "$gem5_meta" source_fingerprint)"
+        meta_target="$(metadata_value "$gem5_meta" target)"
+        meta_binary="$(metadata_value "$gem5_meta" binary)"
+        meta_binary_sha="$(metadata_value "$gem5_meta" binary_sha256)"
+        meta_docker_image="$(metadata_value "$gem5_meta" docker_image)"
+    else
+        provenance_ok=false
+        provenance_failures+=("build metadata is missing, symlinked, or malformed")
+    fi
+
+    actual_commit="$(git -C "$gem5_dir" rev-parse HEAD 2>/dev/null || true)"
+    repo_status="$(git -C "$COSIM_DIR" -c status.renames=false \
+        status --porcelain=v1 --untracked-files=all --ignore-submodules=none \
+        2>/dev/null || true)"
+    if [[ "$STRICT_ACCEPTANCE" == "1" && -n "$repo_status" ]]; then
+        provenance_ok=false
+        provenance_failures+=("top-level source tree is not clean")
+    fi
+    gem5_status="$(git -C "$gem5_dir" -c status.renames=false \
+        status --porcelain=v1 --untracked-files=all --ignore-submodules=none \
+        2>/dev/null || true)"
+    if [[ "$STRICT_ACCEPTANCE" == "1" && -n "$gem5_status" ]]; then
+        provenance_ok=false
+        provenance_failures+=("gem5 source tree is not clean")
+    fi
+    actual_fingerprint="$(bash -c 'source "$1"; source_fingerprint "$2"' \
+        _ "${SCRIPT_DIR}/cosim_build.sh" "$gem5_dir" 2>/dev/null || true)"
+    actual_binary_sha="$(sha256sum -- "$gem5_bin" 2>/dev/null | awk '{print $1}' || true)"
+
+    [[ "$lock_schema" == "1" && "$lock_algorithm" == "2" && \
+       "$lock_commit" =~ ^[0-9a-f]{40}$ && \
+       "$lock_fingerprint" =~ ^[0-9a-f]{64}$ && \
+       "$lock_binary_sha" =~ ^[0-9a-f]{64}$ && \
+       "$lock_docker_image" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+        provenance_ok=false
+        provenance_failures+=("baseline lock values are invalid")
+    }
+    [[ "$actual_fingerprint" =~ ^[0-9a-f]{64}$ ]] || {
+        provenance_ok=false
+        provenance_failures+=("current source fingerprint could not be computed")
+    }
+    [[ "$meta_target" == "VEGA_X86" && "$meta_binary" == "$gem5_bin" ]] || {
+        provenance_ok=false
+        provenance_failures+=("build metadata does not select the canonical target and binary")
+    }
+    [[ "$lock_commit" == "$meta_commit" && "$meta_commit" == "$actual_commit" && \
+       "$lock_algorithm" == "$meta_algorithm" && \
+       "$lock_fingerprint" == "$meta_fingerprint" && \
+       "$meta_fingerprint" == "$actual_fingerprint" && \
+       "$lock_binary_sha" == "$meta_binary_sha" && \
+       "$meta_binary_sha" == "$actual_binary_sha" && \
+       "$lock_docker_image" == "$meta_docker_image" && \
+       "$meta_docker_image" == "$image_id" ]] || {
+        provenance_ok=false
+        provenance_failures+=("lock, metadata, source, binary, and runtime image do not match")
+    }
+
+    if [[ "$provenance_ok" == "true" ]]; then
+        add_check run.gem5_provenance PASS true \
+            "gem5 trust anchor matches the current source, binary, metadata, and runtime image" \
+            "$GEM5_BASELINE_LOCK"
+    else
+        local provenance_detail
+        provenance_detail="$(IFS='; '; printf '%s' "${provenance_failures[*]}")"
+        add_check run.gem5_provenance FAIL true \
+            "gem5 trust anchor validation failed" "$provenance_detail"
+    fi
+
+    if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+        add_check run.strict_acceptance PASS true \
+            "strict acceptance source policy is enabled" "COSIM_STRICT_ACCEPTANCE=1"
+    else
+        add_check run.strict_acceptance PASS true \
+            "replayable development source policy is enabled" "COSIM_STRICT_ACCEPTANCE=0"
+    fi
+
+    check_regular_file run.disk_image "$disk_image" $((1024 * 1024 * 1024)) false
+    check_regular_file run.kernel "$kernel" $((1024 * 1024)) false
+    check_regular_file run.m5 "$m5_binary" 1 true
+    # 这里检查的是 Packer source template，而不是安装后的 Guest executable。
+    # rocm-install.sh 会先赋予上传副本执行权限，再进行安装。
+    check_regular_file run.guest_setup "$guest_setup" 1 false
 
     local kernel_count
     kernel_count="$(find "${COSIM_DIR}/tests/kernels" -maxdepth 1 -type f -name '*.cpp' \
@@ -741,6 +865,8 @@ case "$PROFILE" in
     host|build|run) ;;
     *) die_usage "invalid profile: $PROFILE" ;;
 esac
+[[ "$STRICT_ACCEPTANCE" == "0" || "$STRICT_ACCEPTANCE" == "1" ]] || \
+    die_usage "COSIM_STRICT_ACCEPTANCE must be 0 or 1"
 
 check_host_core
 case "$PROFILE" in

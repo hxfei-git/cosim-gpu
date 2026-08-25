@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COSIM_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_SCRIPT="${SCRIPT_DIR}/cosim_build.sh"
 TOOLCHAIN_LOCK="${COSIM_DIR}/configs/cosim/toolchain.lock"
+GEM5_BASELINE_LOCK="${COSIM_DIR}/configs/cosim/gem5-baseline.lock"
 DOCKERFILE_RUN="${SCRIPT_DIR}/Dockerfile.run"
 
 fail() {
@@ -37,6 +38,8 @@ assert_contains 'source_pristine=' "$BUILD_SCRIPT"
 assert_contains 'configure_fingerprint=' "$BUILD_SCRIPT"
 assert_contains 'build_fingerprint=' "$BUILD_SCRIPT"
 assert_contains 'binary_sha256=' "$BUILD_SCRIPT"
+assert_contains 'GEM5_BASELINE_LOCK=' "$BUILD_SCRIPT"
+assert_contains 'refresh_gem5_baseline_lock' "$BUILD_SCRIPT"
 assert_contains 'qemu_img_sha256=' "$BUILD_SCRIPT"
 assert_contains 'CONFIG_VFIO_USER=y' "$BUILD_SCRIPT"
 assert_contains 'CONFIG_VFIO_PCI=y' "$BUILD_SCRIPT"
@@ -45,6 +48,21 @@ assert_contains 'vfio-user-pci' "$BUILD_SCRIPT"
 assert_contains 'virtio-net-pci' "$BUILD_SCRIPT"
 assert_contains 'virtio-blk-pci' "$BUILD_SCRIPT"
 assert_contains 'virtio-9p-pci' "$BUILD_SCRIPT"
+
+for lock_field in schema gem5_commit source_fingerprint_algorithm \
+                  source_fingerprint binary_sha256 docker_image; do
+    grep -Eq "^${lock_field}=.+$" "$GEM5_BASELINE_LOCK" || \
+        fail "gem5 baseline lock is missing ${lock_field}"
+done
+[[ "$(awk 'NF {count++} END {print count + 0}' "$GEM5_BASELINE_LOCK")" -eq 6 ]] || \
+    fail "gem5 baseline lock contains unexpected fields"
+# shellcheck disable=SC2016
+[[ "$(grep -Fc 'refresh_gem5_baseline_lock "$commit" "$fingerprint"' \
+    "$BUILD_SCRIPT")" -eq 2 ]] || \
+    fail "gem5 build does not refresh the baseline lock on both success paths"
+if grep -Eq '(^|[[:space:]])git[[:space:]]+commit([[:space:]]|$)' "$BUILD_SCRIPT"; then
+    fail "build wrapper must never commit the refreshed baseline lock"
+fi
 
 assert_contains 'QEMU_VERSION=10.1.5' "$TOOLCHAIN_LOCK"
 assert_contains 'QEMU_SOURCE_URL=https://download.qemu.org/qemu-10.1.5.tar.xz' "$TOOLCHAIN_LOCK"
@@ -221,13 +239,14 @@ GEM5_BIN="${TEST_TMP}/gem5.opt"
 GEM5_META="${TEST_TMP}/gem5-meta"
 printf '#!/bin/sh\n' > "$GEM5_BIN"
 chmod +x "$GEM5_BIN"
-GEM5_COMMIT='gem5-commit'
-GEM5_SOURCE_FINGERPRINT='gem5-source-fingerprint'
+GEM5_COMMIT='1111111111111111111111111111111111111111'
+GEM5_SOURCE_FINGERPRINT='2222222222222222222222222222222222222222222222222222222222222222'
 GEM5_RECIPE_FINGERPRINT='gem5-recipe-fingerprint'
 GEM5_BINARY_SHA="$(sha256sum "$GEM5_BIN" | awk '{print $1}')"
-GEM5_IMAGE_ID='sha256:test-gem5-image'
+GEM5_IMAGE_ID='sha256:3333333333333333333333333333333333333333333333333333333333333333'
 docker() {
-    [[ "$*" == "image inspect -f {{.Id}} ${GEM5_IMAGE}" ]] || return 1
+    [[ "$*" == "image inspect -f {{.Id}} ${GEM5_IMAGE}" || \
+       "$*" == "image inspect -f {{.Id}} ${GEM5_RUN_IMAGE}" ]] || return 1
     printf '%s\n' "$GEM5_IMAGE_ID"
 }
 write_metadata "$GEM5_META" \
@@ -262,6 +281,32 @@ write_metadata "$GEM5_META" \
 if gem5_metadata_matches \
     "$GEM5_COMMIT" "$GEM5_SOURCE_FINGERPRINT" "$GEM5_RECIPE_FINGERPRINT"; then
     fail "legacy source-fingerprint metadata was accepted as an incremental-build hit"
+fi
+
+# 刷新 baseline lock 时必须原子替换完整的六字段 trust anchor。
+GEM5_BASELINE_LOCK="${TEST_TMP}/gem5-baseline.lock"
+printf 'stale=true\n' > "$GEM5_BASELINE_LOCK"
+refresh_gem5_baseline_lock "$GEM5_COMMIT" "$GEM5_SOURCE_FINGERPRINT"
+[[ "$(metadata_value "$GEM5_BASELINE_LOCK" schema)" == "1" ]] || \
+    fail "refreshed gem5 baseline lock has the wrong schema"
+[[ "$(metadata_value "$GEM5_BASELINE_LOCK" gem5_commit)" == "$GEM5_COMMIT" ]] || \
+    fail "refreshed gem5 baseline lock has the wrong commit"
+[[ "$(metadata_value "$GEM5_BASELINE_LOCK" source_fingerprint_algorithm)" == \
+    "$SOURCE_FINGERPRINT_ALGORITHM" ]] || \
+    fail "refreshed gem5 baseline lock has the wrong fingerprint algorithm"
+[[ "$(metadata_value "$GEM5_BASELINE_LOCK" source_fingerprint)" == \
+    "$GEM5_SOURCE_FINGERPRINT" ]] || \
+    fail "refreshed gem5 baseline lock has the wrong source fingerprint"
+[[ "$(metadata_value "$GEM5_BASELINE_LOCK" binary_sha256)" == \
+    "$(sha256sum "$GEM5_BIN" | awk '{print $1}')" ]] || \
+    fail "refreshed gem5 baseline lock has the wrong binary hash"
+[[ "$(metadata_value "$GEM5_BASELINE_LOCK" docker_image)" == "$GEM5_IMAGE_ID" ]] || \
+    fail "refreshed gem5 baseline lock has the wrong Docker image"
+[[ "$(awk 'NF {count++} END {print count + 0}' "$GEM5_BASELINE_LOCK")" -eq 6 ]] || \
+    fail "refreshed gem5 baseline lock is not a complete six-field anchor"
+if find "$(dirname "$GEM5_BASELINE_LOCK")" -maxdepth 1 -name \
+    'gem5-baseline.lock.*' -print -quit | grep -q .; then
+    fail "atomic gem5 baseline lock refresh left a temporary file"
 fi
 
 FAKE_PREFIX="${TEST_TMP}/fake-prefix"

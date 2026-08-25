@@ -13,6 +13,8 @@
 
 set -euo pipefail
 
+ORIGINAL_ARGS=("$@")
+
 # ---- Shared library ----
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +32,8 @@ export COSIM_RUN_ID
 GEM5_DIR="${COSIM_DIR}/gem5"
 RESOURCES_DIR="${COSIM_DIR}/gem5-resources"
 
-GEM5_BIN="${GEM5_DIR}/build/VEGA_X86/gem5.opt"
+CANONICAL_GEM5_BIN="${GEM5_DIR}/build/VEGA_X86/gem5.opt"
+GEM5_BIN="$CANONICAL_GEM5_BIN"
 # shellcheck disable=SC2034
 GEM5_CONFIG="${GEM5_DIR}/configs/example/gpufs/mi300_cosim.py"
 GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
@@ -109,7 +112,7 @@ Options:
   --qemu-bin PATH         QEMU binary (default: pinned repository-local QEMU)
   --gem5-bin PATH         gem5 binary (default: build/VEGA_X86/gem5.opt)
   --gem5-docker IMAGE     Docker image for gem5 (default: gem5-run:local)
-  --socket-path PATH      Unix socket (default: /tmp/gem5-mi300x.sock)
+  --socket-path PATH      Unix socket（默认：/tmp/gem5-mi300x-<run-id>.sock）
   --host-mem SIZE         Guest RAM   (default: 8G)
   --host-cpus N           Guest CPUs  (default: 4)
   --vram-size SIZE        GPU VRAM    (default: 16GiB)
@@ -159,6 +162,11 @@ for numeric_name in HOST_CPUS NUM_CUS NUM_GPUS GEM5_TIMEOUT; do
     numeric_value="${!numeric_name}"
     [[ "$numeric_value" =~ ^[1-9][0-9]*$ ]] || error "${numeric_name} must be a positive integer"
 done
+for invocation_value in "$GEM5_BIN" "$GEM5_DEBUG" "$HOST_MEM" "$VRAM_SIZE"; do
+    [[ "$invocation_value" != *$'\n'* && "$invocation_value" != *$'\r'* && \
+       "$invocation_value" != *$'\t'* ]] || \
+        error "control whitespace is not allowed in invocation values"
+done
 ARTIFACT_DIR="$(realpath -m -- "$ARTIFACT_DIR")"
 case "$ARTIFACT_DIR" in
     "${COSIM_DIR}/artifacts/"*) ;;
@@ -187,8 +195,9 @@ fi
 SHMEM_HOST_FILE="/dev/shm${SHMEM_HOST_PATH}"
 
 # Per-GPU socket and VRAM shmem paths
-# Single GPU: /tmp/gem5-mi300x.sock, /dev/shm/mi300x-vram
-# Multi GPU:  /tmp/gem5-mi300x-{0..N}.sock, /dev/shm/mi300x-vram-{0..N}
+# 单 GPU 运行同样使用带 run ID 的 socket、Guest RAM 与 VRAM 资源名。
+# 多 GPU：/tmp/gem5-mi300x-<run-id>-{0..N-1}.sock 与
+# /dev/shm/mi300x-vram-<run-id>-{0..N-1}。
 gpu_socket_path() {
     local gpu_id=$1
     if [[ "$NUM_GPUS" -eq 1 ]]; then
@@ -209,19 +218,34 @@ gpu_shmem_file() {
 }
 
 # Container paths (gem5 source mounted at /gem5)
+[[ -x "$CANONICAL_GEM5_BIN" && ! -L "$CANONICAL_GEM5_BIN" ]] || \
+    error "canonical gem5 binary is missing, non-executable, or symlinked: ${CANONICAL_GEM5_BIN}"
+CANONICAL_GEM5_REALPATH="$(realpath -e -- "$CANONICAL_GEM5_BIN")"
+[[ "$CANONICAL_GEM5_REALPATH" == "$CANONICAL_GEM5_BIN" ]] || \
+    error "canonical gem5 binary resolves outside its fixed path: ${CANONICAL_GEM5_BIN}"
+REQUESTED_GEM5_BIN="$GEM5_BIN"
+if ! GEM5_BIN="$(realpath -e -- "$REQUESTED_GEM5_BIN")"; then
+    error "gem5 not found: $REQUESTED_GEM5_BIN"
+fi
+[[ "$GEM5_BIN" == "$CANONICAL_GEM5_REALPATH" ]] || \
+    error "--gem5-bin must resolve to ${CANONICAL_GEM5_BIN}"
 C_GEM5_BIN="/gem5/build/VEGA_X86/gem5.opt"
 C_GEM5_CONFIG="/gem5/configs/example/gpufs/mi300_cosim.py"
+GEM5_CONFIG_ARGS="defaults:num-gpus=${NUM_GPUS},num-cus=${NUM_CUS},host-mem=${HOST_MEM},vram-size=${VRAM_SIZE}"
+if [[ -n "$GEM5_DEBUG" ]]; then
+    GEM5_CONFIG_ARGS+=";debug-flags=${GEM5_DEBUG}"
+fi
 
 # ---- Validation ----
 
-[[ -f "$GEM5_BIN" ]]   || error "gem5 not found: $GEM5_BIN\n  Build: ./scripts/cosim_build.sh gem5"
+[[ -x "$GEM5_BIN" ]]   || error "gem5 not executable: $GEM5_BIN\n  Build: ./scripts/cosim_build.sh gem5"
 [[ -n "$QEMU_BIN" && -x "$QEMU_BIN" ]] || error "qemu-system-x86_64 not found. Install QEMU 10.1+ or pass --qemu-bin."
 [[ -n "$QEMU_IMG" && -x "$QEMU_IMG" ]] || \
     error "qemu-img not found beside the selected QEMU or on PATH."
 "$QEMU_BIN" -device help 2>/dev/null | grep 'vfio-user-pci' >/dev/null || \
     error "QEMU does not provide vfio-user-pci. Install QEMU 10.1+ or pass a compatible --qemu-bin."
-[[ -f "$DISK_IMAGE" ]] || error "Disk image not found: $DISK_IMAGE\n  Build: ./scripts/run_mi300x_fs.sh build-disk"
-[[ -f "$KERNEL" ]]     || error "Kernel not found: $KERNEL\n  Build: ./scripts/run_mi300x_fs.sh build-disk"
+[[ -f "$DISK_IMAGE" ]] || error "Disk image not found: $DISK_IMAGE\n  Build: ./scripts/cosim_build.sh guest"
+[[ -f "$KERNEL" ]]     || error "Kernel not found: $KERNEL\n  Build: ./scripts/cosim_build.sh guest"
 [[ -r /dev/kvm && -w /dev/kvm ]] || error "/dev/kvm must be readable and writable."
 [[ "$SOCKET_PATH" == "/tmp/gem5-mi300x-${COSIM_RUN_ID}.sock" ]] || \
     error "--socket-path must remain run-scoped: /tmp/gem5-mi300x-${COSIM_RUN_ID}.sock"
@@ -313,6 +337,36 @@ trap 'COSIM_FAILURE_CATEGORY="$COSIM_CAT_INTERRUPT"; exit 130' INT TERM
 # ---- Preflight audit ----
 
 mkdir -p "$ARTIFACT_DIR"
+{
+    echo "schema=cosim-launch-invocation/v1"
+    echo "run_id=${COSIM_RUN_ID}"
+    echo "artifact_dir=${ARTIFACT_DIR}"
+    echo "share_dir=${SHARE_DIR}"
+    echo "gem5_binary=${GEM5_BIN}"
+    echo "gem5_container_binary=${C_GEM5_BIN}"
+    echo "gem5_config_args=${GEM5_CONFIG_ARGS}"
+    echo "gem5_docker_image=${GEM5_DOCKER_IMAGE}"
+    echo "qemu_binary=${QEMU_BIN}"
+    echo "disk_image=${DISK_IMAGE}"
+    echo "kernel=${KERNEL}"
+    echo "host_cpus=${HOST_CPUS}"
+    echo "gem5_init_timeout=${GEM5_TIMEOUT}"
+    echo "cwd=$(pwd -P)"
+    printf 'argv0=%q\n' "$0"
+    printf 'argv='
+    printf ' %q' "${ORIGINAL_ARGS[@]}"
+    printf '\n'
+} > "${ARTIFACT_DIR}/launch-invocation.txt"
+
+PREFLIGHT_DIR="${ARTIFACT_DIR}/preflight"
+mkdir -p "$PREFLIGHT_DIR"
+if ! QEMU_BIN="$QEMU_BIN" GEM5_DOCKER_IMAGE="$GEM5_DOCKER_IMAGE" \
+    "${SCRIPT_DIR}/cosim_preflight.sh" run --output-dir "$PREFLIGHT_DIR" | \
+    tee "${PREFLIGHT_DIR}/preflight.log"; then
+    COSIM_FAILURE_CATEGORY="$COSIM_CAT_READINESS_FAIL"
+    error "run preflight failed; inspect ${PREFLIGHT_DIR}/preflight.json"
+fi
+
 "$QEMU_IMG" create -q -f qcow2 -F raw -b "$DISK_IMAGE" "$GUEST_OVERLAY" || \
     error "failed to create run-scoped Guest overlay: $GUEST_OVERLAY"
 "$QEMU_IMG" info --output=json "$GUEST_OVERLAY" > \
@@ -327,7 +381,12 @@ if [[ -f "${COSIM_DIR}/.local/cosim/build/guest/.cosim-build-meta" ]]; then
         "${ARTIFACT_DIR}/guest-build-meta.txt"
 fi
 
-run_preflight_audit | tee "${SESSION_DIR}/preflight.log"
+if ! run_preflight_audit | \
+    tee "${SESSION_DIR}/preflight-resources.log" \
+        "${ARTIFACT_DIR}/preflight-resources.log"; then
+    COSIM_FAILURE_CATEGORY="$COSIM_CAT_READINESS_FAIL"
+    error "run-scoped resource preflight failed"
+fi
 
 # ==================================================================
 # Step 1: Start gem5 in Docker
@@ -484,9 +543,8 @@ echo "After guest boots (auto-login as root), verify:"
 echo "  rocm-smi          # should show device 0x74a0"
 echo "  rocminfo          # should show gfx942"
 echo ""
-echo "Manual setup (if service is not installed):"
-echo "  dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128"
-echo "  modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2"
+echo "若服务缺失或失败，请保留 artifact 与 run ID，并检查 Guest build provenance 和 service log。"
+echo "不要手工写 /dev/mem，也不要在部分初始化的 Guest 中重载 amdgpu；清理后使用全新会话。"
 echo ""
 if [[ -n "$SHARE_DIR" ]]; then
     echo "Shared directory: $SHARE_DIR"

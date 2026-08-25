@@ -4,11 +4,17 @@
 
 set -euo pipefail
 
+ORIGINAL_ARGS=("$@")
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COSIM_DIR="$(dirname "$SCRIPT_DIR")"
 TESTS_DIR="${COSIM_DIR}/tests"
 KERNELS_DIR="${TESTS_DIR}/kernels"
 LAUNCH_SCRIPT="${SCRIPT_DIR}/cosim_launch.sh"
+BUILD_SCRIPT="${SCRIPT_DIR}/cosim_build.sh"
+CANONICAL_GEM5_BIN="${COSIM_DIR}/gem5/build/VEGA_X86/gem5.opt"
+GEM5_BUILD_META="${COSIM_DIR}/gem5/build/VEGA_X86/.cosim-build-meta"
+GEM5_BASELINE_LOCK="${COSIM_DIR}/configs/cosim/gem5-baseline.lock"
 
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/cosim_lib.sh"
@@ -32,6 +38,15 @@ SESSION_DIR=""
 SESSION_FIFO=""
 LAUNCH_PID=""
 CONTROL_FD=""
+EFFECTIVE_GEM5_BIN="$CANONICAL_GEM5_BIN"
+EFFECTIVE_NUM_GPUS="1"
+EFFECTIVE_NUM_CUS="40"
+EFFECTIVE_HOST_MEM="8G"
+EFFECTIVE_VRAM_SIZE="16GiB"
+EFFECTIVE_GEM5_DEBUG=""
+EFFECTIVE_GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
+GUEST_BRIDGE_POLICY="artifact-local"
+STRICT_ACCEPTANCE="${COSIM_STRICT_ACCEPTANCE:-0}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,6 +60,64 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
+load_gem5_build_metadata() {
+    local metadata_file="$1"
+    local key count value
+
+    for key in commit source_fingerprint_algorithm source_fingerprint target \
+               binary binary_sha256 docker_image; do
+        count="$(awk -F= -v wanted="$key" \
+            '$1 == wanted {count++} END {print count + 0}' "$metadata_file")"
+        [[ "$count" -eq 1 ]] || \
+            error "gem5 build metadata must contain exactly one ${key}: ${metadata_file}"
+        value="$(awk -F= -v wanted="$key" \
+            '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "$metadata_file")"
+        [[ -n "$value" ]] || error "empty gem5 build metadata field: ${key}"
+        case "$key" in
+            commit) GEM5_META_COMMIT="$value" ;;
+            source_fingerprint_algorithm) GEM5_META_FINGERPRINT_ALGORITHM="$value" ;;
+            source_fingerprint) GEM5_META_SOURCE_FINGERPRINT="$value" ;;
+            target) GEM5_META_TARGET="$value" ;;
+            binary) GEM5_META_BINARY="$value" ;;
+            binary_sha256) GEM5_META_BINARY_SHA256="$value" ;;
+            docker_image) GEM5_META_DOCKER_IMAGE="$value" ;;
+        esac
+    done
+}
+
+load_gem5_baseline_lock() {
+    local lock_file="$1"
+    local key count value populated_lines
+    local -a keys=(schema gem5_commit source_fingerprint_algorithm \
+        source_fingerprint binary_sha256 docker_image)
+
+    populated_lines="$(awk 'NF {count++} END {print count + 0}' "$lock_file")"
+    [[ "$populated_lines" -eq "${#keys[@]}" ]] || \
+        error "gem5 baseline lock contains unexpected or missing fields: ${lock_file}"
+    for key in "${keys[@]}"; do
+        count="$(awk -F= -v wanted="$key" \
+            '$1 == wanted {count++} END {print count + 0}' "$lock_file")"
+        [[ "$count" -eq 1 ]] || \
+            error "gem5 baseline lock must contain exactly one ${key}: ${lock_file}"
+        value="$(awk -F= -v wanted="$key" \
+            '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "$lock_file")"
+        [[ -n "$value" ]] || error "empty gem5 baseline lock field: ${key}"
+        case "$key" in
+            schema) GEM5_LOCK_SCHEMA="$value" ;;
+            gem5_commit) GEM5_LOCK_COMMIT="$value" ;;
+            source_fingerprint_algorithm) GEM5_LOCK_FINGERPRINT_ALGORITHM="$value" ;;
+            source_fingerprint) GEM5_LOCK_SOURCE_FINGERPRINT="$value" ;;
+            binary_sha256) GEM5_LOCK_BINARY_SHA256="$value" ;;
+            docker_image) GEM5_LOCK_DOCKER_IMAGE="$value" ;;
+        esac
+    done
+}
+
+current_gem5_source_fingerprint() {
+    bash -c 'source "$1"; source_fingerprint "$2"' \
+        _ "$BUILD_SCRIPT" "${COSIM_DIR}/gem5"
+}
+
 usage() {
     cat <<EOF
 Host-side single-operator cosim test runner.
@@ -56,7 +129,7 @@ Options:
   --repeat N             Run the same operator N times (fresh session each)
   --keep-alive           Leave QEMU + gem5 running after a successful test
   --session-name NAME    detached session name (default: qemu-cosim-tests)
-  --screen-log PATH      console log path (default: /tmp/qemu-cosim-tests.log)
+  --screen-log PATH      console log path (default: <artifact-directory>/qemu.log)
   --boot-timeout SECS    guest boot timeout (default: 240)
   --test-timeout SECS    per-test timeout inside guest (default: 60)
   --guest-run-timeout S  host deadline for compile + test (default: 1800)
@@ -68,6 +141,9 @@ Unknown options are passed through to cosim_launch.sh.
 Environment:
   GUEST_TEST_PREFIX       Empty, HSA_ENABLE_INTERRUPT=0, or
                           HSA_ENABLE_INTERRUPT=1 (default: empty -> 0)
+  COSIM_STRICT_ACCEPTANCE 0：允许可重放的 dirty-tree 开发/诊断（默认）
+                          1：strict v2 候选；要求顶层仓库与 gem5/ clean，
+                            且 tracked baseline lock 与 HEAD 一致
 EOF
     exit 0
 }
@@ -84,7 +160,14 @@ while [[ $# -gt 0 ]]; do
         --guest-run-timeout) GUEST_RUN_TIMEOUT_SECS="$2"; shift 2 ;;
         --output-dir)       OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help)          usage ;;
-        --*)                PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
+        --share-dir|--artifact-dir)
+            error "$1 is runner-owned and cannot be passed through"
+            ;;
+        --*)
+            [[ $# -ge 2 ]] || error "missing value for option: $1"
+            PASSTHROUGH_ARGS+=("$1" "$2")
+            shift 2
+            ;;
         *)                  FILTER="$1"; shift ;;
     esac
 done
@@ -95,9 +178,52 @@ for timeout_name in BOOT_TIMEOUT_SECS TEST_TIMEOUT_SECS GUEST_RUN_TIMEOUT_SECS; 
         error "${timeout_name} must be a positive integer"
 done
 [[ "$REPEAT_COUNT" =~ ^[0-9]+$ ]] || error "--repeat must be a non-negative integer"
+[[ "$STRICT_ACCEPTANCE" == "0" || "$STRICT_ACCEPTANCE" == "1" ]] || \
+    error "COSIM_STRICT_ACCEPTANCE must be 0 or 1"
+export COSIM_STRICT_ACCEPTANCE="$STRICT_ACCEPTANCE"
 if ! GUEST_HSA_ENABLE_INTERRUPT="$(cosim_guest_hsa_interrupt "$GUEST_TEST_PREFIX")"; then
     error "invalid GUEST_TEST_PREFIX"
 fi
+RECORDED_GUEST_TEST_PREFIX="$GUEST_TEST_PREFIX"
+if [[ -z "$RECORDED_GUEST_TEST_PREFIX" ]]; then
+    RECORDED_GUEST_TEST_PREFIX="HSA_ENABLE_INTERRUPT=${GUEST_HSA_ENABLE_INTERRUPT}"
+fi
+
+for ((arg_index=0; arg_index<${#PASSTHROUGH_ARGS[@]}; arg_index+=2)); do
+    option="${PASSTHROUGH_ARGS[$arg_index]}"
+    value="${PASSTHROUGH_ARGS[$((arg_index + 1))]}"
+    case "$option" in
+        --gem5-bin) EFFECTIVE_GEM5_BIN="$(realpath -m -- "$value")" ;;
+        --num-gpus) EFFECTIVE_NUM_GPUS="$value" ;;
+        --num-cus) EFFECTIVE_NUM_CUS="$value" ;;
+        --host-mem) EFFECTIVE_HOST_MEM="$value" ;;
+        --vram-size) EFFECTIVE_VRAM_SIZE="$value" ;;
+        --gem5-debug) EFFECTIVE_GEM5_DEBUG="$value" ;;
+        --gem5-docker) EFFECTIVE_GEM5_DOCKER_IMAGE="$value" ;;
+    esac
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || \
+        error "control whitespace is not allowed in passthrough values"
+done
+[[ -x "$CANONICAL_GEM5_BIN" && ! -L "$CANONICAL_GEM5_BIN" ]] || \
+    error "canonical gem5 binary is missing, non-executable, or symlinked: ${CANONICAL_GEM5_BIN}"
+CANONICAL_GEM5_REALPATH="$(realpath -e -- "$CANONICAL_GEM5_BIN")"
+[[ "$CANONICAL_GEM5_REALPATH" == "$CANONICAL_GEM5_BIN" ]] || \
+    error "canonical gem5 binary resolves outside its fixed path: ${CANONICAL_GEM5_BIN}"
+REQUESTED_GEM5_BIN="$EFFECTIVE_GEM5_BIN"
+if ! EFFECTIVE_GEM5_BIN="$(realpath -e -- "$REQUESTED_GEM5_BIN")"; then
+    error "gem5 not found: $REQUESTED_GEM5_BIN"
+fi
+[[ "$EFFECTIVE_GEM5_BIN" == "$CANONICAL_GEM5_REALPATH" ]] || \
+    error "--gem5-bin must resolve to ${CANONICAL_GEM5_BIN}"
+GEM5_CONFIG_ARGS="defaults:num-gpus=${EFFECTIVE_NUM_GPUS},num-cus=${EFFECTIVE_NUM_CUS},host-mem=${EFFECTIVE_HOST_MEM},vram-size=${EFFECTIVE_VRAM_SIZE}"
+if [[ -n "$EFFECTIVE_GEM5_DEBUG" ]]; then
+    GEM5_CONFIG_ARGS+=";debug-flags=${EFFECTIVE_GEM5_DEBUG}"
+fi
+RUNNER_MODE="pure_test"
+if [[ "$KEEP_ALIVE_ON_SUCCESS" -eq 1 ]]; then
+    RUNNER_MODE="keep_alive_diagnostic"
+fi
+RUNNER_TIMEOUT_POLICY="fixed-${TEST_TIMEOUT_SECS}"
 
 COSIM_RUN_ID="${COSIM_RUN_ID:-$(generate_run_id)}"
 export COSIM_RUN_ID
@@ -114,6 +240,10 @@ if [[ "$REPEAT_COUNT" -gt 0 && "$KEEP_ALIVE_ON_SUCCESS" -eq 1 ]]; then
 fi
 if [[ "$REPEAT_COUNT" -gt 0 && "$RUN_ALL" -eq 1 ]]; then
     error "--all and --repeat cannot be used together"
+fi
+if [[ "$SCREEN_LOG_SET" -eq 1 && \
+      ( "$REPEAT_COUNT" -gt 0 || "$RUN_ALL" -eq 1 ) ]]; then
+    error "--screen-log is fixed per fresh child artifact and cannot be used with --repeat or --all"
 fi
 
 SESSION_DIR="$(cosim_session_dir "$COSIM_RUN_ID" "$SESSION_NAME")"
@@ -346,7 +476,9 @@ on_interrupt() {
         warn "Interrupted. Session preserved (--keep-alive)."
         warn "Launcher PID: ${LAUNCH_PID:-unknown}"
         warn "Console log: ${SCREEN_LOG}"
-        warn "Cleanup: ${SCRIPT_DIR}/cosim_cleanup.sh --run-id ${COSIM_RUN_ID:-unknown} --confirm"
+        warn "Console pipe: ${SESSION_FIFO}"
+        warn "安全恢复：先验证并终止本次 launcher process group，确认退出后才允许精确 manifest fallback。"
+        warn "禁止对 live launcher 直接运行 cosim_cleanup.sh；参见 cosim-gpu-debug 的 live-wait-state 流程。"
     else
         warn "Interrupted. Cleaning up session..."
         cleanup_session
@@ -392,14 +524,13 @@ if [[ -d "$RUNNER_ARTIFACT_DIR" ]] && \
 fi
 mkdir -p "$RUNNER_ARTIFACT_DIR"
 
-if [[ "$SCREEN_LOG_SET" -eq 0 ]]; then
-    SCREEN_LOG="${RUNNER_ARTIFACT_DIR}/qemu.log"
-else
+CANONICAL_SCREEN_LOG="${RUNNER_ARTIFACT_DIR}/qemu.log"
+if [[ "$SCREEN_LOG_SET" -eq 1 ]]; then
     SCREEN_LOG="$(realpath -m -- "$SCREEN_LOG")"
-    case "$SCREEN_LOG" in
-        "${RUNNER_ARTIFACT_DIR}/"*) ;;
-        *) error "--screen-log must be inside --output-dir" ;;
-    esac
+    [[ "$SCREEN_LOG" == "$CANONICAL_SCREEN_LOG" ]] || \
+        error "--screen-log must equal ${CANONICAL_SCREEN_LOG}"
+else
+    SCREEN_LOG="$CANONICAL_SCREEN_LOG"
 fi
 
 STAGING_DIR="${RUNNER_ARTIFACT_DIR}/staging"
@@ -408,6 +539,7 @@ mkdir -p "$STAGING_DIR"
 rsync -a --exclude build/ --exclude '.cosim_guest_run.*' \
     "${TESTS_DIR}/" "${STAGING_DIR}/"
 GUEST_SCRIPT_HOST="${STAGING_DIR}/${GUEST_SCRIPT}"
+GUEST_SCRIPT_ARCHIVE="${RUNNER_ARTIFACT_DIR}/guest-run.sh"
 
 PATCH_DIR="${RUNNER_ARTIFACT_DIR}/patch"
 mkdir -p "$PATCH_DIR"
@@ -428,23 +560,12 @@ SOURCE_FINGERPRINT="$(
     cd "$STAGING_DIR"
     find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
 )"
-{
-    echo "head_commit=$(git -C "$COSIM_DIR" rev-parse HEAD)"
-    echo "source_fingerprint=${SOURCE_FINGERPRINT}"
-    echo "program=${TEST_NAME}"
-    echo "runner_sha256=$(sha256sum "${SCRIPT_DIR}/run_cosim_tests.sh" | awk '{print $1}')"
-    echo "guest_env_helper_sha256=$(sha256sum "${SCRIPT_DIR}/cosim_guest_env.sh" | awk '{print $1}')"
-    echo "repo_patch_sha256=$(sha256sum "${PATCH_DIR}/repo.patch" | awk '{print $1}')"
-    echo "repo_untracked_list_sha256=$(sha256sum "${PATCH_DIR}/repo-untracked-files.txt" | awk '{print $1}')"
-    if [[ -f "${PATCH_DIR}/repo-untracked-files.tar" ]]; then
-        echo "repo_untracked_archive_sha256=$(sha256sum "${PATCH_DIR}/repo-untracked-files.tar" | awk '{print $1}')"
-    else
-        echo "repo_untracked_archive_sha256=none"
-    fi
-} > "${PATCH_DIR}/source-snapshot.txt"
 
-git -C "${COSIM_DIR}/gem5" status --short > "${PATCH_DIR}/gem5-status.txt"
-git -C "${COSIM_DIR}/gem5" diff --binary HEAD > "${PATCH_DIR}/gem5.patch"
+git -C "${COSIM_DIR}/gem5" -c status.renames=false \
+    status --porcelain=v1 --untracked-files=all --ignore-submodules=none > \
+    "${PATCH_DIR}/gem5-status.txt"
+git -C "${COSIM_DIR}/gem5" diff --binary --no-ext-diff HEAD > \
+    "${PATCH_DIR}/gem5.patch"
 git -C "${COSIM_DIR}/gem5" ls-files --others --exclude-standard > \
     "${PATCH_DIR}/untracked-files.txt"
 if [[ -s "${PATCH_DIR}/untracked-files.txt" ]]; then
@@ -452,6 +573,214 @@ if [[ -s "${PATCH_DIR}/untracked-files.txt" ]]; then
         tar -C "${COSIM_DIR}/gem5" --null --files-from=- -cf \
             "${PATCH_DIR}/untracked-files.tar"
 fi
+
+[[ -f "$GEM5_BUILD_META" && ! -L "$GEM5_BUILD_META" ]] || \
+    error "canonical gem5 build metadata is missing or symlinked: ${GEM5_BUILD_META}"
+GEM5_BUILD_META_ARCHIVE="${PATCH_DIR}/gem5-build-meta.txt"
+cp -- "$GEM5_BUILD_META" "$GEM5_BUILD_META_ARCHIVE"
+GEM5_BUILD_META_SHA256="$(sha256sum "$GEM5_BUILD_META" | awk '{print $1}')"
+[[ "$(sha256sum "$GEM5_BUILD_META_ARCHIVE" | awk '{print $1}')" == \
+   "$GEM5_BUILD_META_SHA256" ]] || error "archived gem5 build metadata hash mismatch"
+
+GEM5_BASELINE_LOCK_REL="configs/cosim/gem5-baseline.lock"
+if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+    git -C "$COSIM_DIR" ls-files --error-unmatch -- "$GEM5_BASELINE_LOCK_REL" \
+        >/dev/null 2>&1 || error "gem5 baseline lock is not tracked: ${GEM5_BASELINE_LOCK}"
+    git -C "$COSIM_DIR" diff --quiet HEAD -- "$GEM5_BASELINE_LOCK_REL" || \
+        error "gem5 baseline lock differs from HEAD: ${GEM5_BASELINE_LOCK}"
+fi
+[[ -f "$GEM5_BASELINE_LOCK" && ! -L "$GEM5_BASELINE_LOCK" ]] || \
+    error "gem5 baseline lock is missing or symlinked: ${GEM5_BASELINE_LOCK}"
+GEM5_BASELINE_LOCK_ARCHIVE="${PATCH_DIR}/gem5-baseline.lock"
+cp -- "$GEM5_BASELINE_LOCK" "$GEM5_BASELINE_LOCK_ARCHIVE"
+GEM5_BASELINE_LOCK_SHA256="$(sha256sum "$GEM5_BASELINE_LOCK" | awk '{print $1}')"
+[[ "$(sha256sum "$GEM5_BASELINE_LOCK_ARCHIVE" | awk '{print $1}')" == \
+   "$GEM5_BASELINE_LOCK_SHA256" ]] || error "archived gem5 baseline lock hash mismatch"
+if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+    GEM5_BASELINE_LOCK_HEAD_SHA256="$(git -C "$COSIM_DIR" \
+        show "HEAD:${GEM5_BASELINE_LOCK_REL}" | sha256sum | awk '{print $1}')"
+    [[ "$GEM5_BASELINE_LOCK_SHA256" == "$GEM5_BASELINE_LOCK_HEAD_SHA256" ]] || \
+        error "archived gem5 baseline lock does not match its top-level HEAD blob"
+fi
+
+GEM5_CURRENT_COMMIT="$(git -C "${COSIM_DIR}/gem5" rev-parse HEAD)"
+GEM5_CURRENT_SUBJECT="$(git -C "${COSIM_DIR}/gem5" log -1 --format=%s)"
+GEM5_CURRENT_BINARY_SHA256="$(sha256sum "$EFFECTIVE_GEM5_BIN" | awk '{print $1}')"
+if ! GEM5_CURRENT_DOCKER_IMAGE_ID="$(docker image inspect --format '{{.Id}}' \
+    "$EFFECTIVE_GEM5_DOCKER_IMAGE" 2>/dev/null)"; then
+    error "gem5 runtime Docker image is unavailable: ${EFFECTIVE_GEM5_DOCKER_IMAGE}"
+fi
+[[ "$GEM5_CURRENT_DOCKER_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+    error "invalid gem5 runtime Docker image identity: ${GEM5_CURRENT_DOCKER_IMAGE_ID}"
+if ! GEM5_CURRENT_SOURCE_FINGERPRINT="$(current_gem5_source_fingerprint)"; then
+    error "failed to compute the current gem5 source fingerprint"
+fi
+[[ "$GEM5_CURRENT_SOURCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || \
+    error "invalid current gem5 source fingerprint: ${GEM5_CURRENT_SOURCE_FINGERPRINT}"
+
+{
+    echo "head_commit=$(git -C "$COSIM_DIR" rev-parse HEAD)"
+    echo "source_fingerprint=${SOURCE_FINGERPRINT}"
+    echo "program=${TEST_NAME}"
+    echo "runner_sha256=$(sha256sum "${SCRIPT_DIR}/run_cosim_tests.sh" | awk '{print $1}')"
+    echo "guest_env_helper_sha256=$(sha256sum "${SCRIPT_DIR}/cosim_guest_env.sh" | awk '{print $1}')"
+    echo "launcher_sha256=$(sha256sum "$LAUNCH_SCRIPT" | awk '{print $1}')"
+    echo "build_script_sha256=$(sha256sum "$BUILD_SCRIPT" | awk '{print $1}')"
+    echo "repo_status_sha256=$(sha256sum "${PATCH_DIR}/repo-status.txt" | awk '{print $1}')"
+    echo "repo_patch_sha256=$(sha256sum "${PATCH_DIR}/repo.patch" | awk '{print $1}')"
+    echo "repo_untracked_list_sha256=$(sha256sum "${PATCH_DIR}/repo-untracked-files.txt" | awk '{print $1}')"
+    if [[ -f "${PATCH_DIR}/repo-untracked-files.tar" ]]; then
+        echo "repo_untracked_archive_sha256=$(sha256sum "${PATCH_DIR}/repo-untracked-files.tar" | awk '{print $1}')"
+    else
+        echo "repo_untracked_archive_sha256=none"
+    fi
+    echo "gem5_source_commit=${GEM5_CURRENT_COMMIT}"
+    echo "gem5_source_fingerprint=${GEM5_CURRENT_SOURCE_FINGERPRINT}"
+    echo "gem5_status_sha256=$(sha256sum "${PATCH_DIR}/gem5-status.txt" | awk '{print $1}')"
+    echo "gem5_patch_sha256=$(sha256sum "${PATCH_DIR}/gem5.patch" | awk '{print $1}')"
+    echo "gem5_untracked_list_sha256=$(sha256sum "${PATCH_DIR}/untracked-files.txt" | awk '{print $1}')"
+    if [[ -f "${PATCH_DIR}/untracked-files.tar" ]]; then
+        echo "gem5_untracked_archive_sha256=$(sha256sum "${PATCH_DIR}/untracked-files.tar" | awk '{print $1}')"
+    else
+        echo "gem5_untracked_archive_sha256=none"
+    fi
+    echo "gem5_build_meta_sha256=${GEM5_BUILD_META_SHA256}"
+    echo "gem5_baseline_lock_sha256=${GEM5_BASELINE_LOCK_SHA256}"
+} > "${PATCH_DIR}/source-snapshot.txt"
+
+load_gem5_build_metadata "$GEM5_BUILD_META_ARCHIVE"
+load_gem5_baseline_lock "$GEM5_BASELINE_LOCK_ARCHIVE"
+if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+    [[ ! -s "${PATCH_DIR}/repo-status.txt" ]] || \
+        error "top-level source tree must be clean before a strict acceptance run"
+    [[ ! -s "${PATCH_DIR}/gem5-status.txt" ]] || \
+        error "gem5 source tree must be clean before a strict acceptance run"
+fi
+[[ "$GEM5_META_COMMIT" =~ ^[0-9a-f]{40}$ && \
+   "$GEM5_META_COMMIT" == "$GEM5_CURRENT_COMMIT" ]] || \
+    error "gem5 build metadata commit does not match the current source tree"
+[[ "$GEM5_META_FINGERPRINT_ALGORITHM" == "2" ]] || \
+    error "unsupported gem5 source fingerprint algorithm: ${GEM5_META_FINGERPRINT_ALGORITHM}"
+[[ "$GEM5_META_SOURCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ && \
+   "$GEM5_META_SOURCE_FINGERPRINT" == "$GEM5_CURRENT_SOURCE_FINGERPRINT" ]] || \
+    error "gem5 build metadata source fingerprint does not match the current source tree"
+[[ "$GEM5_META_TARGET" == "VEGA_X86" ]] || \
+    error "gem5 build metadata target must be VEGA_X86"
+[[ "$GEM5_META_BINARY" == "$CANONICAL_GEM5_BIN" ]] || \
+    error "gem5 build metadata binary is not canonical: ${GEM5_META_BINARY}"
+if ! GEM5_META_BINARY_REALPATH="$(realpath -e -- "$GEM5_META_BINARY")"; then
+    error "gem5 build metadata binary does not exist: ${GEM5_META_BINARY}"
+fi
+[[ "$GEM5_META_BINARY_REALPATH" == "$EFFECTIVE_GEM5_BIN" ]] || \
+    error "gem5 build metadata binary does not resolve to the selected binary"
+[[ "$GEM5_META_BINARY_SHA256" =~ ^[0-9a-f]{64}$ && \
+   "$GEM5_META_BINARY_SHA256" == "$GEM5_CURRENT_BINARY_SHA256" ]] || \
+    error "gem5 build metadata binary hash does not match the selected binary"
+[[ "$GEM5_META_DOCKER_IMAGE" =~ ^sha256:[0-9a-f]{64}$ && \
+   "$GEM5_META_DOCKER_IMAGE" == "$GEM5_CURRENT_DOCKER_IMAGE_ID" ]] || \
+    error "gem5 build metadata Docker image does not match the runtime image"
+[[ "$GEM5_LOCK_SCHEMA" == "1" ]] || \
+    error "unsupported gem5 baseline lock schema: ${GEM5_LOCK_SCHEMA}"
+[[ "$GEM5_LOCK_FINGERPRINT_ALGORITHM" == "2" ]] || \
+    error "unsupported gem5 baseline lock source fingerprint algorithm"
+[[ "$GEM5_LOCK_COMMIT" =~ ^[0-9a-f]{40}$ && \
+   "$GEM5_LOCK_COMMIT" == "$GEM5_META_COMMIT" ]] || \
+    error "gem5 baseline lock commit does not match build metadata"
+[[ "$GEM5_LOCK_SOURCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ && \
+   "$GEM5_LOCK_SOURCE_FINGERPRINT" == "$GEM5_META_SOURCE_FINGERPRINT" ]] || \
+    error "gem5 baseline lock source fingerprint does not match build metadata"
+[[ "$GEM5_LOCK_BINARY_SHA256" =~ ^[0-9a-f]{64}$ && \
+   "$GEM5_LOCK_BINARY_SHA256" == "$GEM5_META_BINARY_SHA256" ]] || \
+    error "gem5 baseline lock binary hash does not match build metadata"
+[[ "$GEM5_LOCK_DOCKER_IMAGE" =~ ^sha256:[0-9a-f]{64}$ && \
+   "$GEM5_LOCK_DOCKER_IMAGE" == "$GEM5_META_DOCKER_IMAGE" ]] || \
+    error "gem5 baseline lock Docker image does not match build metadata"
+
+{
+    echo "gem5_source_commit=${GEM5_CURRENT_COMMIT}"
+    echo "gem5_source_subject=${GEM5_CURRENT_SUBJECT}"
+    echo "gem5_source_fingerprint_algorithm=2"
+    echo "gem5_source_fingerprint=${GEM5_CURRENT_SOURCE_FINGERPRINT}"
+    echo "gem5_binary=${EFFECTIVE_GEM5_BIN}"
+    echo "gem5_sha256=${GEM5_CURRENT_BINARY_SHA256}"
+    echo "gem5_build_meta=${GEM5_BUILD_META_ARCHIVE}"
+    echo "gem5_build_meta_sha256=${GEM5_BUILD_META_SHA256}"
+    echo "gem5_baseline_lock=${GEM5_BASELINE_LOCK_ARCHIVE}"
+    echo "gem5_baseline_lock_sha256=${GEM5_BASELINE_LOCK_SHA256}"
+    echo "gem5_docker_image_name=${EFFECTIVE_GEM5_DOCKER_IMAGE}"
+    echo "gem5_docker_image=${GEM5_CURRENT_DOCKER_IMAGE_ID}"
+} > "${PATCH_DIR}/binary-provenance.txt"
+
+{
+    echo "schema=cosim-runner-invocation/v1"
+    echo "run_id=${COSIM_RUN_ID}"
+    echo "program=${TEST_NAME}"
+    echo "program_source=tests/kernels/${TEST_NAME}.cpp"
+    echo "program_binary=tests/build/${TEST_NAME}"
+    echo "runner_argument=${TEST_NAME}"
+    echo "mode=${RUNNER_MODE}"
+    echo "repeat_count=1"
+    echo "timeout_policy=${RUNNER_TIMEOUT_POLICY}"
+    echo "boot_timeout=${BOOT_TIMEOUT_SECS}"
+    echo "test_timeout=${TEST_TIMEOUT_SECS}"
+    echo "guest_run_timeout=${GUEST_RUN_TIMEOUT_SECS}"
+    echo "guest_test_prefix=${RECORDED_GUEST_TEST_PREFIX}"
+    echo "guest_test_prefix_input=${GUEST_TEST_PREFIX}"
+    echo "expected_hsa_interrupt=${GUEST_HSA_ENABLE_INTERRUPT}"
+    echo "gem5_binary=${EFFECTIVE_GEM5_BIN}"
+    echo "gem5_docker_image_name=${EFFECTIVE_GEM5_DOCKER_IMAGE}"
+    echo "gem5_docker_image=${GEM5_CURRENT_DOCKER_IMAGE_ID}"
+    echo "gem5_config_args=${GEM5_CONFIG_ARGS}"
+    echo "strict_acceptance=${STRICT_ACCEPTANCE}"
+    echo "output_dir=${RUNNER_ARTIFACT_DIR}"
+    echo "artifact_dir=${RUNNER_ARTIFACT_DIR}"
+    echo "artifact_dir_pattern=-"
+    echo "matrix_path=${RUNNER_ARTIFACT_DIR}/matrix.tsv"
+    echo "provenance_file=${PATCH_DIR}/binary-provenance.txt"
+    echo "guest_bridge_policy=${GUEST_BRIDGE_POLICY}"
+    echo "guest_bridge_host=${STAGING_DIR}"
+    echo "guest_bridge_guest=/mnt"
+    echo "cwd=$(pwd -P)"
+    printf 'argv0=%q\n' "$0"
+    printf 'argv='
+    printf ' %q' "${ORIGINAL_ARGS[@]}"
+    printf '\n'
+    printf 'passthrough_args='
+    printf ' %q' "${PASSTHROUGH_ARGS[@]}"
+    printf '\n'
+} > "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"
+
+cat >"$GUEST_SCRIPT_ARCHIVE" <<EOF
+#!/bin/bash
+set -uo pipefail
+
+export HSA_ENABLE_INTERRUPT="${GUEST_HSA_ENABLE_INTERRUPT}"
+case "\$HSA_ENABLE_INTERRUPT" in
+    0|1) ;;
+    *) echo "invalid HSA_ENABLE_INTERRUPT=\$HSA_ENABLE_INTERRUPT"; exit 2 ;;
+esac
+echo "[COSIM_ENV] HSA_ENABLE_INTERRUPT=\$HSA_ENABLE_INTERRUPT"
+echo "[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=${TEST_TIMEOUT_SECS}"
+
+if ! mountpoint -q /mnt; then
+    mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt
+fi
+
+cd /mnt || exit 2
+make -j1
+build_rc=\$?
+echo "__${COMPILE_TOKEN}__:\${build_rc}"
+if [[ "\$build_rc" -ne 0 ]]; then
+    echo "__${TOKEN}__:\${build_rc}"
+    exit "\$build_rc"
+fi
+TEST_TIMEOUT_SECS=${TEST_TIMEOUT_SECS} ./run_tests.sh ${TEST_NAME}
+rc=\$?
+echo "__${TOKEN}__:\${rc}"
+exit "\${rc}"
+EOF
+chmod +x "$GUEST_SCRIPT_ARCHIVE"
+cp -- "$GUEST_SCRIPT_ARCHIVE" "$GUEST_SCRIPT_HOST"
 
 [[ ! -e "$SESSION_DIR" && ! -L "$SESSION_DIR" ]] || \
     error "stale or symlinked session directory exists: $SESSION_DIR"
@@ -468,6 +797,7 @@ setsid stdbuf -oL -eL "$LAUNCH_SCRIPT" \
     <&$CONTROL_FD >"$SCREEN_LOG" 2>&1 &
 LAUNCH_PID=$!
 echo "$LAUNCH_PID" >"${SESSION_DIR}/launcher.pid"
+echo "$LAUNCH_PID" >"${RUNNER_ARTIFACT_DIR}/launcher.pid"
 
 step "[${TEST_NAME}] Waiting for guest login prompt..."
 start_ts=$(date +%s)
@@ -493,36 +823,6 @@ start_line=1
 if [[ -f "$SCREEN_LOG" ]]; then
     start_line=$(( $(wc -l < "$SCREEN_LOG") + 1 ))
 fi
-
-cat >"$GUEST_SCRIPT_HOST" <<EOF
-#!/bin/bash
-set -uo pipefail
-
-export HSA_ENABLE_INTERRUPT="${GUEST_HSA_ENABLE_INTERRUPT}"
-case "\$HSA_ENABLE_INTERRUPT" in
-    0|1) ;;
-    *) echo "invalid HSA_ENABLE_INTERRUPT=\$HSA_ENABLE_INTERRUPT"; exit 2 ;;
-esac
-echo "[COSIM_ENV] HSA_ENABLE_INTERRUPT=\$HSA_ENABLE_INTERRUPT"
-
-if ! mountpoint -q /mnt; then
-    mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt
-fi
-
-cd /mnt || exit 2
-make -j1
-build_rc=\$?
-echo "__${COMPILE_TOKEN}__:\${build_rc}"
-if [[ "\$build_rc" -ne 0 ]]; then
-    echo "__${TOKEN}__:\${build_rc}"
-    exit "\$build_rc"
-fi
-TEST_TIMEOUT_SECS=${TEST_TIMEOUT_SECS} ./run_tests.sh ${TEST_NAME}
-rc=\$?
-echo "__${TOKEN}__:\${rc}"
-exit "\${rc}"
-EOF
-chmod +x "$GUEST_SCRIPT_HOST"
 
 step "[${TEST_NAME}] Running test inside guest..."
 send_guest "if ! mountpoint -q /mnt; then mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt; fi; bash /mnt/${GUEST_SCRIPT}"
@@ -570,15 +870,12 @@ if [[ "$compile_rc" -eq 0 && ! -x "$TEST_BINARY" ]]; then
     record_category "$COSIM_CAT_TEST_FAIL"
     error "[${TEST_NAME}] compile succeeded but exact binary is missing: $TEST_BINARY"
 fi
-{
-    echo "gem5_source_commit=$(git -C "${COSIM_DIR}/gem5" rev-parse HEAD)"
-    echo "gem5_binary=${COSIM_DIR}/gem5/build/VEGA_X86/gem5.opt"
-    echo "gem5_sha256=$(sha256sum "${COSIM_DIR}/gem5/build/VEGA_X86/gem5.opt" | awk '{print $1}')"
-    if [[ -f "$TEST_BINARY" ]]; then
+if [[ -f "$TEST_BINARY" ]]; then
+    {
         echo "test_binary=${TEST_BINARY}"
         echo "test_binary_sha256=$(sha256sum "$TEST_BINARY" | awk '{print $1}')"
-    fi
-} > "${PATCH_DIR}/binary-provenance.txt"
+    } >> "${PATCH_DIR}/binary-provenance.txt"
+fi
 
 normalised_output="$(sed -n "${start_line},\$p" "$SCREEN_LOG" | tr -d '\r')"
 pass_count="$(awk -v marker="[PASS] ${TEST_NAME}" '$0 == marker {count++} END {print count + 0}' \
@@ -610,14 +907,35 @@ docker inspect "$cname" > "${RUNNER_ARTIFACT_DIR}/docker-inspect.json" 2>&1 || t
     echo "program_source=tests/kernels/${TEST_NAME}.cpp"
     echo "program_binary=tests/build/${TEST_NAME}"
     echo "runner_argument=${TEST_NAME}"
-    echo "guest_test_prefix=${GUEST_TEST_PREFIX}"
+    echo "mode=${RUNNER_MODE}"
+    echo "repeat_count=1"
+    echo "timeout_policy=${RUNNER_TIMEOUT_POLICY}"
+    echo "boot_timeout=${BOOT_TIMEOUT_SECS}"
+    echo "test_timeout=${TEST_TIMEOUT_SECS}"
+    echo "guest_run_timeout=${GUEST_RUN_TIMEOUT_SECS}"
+    echo "guest_test_prefix=${RECORDED_GUEST_TEST_PREFIX}"
+    echo "guest_test_prefix_input=${GUEST_TEST_PREFIX}"
     echo "expected_hsa_enable_interrupt=${GUEST_HSA_ENABLE_INTERRUPT}"
+    echo "gem5_binary=${EFFECTIVE_GEM5_BIN}"
+    echo "gem5_docker_image_name=${EFFECTIVE_GEM5_DOCKER_IMAGE}"
+    echo "gem5_docker_image=${GEM5_CURRENT_DOCKER_IMAGE_ID}"
+    echo "gem5_config_args=${GEM5_CONFIG_ARGS}"
+    echo "strict_acceptance=${STRICT_ACCEPTANCE}"
+    echo "artifact_dir_pattern=-"
+    echo "guest_bridge_policy=${GUEST_BRIDGE_POLICY}"
+    echo "guest_bridge_host=${STAGING_DIR}"
+    echo "guest_bridge_guest=/mnt"
     echo "compile_exit_code=${compile_rc}"
     echo "test_exit_code=${result_rc}"
     echo "exit_code=${result_rc}"
     echo "pass_count=${pass_count}"
     echo "fail_count=${fail_count}"
     echo "source_snapshot=${PATCH_DIR}/source-snapshot.txt"
+    echo "gem5_baseline_lock=${GEM5_BASELINE_LOCK_ARCHIVE}"
+    echo "gem5_baseline_lock_sha256=${GEM5_BASELINE_LOCK_SHA256}"
+    echo "runner_invocation=${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"
+    echo "launch_invocation=${RUNNER_ARTIFACT_DIR}/launch-invocation.txt"
+    echo "guest_script=${GUEST_SCRIPT_ARCHIVE}"
 } > "${RUNNER_ARTIFACT_DIR}/runner-metadata.txt"
 
 cleanup_rc=0
@@ -676,10 +994,12 @@ if [[ -f "${RUNNER_ARTIFACT_DIR}/verdict.json" ]]; then
         "${RUNNER_ARTIFACT_DIR}/verdict.json")"
     hsa_interrupt="$(cosim_guest_hsa_interrupt_from_log "$SCREEN_LOG" || true)"
     {
-        printf 'program\thsa_interrupt\trun\tsession_id\toutcome\texit_code\treason\tartifact_dir\n'
-        printf '%s\t%s\t1\t%s\t%s\t%s\t%s\t%s\n' \
+        printf 'program\thsa_interrupt\trun\tsession_id\toutcome\texit_code\treason\tartifact_dir\tboot_timeout\ttest_timeout\tguest_run_timeout\tstrict_acceptance\n'
+        printf '%s\t%s\t1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$TEST_NAME" "${hsa_interrupt:-unknown}" "$COSIM_RUN_ID" \
-            "$verdict_outcome" "$result_rc" "$verdict_reason" "$RUNNER_ARTIFACT_DIR"
+            "$verdict_outcome" "$result_rc" "$verdict_reason" "$RUNNER_ARTIFACT_DIR" \
+            "$BOOT_TIMEOUT_SECS" "$TEST_TIMEOUT_SECS" "$GUEST_RUN_TIMEOUT_SECS" \
+            "$STRICT_ACCEPTANCE"
     } > "${RUNNER_ARTIFACT_DIR}/matrix.tsv"
 fi
 

@@ -11,6 +11,7 @@ LOCAL_ROOT="${COSIM_LOCAL_ROOT:-${COSIM_DIR}/.local/cosim}"
 
 TOOLCHAIN_LOCK="${COSIM_DIR}/configs/cosim/toolchain.lock"
 GUEST_LOCK="${COSIM_DIR}/configs/cosim/guest.lock"
+GEM5_BASELINE_LOCK="${COSIM_DIR}/configs/cosim/gem5-baseline.lock"
 GUEST_PATCH="${SCRIPT_DIR}/patches/0002-guest-core-reproducible.patch"
 QEMU_VERSION="10.1.5"
 QEMU_RELEASE_KEY="CEACC9E15534EBABB82D3FA03353C9CEF108B584"
@@ -541,7 +542,7 @@ gem5_metadata_matches() {
     local commit="$1"
     local fingerprint="$2"
     local docker_build_recipe_fingerprint="$3"
-    local binary_sha docker_image_id
+    local binary_sha docker_image_id docker_run_image_id
 
     [[ -x "$GEM5_BIN" ]] || return 1
     [[ "$(metadata_value "$GEM5_META" commit || true)" == "$commit" ]] || return 1
@@ -556,7 +557,41 @@ gem5_metadata_matches() {
         return 1
     docker_image_id="$(docker image inspect -f '{{.Id}}' "$GEM5_IMAGE" 2>/dev/null)" || \
         return 1
+    docker_run_image_id="$(docker image inspect -f '{{.Id}}' "$GEM5_RUN_IMAGE" \
+        2>/dev/null)" || return 1
+    [[ "$docker_image_id" == "$docker_run_image_id" ]] || return 1
     [[ "$(metadata_value "$GEM5_META" docker_image || true)" == "$docker_image_id" ]]
+}
+
+refresh_gem5_baseline_lock() {
+    local commit="$1"
+    local fingerprint="$2"
+    local binary_sha docker_image_id docker_run_image_id
+
+    [[ -x "$GEM5_BIN" && ! -L "$GEM5_BIN" ]] || \
+        die "cannot refresh gem5 baseline lock without a regular executable: ${GEM5_BIN}"
+    binary_sha="$(sha256sum "$GEM5_BIN" | awk '{print $1}')"
+    docker_image_id="$(docker image inspect -f '{{.Id}}' "$GEM5_IMAGE")" || \
+        die "cannot resolve gem5 build image identity: ${GEM5_IMAGE}"
+    docker_run_image_id="$(docker image inspect -f '{{.Id}}' "$GEM5_RUN_IMAGE")" || \
+        die "cannot resolve gem5 runtime image identity: ${GEM5_RUN_IMAGE}"
+    [[ "$docker_image_id" == "$docker_run_image_id" ]] || \
+        die "gem5 build and runtime image identities do not match"
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "invalid gem5 commit for baseline lock"
+    [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || \
+        die "invalid gem5 source fingerprint for baseline lock"
+    [[ "$binary_sha" =~ ^[0-9a-f]{64}$ ]] || \
+        die "invalid gem5 binary hash for baseline lock"
+    [[ "$docker_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] || \
+        die "invalid gem5 Docker image identity for baseline lock"
+
+    write_metadata "$GEM5_BASELINE_LOCK" \
+        'schema=1' \
+        "gem5_commit=${commit}" \
+        "source_fingerprint_algorithm=${SOURCE_FINGERPRINT_ALGORITHM}" \
+        "source_fingerprint=${fingerprint}" \
+        "binary_sha256=${binary_sha}" \
+        "docker_image=${docker_run_image_id}"
 }
 
 prepare_qemu_source() {
@@ -781,6 +816,13 @@ build_qemu() {
 build_gem5() {
     [[ -d "${GEM5_DIR}/.git" || -f "${GEM5_DIR}/.git" ]] || \
         die "gem5 submodule is not initialized: ${GEM5_DIR}"
+    local canonical_gem5_dir selected_gem5_dir
+    canonical_gem5_dir="$(realpath -e -- "${COSIM_DIR}/gem5")" || \
+        die "canonical gem5 submodule is not initialized: ${COSIM_DIR}/gem5"
+    selected_gem5_dir="$(realpath -e -- "$GEM5_DIR")" || \
+        die "cannot resolve gem5 source tree: ${GEM5_DIR}"
+    [[ "$selected_gem5_dir" == "$canonical_gem5_dir" ]] || \
+        die "gem5 baseline lock can only be refreshed from ${COSIM_DIR}/gem5"
     require_command docker
     docker info >/dev/null 2>&1 || die "Docker daemon is not available"
 
@@ -791,6 +833,7 @@ build_gem5() {
 
     if [[ "$FORCE" -eq 0 ]] && gem5_metadata_matches \
         "$commit" "$fingerprint" "$docker_build_recipe_fingerprint"; then
+        refresh_gem5_baseline_lock "$commit" "$fingerprint"
         echo "gem5 up to date (commit ${commit}), skipping build"
         return 0
     fi
@@ -821,6 +864,7 @@ build_gem5() {
         "binary=${GEM5_BIN}" \
         "binary_sha256=$(sha256sum "$GEM5_BIN" | awk '{print $1}')" \
         "docker_image=$(docker image inspect -f '{{.Id}}' "$GEM5_IMAGE")"
+    refresh_gem5_baseline_lock "$commit" "$fingerprint"
 }
 
 validate_m5_binary() {

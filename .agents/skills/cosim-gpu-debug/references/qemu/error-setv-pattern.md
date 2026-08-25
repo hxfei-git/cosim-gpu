@@ -1,79 +1,88 @@
-# QEMU error_setv Double-Set Pattern
+# QEMU `error_setv` 重复设置模式
 
-Reference for diagnosing and fixing the `error_setv` assertion failure in QEMU.
-Discovered during cosim vfio-user launch debugging (June 2026).
+本文用于诊断 QEMU 的 `error_setv` assertion failure。该模式在 2026 年 6 月的
+cosim vfio-user 启动调试中发现；新 case 仍需匹配当前 QEMU source provenance。
 
-## Mechanism
+## 机制
 
-QEMU's error reporting convention uses `Error **errp` — a pointer to an
-error pointer. The invariant: `*errp` must be `NULL` when a new error is set.
+QEMU 的错误报告约定使用 `Error **errp`，即指向 error pointer 的 pointer。设置新
+error 时，必须保持 `*errp == NULL`。
 
 ```c
 // util/error.c:51-62
 static void error_setv(Error **errp, ...) {
-    if (errp == NULL) {          // L59: NULL → harmless, return immediately
+    if (errp == NULL) {          // L59：调用方不接收错误，直接返回
         return;
     }
-    assert(*errp == NULL);       // L62: *errp already set → SIGABRT
+    assert(*errp == NULL);       // L62：*errp 已设置时触发 SIGABRT
 }
 ```
 
-Key behaviors:
-- `errp == NULL`: callee does not want error detail → `error_setv` returns early (no crash)
-- `errp != NULL && *errp == NULL`: normal path — first error is set
-- `errp != NULL && *errp != NULL`: **assertion fires** — a second error is being set on a dirty `*errp`
+关键行为：
 
-## The anti-pattern
+- `errp == NULL`：callee 不接收错误详情，`error_setv` 直接返回。
+- `errp != NULL && *errp == NULL`：正常路径，设置第一个 error。
+- `errp != NULL && *errp != NULL`：在非空 `*errp` 上设置第二个 error，触发 assertion。
 
-Passing the same `Error **errp` to two functions that can both set errors:
+## 反模式
+
+把同一个 `Error **errp` 依次传给两个都可能设置错误的函数：
 
 ```c
-// ANTI-PATTERN (proxy.c:234-241, also present in upstream QEMU master):
+// 反模式（proxy.c:234-241；是否仍存在必须按锁定源码核验）：
 ret = qio_channel_readv_full(proxy->ioc, &iov, 1, fdp, numfdp, 0,
-                             errp);   // ← this may set *errp on failure (ECONNRESET)
+                             errp);   // 失败（如 ECONNRESET）时可能设置 *errp
 if (ret < 0) {
     error_setg_errno(errp, errno, "failed to read header");
-    // ↑ tries to set *errp again → assert(*errp == NULL) fails → SIGABRT
+    // 再次设置 *errp，导致 assert(*errp == NULL) 失败
 }
 ```
 
-## The fix pattern
+## 修复模式
 
-Use a local `Error *` to decouple the two error-setting calls:
+使用局部 `Error *` 隔离两次错误设置：
 
 ```c
-// FIX:
+// 修复：
 Error *local_err = NULL;
 ret = qio_channel_readv_full(proxy->ioc, &iov, 1, fdp, numfdp, 0,
-                             &local_err);  // isolate the inner error
+                             &local_err);  // 隔离内部 error
 if (ret < 0) {
     error_propagate_prepend(errp, local_err, "failed to read header: ");
-    // local_err is consumed; *errp is only set once
+    // local_err 的所有权被转移，*errp 只设置一次
 }
 ```
 
-`error_propagate_prepend` transfers ownership of `local_err` to `*errp`
-(with a prefix message), so `*errp` is set exactly once.
+`error_propagate_prepend` 把 `local_err` 的所有权连同 prefix message 转移到
+`*errp`，因此 `*errp` 只设置一次。
 
-## Identifying the pattern
+## 识别模式
 
-Search QEMU source for any function call that passes `errp` as argument
-followed by another error-set call on the same `errp`:
+在锁定的 QEMU 源码中查找：某函数调用接收 `errp` 后，后续路径又对同一 `errp`
+调用 error-set：
 
 ```bash
-# Find potential double-set sites in QEMU
+# 查找 QEMU 中可能的重复设置位置
 search pattern="error_set[gv]_errno\(errp" paths=["qemu/"]
-# Cross-check: does the immediately preceding call also receive errp?
+# 交叉检查：紧邻的前一次调用是否也接收 errp？
 ```
 
-Additional risk: `error_report_err` + `error_free` is safe (it reads and clears
-`*errp`), but `error_report_err` alone leaves `*errp` set → next `error_setv`
-crashes if it receives the same `errp`.
+额外风险：锁定的 QEMU 10.1.5 中，`error_report_err(Error *err)` 已经报告并释放
+传入的 `Error`；调用方不得再次执行 `error_free(err)`，否则会 double-free。由于参数
+按值传递，调用方变量不会自动清零；若同一局部变量还要复用，必须显式置空：
 
-## Crash chain: gem5 → QEMU secondary failure
+```c
+error_report_err(local_err);
+local_err = NULL;
+```
 
-The common trigger in cosim: gem5 crashes → socket closes → QEMU sees
-ECONNRESET → the double-set path is reached.
+也可以使用一次性的 ownership-transfer API。无论选择哪种路径，必须保证 error
+object 只消费一次，下一次传入 `&local_err` 前保持 `local_err == NULL`。
+
+## Crash 链：gem5 → QEMU 次生故障
+
+常见 cosim trigger 是 gem5 crash 后 socket 关闭，QEMU 收到 `ECONNRESET`，继而
+进入重复设置路径：
 
 ```
 gem5 assert/crash → socket disconnect
@@ -82,35 +91,34 @@ gem5 assert/crash → socket disconnect
   → error_setg_errno tries to set *errp again → SIGABRT
 ```
 
-**The QEMU double-set is a defensive bug**: it should never happen in normal
-operation, but it should also never crash when it does happen. The gem5 crash
-is the first failing component; the QEMU crash is a secondary effect that masks
-it.
+QEMU 重复设置属于 defensive bug：正常运行不应触发，即使触发也不应使 QEMU crash。
+在上面的时序中，gem5 crash 是第一个失败组件，QEMU crash 是掩盖它的次生效应。
 
-## GDB debugging
+## GDB 调试边界
 
-When the crash is inside QEMU, use a conditional breakpoint to isolate the
-real trigger (avoid stopping on harmless `errp == NULL` paths like SGX init):
+先通过同一 run 的 gem5/QEMU log 与 `--qemu-trace 'vfio_user_*'` 判断 QEMU 是否
+真的先失败。需要 GDB 时不得手写或复制 raw QEMU 参数，因为那会绕过 launcher 的
+run-scoped socket、shared memory、overlay、manifest 与 cleanup contract。优先分析
+该次运行保留的 core；若必须交互 breakpoint，应在已确认的调试计划内为标准 launcher
+增加有界的 GDB 入口，并由同一 manifest 管理进程。
+
+用于定位 assertion 的 breakpoint 条件是：
 
 ```gdb
-# Only break when the assertion would actually fire
+# 只在 assertion 确实会触发时停止
 break error.c:62 if *errp != NULL
-
-# Or from command line:
-gdb -q -batch \
-  -ex 'break error.c:62 if *errp != NULL' \
-  -ex run \
-  -ex 'bt full' \
-  --args .local/cosim/qemu/10.1.5/bin/qemu-system-x86_64 [args...]
+bt full
 ```
 
-## Upstream status
+## 源码版本状态
 
-This bug exists in upstream QEMU (`gitlab.com/qemu-project/qemu`, master)
-at `hw/vfio-user/proxy.c:234-241`. The same fix applies.
+历史发现位置为 `hw/vfio-user/proxy.c:234-241`。不得根据 `master` 的移动状态判断
+当前环境；必须先记录 lockfile、QEMU commit/source hash 与 binary provenance，再确认
+当前源码是否仍存在相同 caller/callee contract。
 
-## Cross-references
+## 交叉参考
 
-- `qemu-first-failure.md`: QEMU-first failure checks
-- `../gem5-model/vmid-assert-lesson.md`: the specific instance of this pattern in cosim (gem5 `assert(queue_vmid)` → QEMU double-error crash)
-- `../analysis/debug-analysis.md`: gem5 vs QEMU first-failure comparison
+- `qemu-first-failure.md`：QEMU-first failure 检查。
+- `../gem5-model/vmid-assert-lesson.md`：cosim 中 gem5
+  `assert(queue_vmid)` 导致 QEMU 重复错误 crash 的具体案例。
+- `../analysis/debug-analysis.md`：gem5 与 QEMU 的 first-failure 对比。

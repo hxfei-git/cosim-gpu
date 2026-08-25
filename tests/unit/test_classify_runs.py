@@ -159,6 +159,24 @@ class ClassifyRunsTests(unittest.TestCase):
         update_metadata(self.root, category="test_timeout")
         self.assert_failed_for("timeout")
 
+    def test_timeout_policy_marker_is_not_a_timeout_signal(self) -> None:
+        with (self.root / "qemu.log").open("a", encoding="utf-8") as handle:
+            handle.write("[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=60\n")
+        result = self.classify()
+        self.assertEqual("PASS", result["outcome"])
+        self.assertFalse(result["checks"]["timeout"]["observed"])
+
+    def test_timeout_log_marker_fails_even_with_pass_marker(self) -> None:
+        with (self.root / "qemu.log").open("a", encoding="utf-8") as handle:
+            handle.write("[TIMEOUT] vector_add exceeded 60s\n")
+        self.assert_failed_for("timeout")
+
+    def test_nonpolicy_cosim_timeout_marker_still_fails(self) -> None:
+        with (self.root / "qemu.log").open("a", encoding="utf-8") as handle:
+            handle.write("[COSIM_TIMEOUT] vector_add exceeded 60s\n")
+        result = self.assert_failed_for("timeout")
+        self.assertTrue(result["checks"]["timeout"]["observed"])
+
     def test_simulator_early_exit_category_fails(self) -> None:
         update_metadata(self.root, category="gem5_exit")
         self.assert_failed_for("simulator_early_exit")

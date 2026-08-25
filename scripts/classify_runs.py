@@ -77,6 +77,9 @@ FAIL_RE = re.compile(r"^\[FAIL\](?:\s|$)")
 TIMEOUT_SIGNAL_RE = re.compile(
     r"^\[(?:COSIM_)?(?:BOOT_|GEM5_INIT_|TEST_)?TIMEOUT\](?:\s|$)"
 )
+TIMEOUT_POLICY_RE = re.compile(
+    r"^\[COSIM_TIMEOUT\] TEST_TIMEOUT_SECS=[1-9][0-9]*$"
+)
 SIMULATOR_EXIT_SIGNAL_RE = re.compile(
     r"^\[COSIM_(?:GEM5|QEMU|SIMULATOR|LAUNCHER)_EXIT\](?:\s|$)"
 )
@@ -328,7 +331,9 @@ def classify_artifact(
             env_match = ENV_RE.match(line)
             if env_match:
                 env_values.append(env_match.group(1))
-            if TIMEOUT_SIGNAL_RE.match(line):
+            if TIMEOUT_SIGNAL_RE.match(line) and not TIMEOUT_POLICY_RE.fullmatch(
+                line
+            ):
                 timeout_seen = True
             if SIMULATOR_EXIT_SIGNAL_RE.match(line):
                 simulator_exit_seen = True
@@ -340,7 +345,9 @@ def classify_artifact(
             continue
         scanned_logs.add(path.resolve())
         for _, line in _iter_normalized_lines(path):
-            if TIMEOUT_SIGNAL_RE.match(line):
+            if TIMEOUT_SIGNAL_RE.match(line) and not TIMEOUT_POLICY_RE.fullmatch(
+                line
+            ):
                 timeout_seen = True
             if SIMULATOR_EXIT_SIGNAL_RE.match(line) or SIMULATOR_FATAL_RE.match(line):
                 simulator_exit_seen = True

@@ -118,6 +118,11 @@ grep -Fq 'error "--gem5-bin must resolve to ${CANONICAL_GEM5_BIN}"' \
 grep -Fq 'C_GEM5_BIN="/gem5/build/VEGA_X86/gem5.opt"' "$LAUNCHER" || \
     fail "launcher container binary is not canonical"
 # shellcheck disable=SC2016
+grep -Fq 'cosim_recorded_runner_category "$ARTIFACT_DIR"' "$LAUNCHER" || \
+    fail "launcher signal cleanup does not preserve the validated runner category"
+grep -Fq "trap 'handle_signal' INT TERM" "$LAUNCHER" || \
+    fail "launcher signals bypass the runner-category handshake"
+# shellcheck disable=SC2016
 grep -Fq 'error "--screen-log must equal ${CANONICAL_SCREEN_LOG}"' \
     "$HOST_RUNNER" || fail "runner does not fix the console log to artifact/qemu.log"
 

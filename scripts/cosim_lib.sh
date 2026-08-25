@@ -91,6 +91,30 @@ is_infra_failure() {
     esac
 }
 
+cosim_recorded_runner_category() {
+    local artifact_dir="$1"
+    local category_file="${artifact_dir}/runner-category.txt"
+    local -a lines=()
+
+    [[ -f "$category_file" && ! -L "$category_file" ]] || return 1
+    mapfile -t lines < "$category_file"
+    [[ "${#lines[@]}" -eq 1 && -n "${lines[0]}" ]] || return 1
+    case "${lines[0]}" in
+        "$COSIM_CAT_TEST_PASS"|"$COSIM_CAT_TEST_FAIL"|\
+        "$COSIM_CAT_TEST_TIMEOUT"|"$COSIM_CAT_BOOT_TIMEOUT"|\
+        "$COSIM_CAT_GEM5_INIT_TIMEOUT"|"$COSIM_CAT_GEM5_EXIT"|\
+        "$COSIM_CAT_QEMU_EXIT"|"$COSIM_CAT_READINESS_FAIL"|\
+        "$COSIM_CAT_STALE_CONFLICT"|"$COSIM_CAT_INTERRUPT"|\
+        "$COSIM_CAT_CLEANUP_FAIL"|"$COSIM_CAT_LAUNCHER_EXIT"|\
+        "$COSIM_CAT_INFRA_UNKNOWN")
+            printf '%s\n' "${lines[0]}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # ---- Resource Manifest ----
 
 COSIM_MANIFEST_FILE=""

@@ -331,8 +331,21 @@ cleanup() {
 
     info "Run: $COSIM_RUN_ID | Category: $COSIM_FAILURE_CATEGORY${COSIM_SECONDARY_STATUS:+ | Secondary: $COSIM_SECONDARY_STATUS}"
 }
+
+# shellcheck disable=SC2317
+handle_signal() {
+    local runner_category=""
+
+    if runner_category="$(cosim_recorded_runner_category "$ARTIFACT_DIR")"; then
+        COSIM_FAILURE_CATEGORY="$runner_category"
+    else
+        COSIM_FAILURE_CATEGORY="$COSIM_CAT_INTERRUPT"
+    fi
+    exit 130
+}
+
 trap 'cleanup' EXIT
-trap 'COSIM_FAILURE_CATEGORY="$COSIM_CAT_INTERRUPT"; exit 130' INT TERM
+trap 'handle_signal' INT TERM
 
 # ---- Preflight audit ----
 

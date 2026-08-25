@@ -26,6 +26,23 @@ bash -n "$BUILD_SCRIPT"
 
 assert_contains 'QEMU_VERSION="10.1.5"' "$BUILD_SCRIPT"
 assert_contains 'QEMU_SOURCE_SHA256 is empty' "$BUILD_SCRIPT"
+assert_contains 'QEMU_SOURCE_FINGERPRINT is empty' "$BUILD_SCRIPT"
+assert_contains 'prepare_qemu_source true false true' "$BUILD_SCRIPT"
+# shellcheck disable=SC2016
+assert_contains 'QEMU_SOURCE_FINGERPRINT=${verified_fingerprint}' "$BUILD_SCRIPT"
+assert_contains 'this action did not modify the tracked lock' "$BUILD_SCRIPT"
+# shellcheck disable=SC2016
+assert_contains 'require_qemu_source_fingerprint "$extracted_source_fingerprint"' \
+    "$BUILD_SCRIPT"
+# shellcheck disable=SC2016
+assert_contains 'require_qemu_source_fingerprint "$provenance_initial_fingerprint"' \
+    "$BUILD_SCRIPT"
+# shellcheck disable=SC2016
+assert_contains 'require_qemu_source_fingerprint "$source_tree_fingerprint"' \
+    "$BUILD_SCRIPT"
+# shellcheck disable=SC2016
+assert_contains 'require_qemu_source_fingerprint "$post_build_source_fingerprint"' \
+    "$BUILD_SCRIPT"
 assert_contains '"--disable-download"' "$BUILD_SCRIPT"
 assert_contains '"--enable-tools"' "$BUILD_SCRIPT"
 assert_contains 'VALIDSIG' "$BUILD_SCRIPT"
@@ -69,6 +86,7 @@ assert_contains 'QEMU_SOURCE_URL=https://download.qemu.org/qemu-10.1.5.tar.xz' "
 assert_contains 'QEMU_SIGNATURE_URL=https://download.qemu.org/qemu-10.1.5.tar.xz.sig' "$TOOLCHAIN_LOCK"
 assert_contains 'QEMU_RELEASE_KEY_FINGERPRINT=CEACC9E15534EBABB82D3FA03353C9CEF108B584' "$TOOLCHAIN_LOCK"
 assert_contains 'QEMU_SOURCE_SHA256=1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693' "$TOOLCHAIN_LOCK"
+assert_contains 'QEMU_SOURCE_FINGERPRINT=9e2d43798bdfe7baaa7e8413ddbc35fdf409c8b435a47e5f5d435af4fd25d4b1' "$TOOLCHAIN_LOCK"
 grep -Eq '^FROM ghcr\.io/gem5/gpu-fs@sha256:[0-9a-f]{64}$' "$DOCKERFILE_RUN" || \
     fail "Dockerfile.run must pin the gem5 GPU base image by digest"
 if grep -Eq '^FROM .*:latest([[:space:]]|$)' "$DOCKERFILE_RUN"; then
@@ -89,6 +107,7 @@ grep -F 'QEMU status: not ready' "${TEST_TMP}/status-output" >/dev/null || \
 # Functions and globals from the build wrapper are the contract under test.
 # shellcheck disable=SC1090,SC1091
 source "$BUILD_SCRIPT"
+ORIGINAL_LOCAL_ROOT="$LOCAL_ROOT"
 EMPTY_LOCK="${TEST_TMP}/empty-toolchain.lock"
 sed 's/^QEMU_SOURCE_SHA256=.*/QEMU_SOURCE_SHA256=/' "$TOOLCHAIN_LOCK" > "$EMPTY_LOCK"
 ORIGINAL_LOCK="$TOOLCHAIN_LOCK"
@@ -99,6 +118,111 @@ fi
 grep -F 'QEMU_SOURCE_SHA256 is empty' "${TEST_TMP}/stderr" >/dev/null || \
     fail "empty archive SHA failure was not explicit"
 TOOLCHAIN_LOCK="$ORIGINAL_LOCK"
+
+EMPTY_FINGERPRINT_LOCK="${TEST_TMP}/empty-fingerprint-toolchain.lock"
+sed 's/^QEMU_SOURCE_FINGERPRINT=.*/QEMU_SOURCE_FINGERPRINT=/' \
+    "$TOOLCHAIN_LOCK" > "$EMPTY_FINGERPRINT_LOCK"
+TOOLCHAIN_LOCK="$EMPTY_FINGERPRINT_LOCK"
+if (validate_qemu_lock) >"${TEST_TMP}/stdout" 2>"${TEST_TMP}/stderr"; then
+    fail "lock validation unexpectedly accepted an empty source fingerprint"
+fi
+grep -F 'QEMU_SOURCE_FINGERPRINT is empty' "${TEST_TMP}/stderr" >/dev/null || \
+    fail "empty source fingerprint failure was not explicit"
+TOOLCHAIN_LOCK="$ORIGINAL_LOCK"
+validate_qemu_lock
+# shellcheck disable=SC2153
+require_qemu_source_fingerprint "$QEMU_SOURCE_FINGERPRINT" \
+    "contract matching QEMU source fingerprint"
+if (require_qemu_source_fingerprint "$(printf 'f%.0s' {1..64})" \
+        "contract mismatched QEMU source fingerprint") \
+        >"${TEST_TMP}/stdout" 2>"${TEST_TMP}/stderr"; then
+    fail "QEMU source fingerprint guard accepted a mismatched digest"
+fi
+grep -F 'does not match QEMU_SOURCE_FINGERPRINT' "${TEST_TMP}/stderr" >/dev/null || \
+    fail "QEMU source fingerprint mismatch failure was not explicit"
+
+# 双空 lock bootstrap 必须复用签名验证、只在临时目录解包，并同时输出两个摘要。
+BOOTSTRAP_LOCAL="${TEST_TMP}/qemu-bootstrap-local"
+BOOTSTRAP_INPUT="${TEST_TMP}/qemu-bootstrap-input"
+BOOTSTRAP_FAKE_BIN="${TEST_TMP}/qemu-bootstrap-bin"
+BOOTSTRAP_LOCK="${TEST_TMP}/qemu-bootstrap.lock"
+BOOTSTRAP_GPG_LOG="${TEST_TMP}/qemu-bootstrap-gpg.log"
+BOOTSTRAP_CURL_LOG="${TEST_TMP}/qemu-bootstrap-curl.log"
+mkdir -p "${BOOTSTRAP_LOCAL}/downloads" \
+    "${BOOTSTRAP_LOCAL}/keys/qemu-release" \
+    "${BOOTSTRAP_INPUT}/qemu-${QEMU_VERSION}" "$BOOTSTRAP_FAKE_BIN"
+printf '#!/bin/sh\nexit 0\n' > \
+    "${BOOTSTRAP_INPUT}/qemu-${QEMU_VERSION}/configure"
+chmod +x "${BOOTSTRAP_INPUT}/qemu-${QEMU_VERSION}/configure"
+printf 'signature-verified fixture\n' > \
+    "${BOOTSTRAP_INPUT}/qemu-${QEMU_VERSION}/README"
+BOOTSTRAP_TARBALL="${BOOTSTRAP_LOCAL}/downloads/qemu-${QEMU_VERSION}.tar.xz"
+tar -C "$BOOTSTRAP_INPUT" -cf "$BOOTSTRAP_TARBALL" \
+    "qemu-${QEMU_VERSION}"
+printf 'detached signature fixture\n' > "${BOOTSTRAP_TARBALL}.sig"
+printf 'release key fixture\n' > \
+    "${BOOTSTRAP_LOCAL}/keys/qemu-release/release-key.asc"
+cat > "${BOOTSTRAP_FAKE_BIN}/gpg" <<'SH'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_GPG_LOG:?}"
+case " $* " in
+    *' --import-options show-only '*)
+        printf '%s\n' \
+            'pub:-:2048:1:3353C9CEF108B584:0:0:::::::' \
+            'fpr:::::::::CEACC9E15534EBABB82D3FA03353C9CEF108B584:'
+        ;;
+    *' --status-fd 1 '*)
+        printf '%s\n' \
+            '[GNUPG:] VALIDSIG CEACC9E15534EBABB82D3FA03353C9CEF108B584'
+        ;;
+esac
+SH
+cat > "${BOOTSTRAP_FAKE_BIN}/curl" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "${FAKE_CURL_LOG:?}"
+exit 97
+SH
+chmod +x "${BOOTSTRAP_FAKE_BIN}/gpg" "${BOOTSTRAP_FAKE_BIN}/curl"
+sed -e 's/^QEMU_SOURCE_SHA256=.*/QEMU_SOURCE_SHA256=/' \
+    -e 's/^QEMU_SOURCE_FINGERPRINT=.*/QEMU_SOURCE_FINGERPRINT=/' \
+    "$ORIGINAL_LOCK" > "$BOOTSTRAP_LOCK"
+BOOTSTRAP_LOCK_SHA_BEFORE="$(sha256sum "$BOOTSTRAP_LOCK" | awk '{print $1}')"
+BOOTSTRAP_EXPECTED_ARCHIVE_SHA="$(sha256sum "$BOOTSTRAP_TARBALL" | awk '{print $1}')"
+BOOTSTRAP_EXPECTED_SOURCE_FINGERPRINT="$(directory_fingerprint \
+    "${BOOTSTRAP_INPUT}/qemu-${QEMU_VERSION}")"
+TOOLCHAIN_LOCK="$BOOTSTRAP_LOCK"
+LOCAL_ROOT="$BOOTSTRAP_LOCAL"
+if ! BOOTSTRAP_OUTPUT="$(PATH="${BOOTSTRAP_FAKE_BIN}:${PATH}" \
+        FAKE_GPG_LOG="$BOOTSTRAP_GPG_LOG" \
+        FAKE_CURL_LOG="$BOOTSTRAP_CURL_LOG" lock_qemu_source)"; then
+    fail "double-empty QEMU lock bootstrap failed"
+fi
+grep -Fx "QEMU_SOURCE_SHA256=${BOOTSTRAP_EXPECTED_ARCHIVE_SHA}" \
+    <<< "$BOOTSTRAP_OUTPUT" >/dev/null || \
+    fail "QEMU bootstrap did not output the verified archive SHA-256"
+grep -Fx "QEMU_SOURCE_FINGERPRINT=${BOOTSTRAP_EXPECTED_SOURCE_FINGERPRINT}" \
+    <<< "$BOOTSTRAP_OUTPUT" >/dev/null || \
+    fail "QEMU bootstrap did not output the extracted source-tree fingerprint"
+grep -F -- '--import-options show-only' "$BOOTSTRAP_GPG_LOG" >/dev/null || \
+    fail "QEMU bootstrap skipped release-key identity inspection"
+grep -F -- '--status-fd 1' "$BOOTSTRAP_GPG_LOG" >/dev/null || \
+    fail "QEMU bootstrap skipped detached-signature verification"
+[[ ! -e "$BOOTSTRAP_CURL_LOG" ]] || \
+    fail "offline QEMU bootstrap unexpectedly attempted a download"
+[[ "$(sha256sum "$BOOTSTRAP_LOCK" | awk '{print $1}')" == \
+   "$BOOTSTRAP_LOCK_SHA_BEFORE" ]] || \
+    fail "QEMU bootstrap silently modified the lock"
+[[ ! -e "${BOOTSTRAP_LOCAL}/src/qemu-${QEMU_VERSION}" && \
+   ! -e "${BOOTSTRAP_LOCAL}/src/qemu-${QEMU_VERSION}.source-meta" ]] || \
+    fail "QEMU bootstrap installed source or provenance instead of using a temporary tree"
+if find "${BOOTSTRAP_LOCAL}/src" -maxdepth 1 \
+        -name '.qemu-bootstrap.*' -print -quit | grep -q .; then
+    fail "QEMU bootstrap left a temporary extraction tree"
+fi
+TOOLCHAIN_LOCK="$ORIGINAL_LOCK"
+LOCAL_ROOT="$ORIGINAL_LOCAL_ROOT"
+validate_qemu_lock
 
 QEMU_BUILD_DIR="${TEST_TMP}/qemu-build"
 QEMU_META="${QEMU_BUILD_DIR}/.cosim-build-meta"
@@ -356,10 +480,14 @@ ARCHIVE_SHA="$(printf 'archive' | sha256sum | awk '{print $1}')"
 SOURCE_SHA="$(printf 'source' | sha256sum | awk '{print $1}')"
 CONFIGURE_SHA="$(printf 'configure' | sha256sum | awk '{print $1}')"
 BUILD_SHA="$(printf 'build' | sha256sum | awk '{print $1}')"
+# shellcheck disable=SC2034
+QEMU_SOURCE_FINGERPRINT="$SOURCE_SHA"
 write_metadata "$QEMU_META" \
     'version=10.1.5' \
     "source_sha256=${ARCHIVE_SHA}" \
+    "initial_source_fingerprint=${SOURCE_SHA}" \
     "source_fingerprint=${SOURCE_SHA}" \
+    'source_pristine=true' \
     "configure_fingerprint=${CONFIGURE_SHA}" \
     "build_fingerprint=${BUILD_SHA}" \
     'signing_verified=true' \
@@ -367,6 +495,13 @@ write_metadata "$QEMU_META" \
     "qemu_img_sha256=$(sha256sum "$QEMU_IMG" | awk '{print $1}')"
 verify_qemu_metadata "$ARCHIVE_SHA" "$SOURCE_SHA" "$CONFIGURE_SHA" "$BUILD_SHA" || \
     fail "matching QEMU features and metadata were rejected"
+sed -i "s/^initial_source_fingerprint=.*/initial_source_fingerprint=$(printf 'e%.0s' {1..64})/" \
+    "$QEMU_META"
+if verify_qemu_metadata "$ARCHIVE_SHA" "$SOURCE_SHA" "$CONFIGURE_SHA" "$BUILD_SHA"; then
+    fail "metadata reuse accepted an initial source fingerprint outside the lock"
+fi
+sed -i "s/^initial_source_fingerprint=.*/initial_source_fingerprint=${SOURCE_SHA}/" \
+    "$QEMU_META"
 printf '%s\n' '# binary tamper' >> "$QEMU_BIN"
 if verify_qemu_metadata "$ARCHIVE_SHA" "$SOURCE_SHA" "$CONFIGURE_SHA" "$BUILD_SHA"; then
     fail "a changed QEMU binary hash was accepted as an incremental-build hit"

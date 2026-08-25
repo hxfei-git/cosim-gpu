@@ -42,6 +42,10 @@ assert_contains 'PACKER_PLUGIN_PATH=' "$BUILD_SCRIPT"
 assert_contains 'validate_guest_image' "$BUILD_SCRIPT"
 assert_contains 'validate_guest_kernel' "$BUILD_SCRIPT"
 assert_contains 'guest_metadata_matches' "$BUILD_SCRIPT"
+assert_contains "GUEST_SEAL=\"\${GUEST_BUILD_ROOT}/.cosim-content-seal\"" "$BUILD_SCRIPT"
+assert_contains "guest_metadata_reseal \"\$recipe_fingerprint\"" "$BUILD_SCRIPT"
+assert_contains "guest_provenance seal --known-image-sha256 \"\$image_sha\"" "$BUILD_SCRIPT"
+assert_contains "cp \"\$GUEST_SEAL\" \"\${artifact_dir}/content-seal.txt\"" "$BUILD_SCRIPT"
 assert_contains 'installer-serial.log' "$BUILD_SCRIPT"
 # Contract checks require literal HCL/shell interpolation.
 # shellcheck disable=SC2016
@@ -87,6 +91,18 @@ assert_contains 'GUEST_KERNEL_MODULES_EXTRA_DEB_SHA256=95802c55ad41be81e6511ff04
 assert_contains 'GUEST_KERNEL_HEADERS_DEB_SHA256=80c1e08da84f88c8ca080a4fa513a879556b3e65d634bf760c32e6a1e092186d' "$GUEST_LOCK"
 assert_contains 'GUEST_KERNEL_HEADERS_GENERIC_DEB_SHA256=54cb0dfd1564d57ef13728ca9efe7dedef65e54a3538f8c06f12c356d8801da2' "$GUEST_LOCK"
 assert_contains 'prepare_guest_kernel_debs' "$BUILD_SCRIPT"
+
+build_guest_body="$(sed -n '/^build_guest() {/,/^}/p' "$BUILD_SCRIPT")"
+reseal_line="$(grep -n -F "guest_metadata_reseal \"\$recipe_fingerprint\"" \
+    <<< "$build_guest_body" | cut -d: -f1)"
+packer_line="$(grep -n -F 'prepare_packer_toolchain' \
+    <<< "$build_guest_body" | cut -d: -f1)"
+[[ -n "$reseal_line" && -n "$packer_line" && "$reseal_line" -lt "$packer_line" ]] || \
+    fail "legacy Guest reseal does not precede all Packer preparation"
+if sed -n '/^guest_metadata_matches() {/,/^}/p' "$BUILD_SCRIPT" | \
+    grep -F "sha256sum \"\$GUEST_IMAGE\"" >/dev/null; then
+    fail "normal Guest metadata validation still fully hashes the base image"
+fi
 
 TEST_CONTEXT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_CONTEXT"' EXIT

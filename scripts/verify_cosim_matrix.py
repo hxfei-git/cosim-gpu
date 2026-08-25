@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import hashlib
 import json
 import os
@@ -19,26 +20,133 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Counter as CounterType
+from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+
+try:
+    from scripts.cosim_log_evidence import (
+        REQUIRED_STRICT_DEBUG_FLAGS,
+        analyze_gem5_log,
+        analyze_qemu_log,
+        parse_rfc3339nano,
+        render_guest_run_script,
+    )
+except ModuleNotFoundError:  # 允许直接执行 scripts/verify_cosim_matrix.py。
+    from cosim_log_evidence import (  # type: ignore[no-redef]
+        REQUIRED_STRICT_DEBUG_FLAGS,
+        analyze_gem5_log,
+        analyze_qemu_log,
+        parse_rfc3339nano,
+        render_guest_run_script,
+    )
+
+try:
+    from scripts.guest_provenance import (
+        LOCK_KEYS as GUEST_LOCK_KEYS,
+        META_KEYS as GUEST_META_KEYS,
+        SEAL_KEYS as GUEST_SEAL_KEYS,
+        recipe_fingerprint as guest_recipe_fingerprint,
+    )
+except ModuleNotFoundError:  # 允许直接执行 scripts/verify_cosim_matrix.py。
+    from guest_provenance import (  # type: ignore[no-redef]
+        LOCK_KEYS as GUEST_LOCK_KEYS,
+        META_KEYS as GUEST_META_KEYS,
+        SEAL_KEYS as GUEST_SEAL_KEYS,
+        recipe_fingerprint as guest_recipe_fingerprint,
+    )
 
 
 SCHEMA = "cosim-matrix-verification/v2"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+EXPECTED_ROWS_SCHEMA = "cosim-strict-expected-rows/v1"
+EXPECTED_ROWS_RELATIVE = Path("configs/cosim/strict-acceptance-rows.json")
+QEMU_TOOLCHAIN_LOCK_KEYS = {
+    "QEMU_VERSION",
+    "QEMU_SOURCE_URL",
+    "QEMU_SIGNATURE_URL",
+    "QEMU_RELEASE_KEY_FINGERPRINT",
+    "QEMU_RELEASE_KEY_URL",
+    "QEMU_SOURCE_SHA256",
+    "QEMU_SOURCE_FINGERPRINT",
+}
+QEMU_BUILD_META_KEYS = {
+    "version",
+    "source_url",
+    "source_sha256",
+    "signature_url",
+    "signing_key",
+    "signing_verified",
+    "initial_source_fingerprint",
+    "source_fingerprint",
+    "source_pristine",
+    "configure_fingerprint",
+    "build_fingerprint",
+    "configure_args",
+    "binary",
+    "binary_sha256",
+    "qemu_img",
+    "qemu_img_sha256",
+    "compiler",
+    "timestamp",
+}
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
-HSA_RE = re.compile(r"^\[COSIM_ENV\] HSA_ENABLE_INTERRUPT=([01])$")
-TEST_TIMEOUT_RE = re.compile(r"^\[COSIM_TIMEOUT\] TEST_TIMEOUT_SECS=([1-9][0-9]*)$")
 PREFIX_HSA_RE = re.compile(r"(?:^|\s)HSA_ENABLE_INTERRUPT=([01])(?:\s|$)")
 PROGRAM_RE = re.compile(r"^[a-z0-9_]+$")
 MEMORY_SIZE_RE = re.compile(r"^[1-9][0-9]*(?:[KMGTPE]i?B?)?$")
 DEBUG_FLAGS_RE = re.compile(r"^[A-Za-z0-9_,]+$")
-COMPILE_TOKEN_SCRIPT_RE = re.compile(
-    r'^echo "__(COSIM_COMPILE_DONE_[A-Za-z0-9_]+)__:\$\{build_rc\}"$'
-)
-TEST_TOKEN_SCRIPT_RE = re.compile(
-    r'^echo "__(COSIM_TEST_DONE_[A-Za-z0-9_]+)__:\$\{rc\}"$'
-)
+RUN_PREFLIGHT_CHECK_IDS = {
+    "command.docker",
+    "command.rsync",
+    "command.screen",
+    "command.setsid",
+    "command.socat",
+    "command.stdbuf",
+    "command.timeout",
+    "host.arch",
+    "host.cpus",
+    "host.dev_shm",
+    "host.disk",
+    "host.distribution",
+    "host.docker_arch",
+    "host.docker_daemon",
+    "host.kvm_access",
+    "host.kvm_node",
+    "host.linux",
+    "host.memory",
+    "host.proxy",
+    "host.tmp",
+    "host.virtualization",
+    "run.disk_image",
+    "run.docker_image",
+    "run.gem5_binary",
+    "run.gem5_config",
+    "run.gem5_provenance",
+    "run.guest_provenance",
+    "run.guest_setup",
+    "run.kernel",
+    "run.m5",
+    "run.qemu_binary",
+    "run.qemu_img",
+    "run.qemu_kvm",
+    "run.qemu_provenance",
+    "run.qemu_q35",
+    "run.qemu_version",
+    "run.qemu_vfio_user",
+    "run.stale_resources",
+    "run.strict_acceptance",
+    "run.test_sources",
+    "source.gem5",
+    "source.gem5-resources",
+}
+RUN_PREFLIGHT_REQUIRED_IDS = RUN_PREFLIGHT_CHECK_IDS - {
+    "host.distribution",
+    "host.proxy",
+    "host.virtualization",
+    "run.stale_resources",
+}
 
 MANIFEST_COLUMNS = {
     "row_id",
@@ -116,6 +224,9 @@ LOCAL_MATRIX_COLUMNS = {
 }
 
 Error = Dict[str, str]
+HashCacheKey = Tuple[Path, int, int, int, int, int]
+HashCache = MutableMapping[HashCacheKey, str]
+DerivedCache = MutableMapping[Tuple[str, Path], str]
 
 
 def _add_error(errors: List[Error], code: str, detail: str) -> None:
@@ -145,9 +256,15 @@ def _load_tsv(path: Path, required: set[str]) -> List[Dict[str, str]]:
         fields = reader.fieldnames or []
         if len(fields) != len(set(fields)):
             raise ValueError(f"duplicate TSV column: {path}")
-        missing = sorted(required - set(fields))
-        if missing:
-            raise ValueError(f"TSV lacks columns {','.join(missing)}: {path}")
+        actual = set(fields)
+        missing = sorted(required - actual)
+        unknown = sorted(actual - required)
+        if missing or unknown:
+            raise ValueError(
+                "TSV schema mismatch "
+                f"missing={','.join(missing) or '-'} "
+                f"unknown={','.join(unknown) or '-'}: {path}"
+            )
         rows: List[Dict[str, str]] = []
         for line_number, row in enumerate(reader, 2):
             if None in row:
@@ -194,10 +311,27 @@ def _read_key_values(path: Path, errors: List[Error], role: str) -> Dict[str, st
     return values
 
 
+def _reject_duplicate_json_keys(
+    pairs: Sequence[Tuple[str, object]],
+) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(raw: str) -> object:
+    return json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+
+
 def _load_json(path: Path, errors: List[Error], role: str) -> Mapping[str, object]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8", errors="strict"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        payload = _strict_json_loads(
+            path.read_text(encoding="utf-8", errors="strict")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         _add_error(errors, "json_read_error", f"{role}:{error}")
         return {}
     if not isinstance(payload, dict):
@@ -208,10 +342,98 @@ def _load_json(path: Path, errors: List[Error], role: str) -> Mapping[str, objec
 
 def _load_json_value(path: Path, errors: List[Error], role: str) -> object:
     try:
-        return json.loads(path.read_text(encoding="utf-8", errors="strict"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return _strict_json_loads(
+            path.read_text(encoding="utf-8", errors="strict")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         _add_error(errors, "json_read_error", f"{role}:{error}")
         return None
+
+
+def _load_expected_rows(
+    path: Path, repo_root: Path, errors: List[Error]
+) -> Tuple[CounterType[Tuple[str, str]], Dict[str, object]]:
+    """加载受 HEAD 锚定的独立 strict 行规范。"""
+
+    lexical = Path(os.path.abspath(path))
+    info: Dict[str, object] = {"path": str(lexical), "sha256": None}
+    if lexical.is_symlink():
+        _add_error(errors, "expected_rows_symlink", str(lexical))
+        return Counter(), info
+    try:
+        relative = lexical.relative_to(repo_root)
+    except ValueError:
+        _add_error(errors, "expected_rows_outside_repository", str(lexical))
+        return Counter(), info
+    try:
+        raw = lexical.read_bytes()
+    except OSError as error:
+        _add_error(errors, "expected_rows_error", str(error))
+        return Counter(), info
+    info["sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        tracked = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(repo_root),
+                "show",
+                f"HEAD:{relative.as_posix()}",
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        _add_error(errors, "expected_rows_git_error", str(error))
+        return Counter(), info
+    if tracked.returncode != 0:
+        detail = tracked.stderr.decode("utf-8", errors="replace").strip()
+        _add_error(errors, "expected_rows_not_tracked", detail or str(relative))
+    elif tracked.stdout != raw:
+        _add_error(errors, "expected_rows_differs_from_head", str(relative))
+
+    try:
+        payload = _strict_json_loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        _add_error(errors, "expected_rows_error", str(error))
+        return Counter(), info
+    if not isinstance(payload, Mapping) or set(payload) != {"schema", "rows"}:
+        keys = sorted(payload) if isinstance(payload, Mapping) else []
+        _add_error(errors, "invalid_expected_rows_schema", f"keys={keys!r}")
+        return Counter(), info
+    if payload.get("schema") != EXPECTED_ROWS_SCHEMA:
+        _add_error(
+            errors,
+            "invalid_expected_rows_schema",
+            str(payload.get("schema")),
+        )
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        _add_error(errors, "empty_expected_rows", str(relative))
+        return Counter(), info
+    expected: CounterType[Tuple[str, str]] = Counter()
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != {
+            "program",
+            "expected_hsa_interrupt",
+        }:
+            _add_error(errors, "invalid_expected_row", f"index={index}")
+            continue
+        program = row.get("program")
+        hsa = row.get("expected_hsa_interrupt")
+        if not isinstance(program, str) or not PROGRAM_RE.fullmatch(program):
+            _add_error(errors, "invalid_expected_row", f"index={index}:program")
+            continue
+        if hsa not in {"0", "1"}:
+            _add_error(errors, "invalid_expected_row", f"index={index}:hsa={hsa}")
+            continue
+        expected[(program, hsa)] += 1
+    duplicates = sorted(key for key, count in expected.items() if count != 1)
+    if duplicates:
+        _add_error(errors, "duplicate_expected_row", repr(duplicates))
+    info["row_count"] = sum(expected.values())
+    return expected, info
 
 
 def _command_output(
@@ -235,10 +457,19 @@ def _command_output(
     return completed.stdout.rstrip("\n")
 
 
-def _hash_file(path: Path, cache: MutableMapping[Path, str]) -> str:
+def _hash_file(path: Path, cache: HashCache) -> str:
     canonical = path.resolve()
-    if canonical in cache:
-        return cache[canonical]
+    before = canonical.stat()
+    key: HashCacheKey = (
+        canonical,
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if key in cache:
+        return cache[key]
     digest = hashlib.sha256()
     with canonical.open("rb") as handle:
         while True:
@@ -246,12 +477,23 @@ def _hash_file(path: Path, cache: MutableMapping[Path, str]) -> str:
             if not chunk:
                 break
             digest.update(chunk)
+    after = canonical.stat()
+    after_identity = (
+        canonical,
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if after_identity != key:
+        raise OSError(f"file changed while hashing: {canonical}")
     value = digest.hexdigest()
-    cache[canonical] = value
+    cache[key] = value
     return value
 
 
-def _staging_fingerprint(root: Path, cache: MutableMapping[Path, str]) -> str:
+def _staging_fingerprint(root: Path, cache: HashCache) -> str:
     files = sorted(
         (
             path
@@ -268,6 +510,70 @@ def _staging_fingerprint(root: Path, cache: MutableMapping[Path, str]) -> str:
         relative = path.relative_to(root).as_posix()
         digest.update(f"{_hash_file(path, cache)}  ./{relative}\n".encode())
     return digest.hexdigest()
+
+
+def _array_fingerprint(values: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(value.encode("utf-8", errors="strict"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _directory_fingerprint(root: Path, cache: DerivedCache) -> str:
+    """按 cosim_build.sh 的 directory_fingerprint 合同重建目录摘要。"""
+
+    canonical = root.resolve(strict=True)
+    cache_key = ("qemu-directory-v1", canonical)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    files: List[Tuple[bytes, Path, str]] = []
+    symlinks: List[Tuple[bytes, Path, str]] = []
+    for directory, names, filenames in os.walk(canonical, followlinks=False):
+        directory_path = Path(directory)
+        names.sort(key=lambda value: os.fsencode(value))
+        filenames.sort(key=lambda value: os.fsencode(value))
+        for name in [*names, *filenames]:
+            path = directory_path / name
+            relative = "./" + path.relative_to(canonical).as_posix()
+            info = path.lstat()
+            mode = format(info.st_mode & 0o7777, "o")
+            encoded = os.fsencode(relative)
+            if path.is_symlink():
+                target = os.readlink(path)
+                entry = (
+                    b"symlink\t"
+                    + mode.encode()
+                    + b"\t"
+                    + encoded
+                    + b"\t"
+                    + os.fsencode(target)
+                    + b"\0"
+                )
+                symlinks.append((encoded, path, entry))
+            elif path.is_file():
+                entry = (
+                    b"file\t" + mode.encode() + b"\t" + encoded + b"\0"
+                )
+                files.append((encoded, path, entry))
+    digest = hashlib.sha256()
+    for _, _, entry in sorted(files, key=lambda item: item[2]):
+        digest.update(entry)
+    for _, _, entry in sorted(symlinks, key=lambda item: item[2]):
+        digest.update(entry)
+    for encoded, path, _ in sorted(files, key=lambda item: item[0]):
+        file_digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                file_digest.update(chunk)
+        digest.update(file_digest.hexdigest().encode())
+        digest.update(b"  ")
+        digest.update(encoded)
+        digest.update(b"\n")
+    value = digest.hexdigest()
+    cache[cache_key] = value
+    return value
 
 
 def _require_file(
@@ -303,6 +609,17 @@ def _expect_value(
             errors,
             "value_mismatch",
             f"{field}:expected={expected!s}:actual={actual!s}",
+        )
+
+
+def _expect_typed_value(
+    errors: List[Error], field: str, expected: object, actual: object
+) -> None:
+    if type(actual) is not type(expected) or actual != expected:
+        _add_error(
+            errors,
+            "value_mismatch",
+            f"{field}:expected={expected!r}:actual={actual!r}",
         )
 
 
@@ -452,6 +769,17 @@ def _effective_gem5_invocation(
             "invalid_gem5_config_value",
             f"--gem5-debug={values['--gem5-debug']}",
         )
+    debug_flags = values["--gem5-debug"].split(",") \
+        if values["--gem5-debug"] else []
+    missing_debug_flags = [
+        flag for flag in REQUIRED_STRICT_DEBUG_FLAGS if flag not in debug_flags
+    ]
+    if missing_debug_flags:
+        _add_error(
+            errors,
+            "missing_strict_gem5_debug_flags",
+            ",".join(missing_debug_flags),
+        )
     config = (
         f"defaults:num-gpus={values['--num-gpus']},"
         f"num-cus={values['--num-cus']},"
@@ -484,7 +812,7 @@ def _verify_file_hash(
     field: str,
     path: Path,
     expected: object,
-    cache: MutableMapping[Path, str],
+    cache: HashCache,
 ) -> None:
     expected_hash = _validate_sha(errors, field, expected)
     if expected_hash is None or not path.is_file():
@@ -639,7 +967,7 @@ def _verify_repo_provenance(
     artifact_dir: Path,
     snapshot: Mapping[str, str],
     repo_root: Path,
-    cache: MutableMapping[Path, str],
+    cache: HashCache,
 ) -> None:
     required = (
         "head_commit",
@@ -953,11 +1281,1009 @@ def _verify_verdict_evidence_paths(
         )
 
 
+def _path_stat(path: Path) -> Dict[str, object]:
+    info = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": info.st_size,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
+
+
+def _head_blob_sha256(
+    errors: List[Error], repo_root: Path, relative: str
+) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(repo_root), "show", f"HEAD:{relative}"),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        _add_error(errors, "command_failed", f"head_blob:{relative}:{error}")
+        return None
+    if completed.returncode != 0:
+        detail = completed.stderr.decode(errors="replace").strip()
+        _add_error(errors, "command_failed", f"head_blob:{relative}:{detail}")
+        return None
+    return hashlib.sha256(completed.stdout).hexdigest()
+
+
+def _expect_exact_keys(
+    errors: List[Error], role: str, value: object, expected: set[str]
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        _add_error(errors, "invalid_guest_provenance", f"{role}:not-object")
+        return {}
+    if set(value) != expected:
+        _add_error(
+            errors,
+            "invalid_guest_provenance",
+            f"{role}:expected={sorted(expected)!r}:actual={sorted(value)!r}",
+        )
+    return value
+
+
+def _verify_qemu_provenance(
+    errors: List[Error],
+    paths: Mapping[str, Path],
+    launch_invocation: Mapping[str, str],
+    repo_root: Path,
+    cache: HashCache,
+    derived_cache: DerivedCache,
+) -> Optional[int]:
+    """独立连接 QEMU tracked lock、构建 metadata、源码树和二进制。"""
+
+    archived_meta = _read_key_values(
+        paths["qemu_build_meta"], errors, "qemu_build_meta"
+    )
+    archived_lock = _read_key_values(
+        paths["toolchain_lock"], errors, "qemu_toolchain_lock"
+    )
+    if set(archived_meta) != QEMU_BUILD_META_KEYS:
+        _add_error(
+            errors,
+            "invalid_qemu_build_metadata",
+            f"keys={sorted(archived_meta)!r}",
+        )
+    if set(archived_lock) != QEMU_TOOLCHAIN_LOCK_KEYS:
+        _add_error(
+            errors,
+            "invalid_qemu_toolchain_lock",
+            f"keys={sorted(archived_lock)!r}",
+        )
+
+    canonical_meta = (
+        repo_root / ".local/cosim/build/qemu-10.1.5/.cosim-build-meta"
+    )
+    canonical_lock = repo_root / "configs/cosim/toolchain.lock"
+    canonical_source = repo_root / ".local/cosim/src/qemu-10.1.5"
+    canonical_prefix = repo_root / ".local/cosim/qemu/10.1.5"
+    canonical_binary = canonical_prefix / "bin/qemu-system-x86_64"
+    canonical_qemu_img = canonical_prefix / "bin/qemu-img"
+    for role, path in (
+        ("current_qemu_build_meta", canonical_meta),
+        ("current_qemu_toolchain_lock", canonical_lock),
+        ("current_qemu_binary", canonical_binary),
+        ("current_qemu_img", canonical_qemu_img),
+    ):
+        _require_file(path, errors, role)
+    if not canonical_source.is_dir() or canonical_source.is_symlink():
+        _add_error(errors, "invalid_qemu_source_tree", str(canonical_source))
+
+    try:
+        archived_meta_sha = _hash_file(paths["qemu_build_meta"], cache)
+        archived_lock_sha = _hash_file(paths["toolchain_lock"], cache)
+        if canonical_meta.is_file():
+            _expect_value(
+                errors,
+                "qemu_build_meta.archive_live_sha256",
+                archived_meta_sha,
+                _hash_file(canonical_meta, cache),
+            )
+        if canonical_lock.is_file():
+            _expect_value(
+                errors,
+                "qemu_toolchain_lock.archive_live_sha256",
+                archived_lock_sha,
+                _hash_file(canonical_lock, cache),
+            )
+        head_lock_sha = _head_blob_sha256(
+            errors, repo_root, "configs/cosim/toolchain.lock"
+        )
+        if head_lock_sha is not None:
+            _expect_value(
+                errors,
+                "qemu_toolchain_lock.archive_head_sha256",
+                head_lock_sha,
+                archived_lock_sha,
+            )
+    except OSError as error:
+        _add_error(errors, "qemu_provenance_read_error", str(error))
+
+    if canonical_meta.is_file():
+        live_meta = _read_key_values(
+            canonical_meta, errors, "current_qemu_build_meta"
+        )
+        if live_meta != archived_meta:
+            _add_error(errors, "qemu_build_metadata_mismatch", "archive/live")
+    if canonical_lock.is_file():
+        live_lock = _read_key_values(
+            canonical_lock, errors, "current_qemu_toolchain_lock"
+        )
+        if live_lock != archived_lock:
+            _add_error(errors, "qemu_toolchain_lock_mismatch", "archive/live")
+
+    version = archived_lock.get("QEMU_VERSION", "")
+    fingerprint = archived_lock.get("QEMU_RELEASE_KEY_FINGERPRINT", "")
+    expected_source_url = f"https://download.qemu.org/qemu-{version}.tar.xz"
+    for role, expected, actual in (
+        ("qemu_lock.version", "10.1.5", version),
+        (
+            "qemu_lock.source_url",
+            expected_source_url,
+            archived_lock.get("QEMU_SOURCE_URL", ""),
+        ),
+        (
+            "qemu_lock.signature_url",
+            f"{expected_source_url}.sig",
+            archived_lock.get("QEMU_SIGNATURE_URL", ""),
+        ),
+        (
+            "qemu_lock.release_key_url",
+            f"https://keys.openpgp.org/vks/v1/by-fingerprint/{fingerprint}",
+            archived_lock.get("QEMU_RELEASE_KEY_URL", ""),
+        ),
+        ("qemu_meta.version", version, archived_meta.get("version", "")),
+        (
+            "qemu_meta.source_url",
+            archived_lock.get("QEMU_SOURCE_URL", ""),
+            archived_meta.get("source_url", ""),
+        ),
+        (
+            "qemu_meta.signature_url",
+            archived_lock.get("QEMU_SIGNATURE_URL", ""),
+            archived_meta.get("signature_url", ""),
+        ),
+        (
+            "qemu_meta.signing_key",
+            fingerprint,
+            archived_meta.get("signing_key", ""),
+        ),
+        (
+            "qemu_meta.source_sha256",
+            archived_lock.get("QEMU_SOURCE_SHA256", ""),
+            archived_meta.get("source_sha256", ""),
+        ),
+        (
+            "qemu_meta.signing_verified",
+            "true",
+            archived_meta.get("signing_verified", ""),
+        ),
+        (
+            "qemu_meta.source_pristine",
+            "true",
+            archived_meta.get("source_pristine", ""),
+        ),
+    ):
+        _expect_value(errors, role, expected, actual)
+    if re.fullmatch(r"[0-9A-F]{40}", fingerprint) is None:
+        _add_error(errors, "invalid_qemu_toolchain_lock", "release-key fingerprint")
+    for field in (
+        "QEMU_SOURCE_SHA256",
+        "QEMU_SOURCE_FINGERPRINT",
+        "initial_source_fingerprint",
+        "source_fingerprint",
+        "configure_fingerprint",
+        "build_fingerprint",
+        "binary_sha256",
+        "qemu_img_sha256",
+    ):
+        value = (
+            archived_lock.get(field, "")
+            if field in {"QEMU_SOURCE_SHA256", "QEMU_SOURCE_FINGERPRINT"}
+            else archived_meta.get(field, "")
+        )
+        _validate_sha(errors, f"qemu_provenance.{field}", value)
+
+    expected_configure_args = [
+        f"--prefix={canonical_prefix.resolve()}",
+        "--target-list=x86_64-softmmu",
+        "--disable-download",
+        "--disable-docs",
+        "--disable-gtk",
+        "--disable-sdl",
+        "--disable-werror",
+        "--enable-kvm",
+        "--enable-slirp",
+        "--enable-tools",
+        "--enable-virtfs",
+    ]
+    try:
+        configure_args = shlex.split(
+            archived_meta.get("configure_args", ""), posix=True
+        )
+    except ValueError as error:
+        _add_error(errors, "invalid_qemu_build_metadata", f"configure_args:{error}")
+        configure_args = []
+    _expect_value(
+        errors,
+        "qemu_meta.configure_args",
+        repr(expected_configure_args),
+        repr(configure_args),
+    )
+    expected_configure_fingerprint = _array_fingerprint(expected_configure_args)
+    _expect_value(
+        errors,
+        "qemu_meta.configure_fingerprint",
+        expected_configure_fingerprint,
+        archived_meta.get("configure_fingerprint", ""),
+    )
+    if canonical_source.is_dir() and not canonical_source.is_symlink():
+        try:
+            source_fingerprint = _directory_fingerprint(
+                canonical_source, derived_cache
+            )
+            locked_source_fingerprint = archived_lock.get(
+                "QEMU_SOURCE_FINGERPRINT", ""
+            )
+            _expect_value(
+                errors,
+                "qemu_lock.source_fingerprint",
+                locked_source_fingerprint,
+                source_fingerprint,
+            )
+            _expect_value(
+                errors,
+                "qemu_meta.initial_source_fingerprint",
+                locked_source_fingerprint,
+                archived_meta.get("initial_source_fingerprint", ""),
+            )
+            _expect_value(
+                errors,
+                "qemu_meta.source_fingerprint",
+                locked_source_fingerprint,
+                archived_meta.get("source_fingerprint", ""),
+            )
+            expected_build_fingerprint = _array_fingerprint(
+                (
+                    archived_lock.get("QEMU_SOURCE_SHA256", ""),
+                    locked_source_fingerprint,
+                    expected_configure_fingerprint,
+                )
+            )
+            _expect_value(
+                errors,
+                "qemu_meta.build_fingerprint",
+                expected_build_fingerprint,
+                archived_meta.get("build_fingerprint", ""),
+            )
+        except (OSError, UnicodeError) as error:
+            _add_error(errors, "qemu_source_fingerprint_error", str(error))
+
+    for role, recorded, path in (
+        ("qemu_meta.binary_sha256", archived_meta.get("binary_sha256"), canonical_binary),
+        (
+            "qemu_meta.qemu_img_sha256",
+            archived_meta.get("qemu_img_sha256"),
+            canonical_qemu_img,
+        ),
+    ):
+        if path.is_file():
+            _verify_file_hash(errors, role, path, recorded, cache)
+    for role, recorded, expected in (
+        ("qemu_meta.binary", archived_meta.get("binary"), canonical_binary),
+        ("qemu_meta.qemu_img", archived_meta.get("qemu_img"), canonical_qemu_img),
+        (
+            "launch_invocation.qemu_binary",
+            launch_invocation.get("qemu_binary"),
+            canonical_binary,
+        ),
+        (
+            "launch_invocation.qemu_img",
+            launch_invocation.get("qemu_img"),
+            canonical_qemu_img,
+        ),
+    ):
+        _expect_path(errors, role, recorded, expected, repo_root)
+    if not archived_meta.get("compiler", ""):
+        _add_error(errors, "invalid_qemu_build_metadata", "missing compiler")
+    qemu_timestamp_ns = parse_rfc3339nano(archived_meta.get("timestamp", ""))
+    if qemu_timestamp_ns is None:
+        _add_error(
+            errors,
+            "invalid_qemu_build_metadata",
+            f"timestamp={archived_meta.get('timestamp', '')!r}",
+        )
+    return qemu_timestamp_ns
+
+
+def _verify_guest_provenance(
+    errors: List[Error],
+    paths: Mapping[str, Path],
+    report: Mapping[str, object],
+    pre_stat: Mapping[str, object],
+    post_stat: Mapping[str, object],
+    base_stat: Mapping[str, str],
+    launch_invocation: Mapping[str, str],
+    snapshot: Mapping[str, str],
+    runner_metadata: Mapping[str, str],
+    preflight: Mapping[str, object],
+    qemu_build_timestamp_ns: Optional[int],
+    repo_root: Path,
+    run_id: str,
+    cache: HashCache,
+) -> None:
+    """按本机 TCB 重建 Guest 证据；不抵抗有工作区写权限者协调伪造全部证据。"""
+
+    report_keys = {
+        "schema",
+        "run_id",
+        "validated_at",
+        "guest_build_meta",
+        "guest_content_seal",
+        "source",
+        "toolchain",
+        "image",
+        "kernel",
+        "m5",
+    }
+    report = _expect_exact_keys(errors, "report", report, report_keys)
+    _expect_value(
+        errors,
+        "guest_provenance.schema",
+        "cosim-guest-provenance/v2",
+        report.get("schema", ""),
+    )
+    _expect_value(
+        errors, "guest_provenance.run_id", run_id, report.get("run_id", "")
+    )
+    validated_at = report.get("validated_at")
+    validated_ns: Optional[int] = None
+    if not isinstance(validated_at, str) or not validated_at:
+        _add_error(errors, "invalid_guest_provenance", "missing validated_at")
+    else:
+        validated_ns = parse_rfc3339nano(validated_at)
+        if validated_ns is None:
+            _add_error(errors, "invalid_guest_provenance", "invalid validated_at")
+
+    report_meta = _expect_exact_keys(
+        errors,
+        "report.guest_build_meta",
+        report.get("guest_build_meta"),
+        {"path", "sha256"},
+    )
+    report_seal = _expect_exact_keys(
+        errors,
+        "report.guest_content_seal",
+        report.get("guest_content_seal"),
+        {"path", "sha256"},
+    )
+    report_source = _expect_exact_keys(
+        errors,
+        "report.source",
+        report.get("source"),
+        {
+            "build_top_commit",
+            "validated_top_head",
+            "build_script_sha256",
+            "provenance_validator_sha256",
+            "resources_gitlink",
+            "resources_head",
+            "template_tree",
+            "guest_lock_sha256",
+            "overlay_patch_sha256",
+            "recipe_fingerprint",
+        },
+    )
+    report_toolchain = _expect_exact_keys(
+        errors,
+        "report.toolchain",
+        report.get("toolchain"),
+        {"qemu_binary_sha256", "qemu_img_sha256"},
+    )
+    stat_keys = {"path", "size", "device", "inode", "mtime_ns", "ctime_ns"}
+    hashed_stat_keys = stat_keys | {"sha256", "validation_method"}
+    report_image = _expect_exact_keys(
+        errors, "report.image", report.get("image"), hashed_stat_keys
+    )
+    report_kernel = _expect_exact_keys(
+        errors, "report.kernel", report.get("kernel"), hashed_stat_keys
+    )
+    report_m5 = _expect_exact_keys(
+        errors, "report.m5", report.get("m5"), hashed_stat_keys
+    )
+
+    guest_meta = _read_key_values(paths["guest_build_meta"], errors, "guest_meta")
+    guest_seal = _read_key_values(
+        paths["guest_content_seal"], errors, "guest_content_seal"
+    )
+    guest_lock = _read_key_values(paths["guest_lock"], errors, "guest_lock")
+    if set(guest_meta) != set(GUEST_META_KEYS):
+        _add_error(
+            errors,
+            "invalid_guest_metadata",
+            f"keys={sorted(guest_meta)!r}",
+        )
+    if set(guest_seal) != set(GUEST_SEAL_KEYS):
+        _add_error(
+            errors,
+            "invalid_guest_content_seal",
+            f"keys={sorted(guest_seal)!r}",
+        )
+    if set(guest_lock) != set(GUEST_LOCK_KEYS):
+        _add_error(errors, "invalid_guest_lock", f"keys={sorted(guest_lock)!r}")
+
+    canonical_meta = repo_root / ".local/cosim/build/guest/.cosim-build-meta"
+    canonical_seal = repo_root / ".local/cosim/build/guest/.cosim-content-seal"
+    canonical_lock = repo_root / "configs/cosim/guest.lock"
+    canonical_patch = repo_root / "scripts/patches/0002-guest-core-reproducible.patch"
+    canonical_image = (
+        repo_root
+        / "gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
+    )
+    canonical_kernel = (
+        repo_root / "gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
+    )
+    canonical_m5 = repo_root / "gem5-resources/src/x86-ubuntu-gpu-ml/files/m5"
+    canonical_qemu = (
+        repo_root / ".local/cosim/qemu/10.1.5/bin/qemu-system-x86_64"
+    )
+    canonical_qemu_img = repo_root / ".local/cosim/qemu/10.1.5/bin/qemu-img"
+    canonical_build_script = repo_root / "scripts/cosim_build.sh"
+    canonical_validator = repo_root / "scripts/guest_provenance.py"
+    for role, path in (
+        ("current_guest_meta", canonical_meta),
+        ("current_guest_seal", canonical_seal),
+        ("current_guest_lock", canonical_lock),
+        ("current_guest_patch", canonical_patch),
+        ("current_guest_image", canonical_image),
+        ("current_guest_kernel", canonical_kernel),
+        ("current_guest_m5", canonical_m5),
+        ("current_qemu", canonical_qemu),
+        ("current_qemu_img", canonical_qemu_img),
+        ("current_guest_build_script", canonical_build_script),
+        ("current_guest_provenance_validator", canonical_validator),
+    ):
+        _require_file(path, errors, role)
+
+    archived_hashes = {
+        "metadata": _hash_file(paths["guest_build_meta"], cache),
+        "seal": _hash_file(paths["guest_content_seal"], cache),
+        "lock": _hash_file(paths["guest_lock"], cache),
+        "patch": _hash_file(paths["guest_overlay_patch"], cache),
+    }
+    for field, expected, actual in (
+        ("guest_build_meta.sha256", report_meta.get("sha256"), archived_hashes["metadata"]),
+        ("guest_content_seal.sha256", report_seal.get("sha256"), archived_hashes["seal"]),
+        (
+            "source.guest_lock_sha256",
+            report_source.get("guest_lock_sha256"),
+            archived_hashes["lock"],
+        ),
+        (
+            "source.overlay_patch_sha256",
+            report_source.get("overlay_patch_sha256"),
+            archived_hashes["patch"],
+        ),
+    ):
+        _validate_sha(errors, field, expected)
+        _expect_value(errors, field, expected, actual)
+    for role, current, archived in (
+        ("guest_build_meta", canonical_meta, archived_hashes["metadata"]),
+        ("guest_content_seal", canonical_seal, archived_hashes["seal"]),
+        ("guest_lock", canonical_lock, archived_hashes["lock"]),
+        ("guest_overlay_patch", canonical_patch, archived_hashes["patch"]),
+    ):
+        if current.is_file():
+            _expect_value(errors, f"current.{role}.sha256", archived, _hash_file(current, cache))
+
+    preflight_report_hash = _hash_file(paths["preflight_guest_provenance"], cache)
+    root_report_hash = _hash_file(paths["guest_provenance"], cache)
+    _expect_value(
+        errors,
+        "preflight_guest_provenance.sha256",
+        root_report_hash,
+        preflight_report_hash,
+    )
+
+    head_lock_sha = _head_blob_sha256(errors, repo_root, "configs/cosim/guest.lock")
+    head_patch_sha = _head_blob_sha256(
+        errors, repo_root, "scripts/patches/0002-guest-core-reproducible.patch"
+    )
+    if head_lock_sha is not None:
+        _expect_value(errors, "head.guest_lock.sha256", head_lock_sha, archived_hashes["lock"])
+    if head_patch_sha is not None:
+        _expect_value(errors, "head.guest_patch.sha256", head_patch_sha, archived_hashes["patch"])
+
+    current_head = _command_output(
+        errors, "guest_top_head", ("git", "-C", str(repo_root), "rev-parse", "HEAD")
+    )
+    head_build_script_sha = _head_blob_sha256(
+        errors, repo_root, "scripts/cosim_build.sh"
+    )
+    head_validator_sha = _head_blob_sha256(
+        errors, repo_root, "scripts/guest_provenance.py"
+    )
+    resources_root = repo_root / "gem5-resources"
+    resources_head = _command_output(
+        errors,
+        "guest_resources_head",
+        ("git", "-C", str(resources_root), "rev-parse", "HEAD"),
+    )
+    gitlink_line = _command_output(
+        errors,
+        "guest_resources_gitlink",
+        ("git", "-C", str(repo_root), "ls-tree", "HEAD", "--", "gem5-resources"),
+    )
+    gitlink_parts = (gitlink_line or "").split()
+    resources_gitlink = ""
+    if len(gitlink_parts) < 3 or gitlink_parts[0] != "160000":
+        _add_error(errors, "invalid_guest_resources_gitlink", str(gitlink_line or ""))
+    else:
+        resources_gitlink = gitlink_parts[2]
+    template_tree = ""
+    if resources_gitlink:
+        template_tree = _command_output(
+            errors,
+            "guest_template_tree",
+            (
+                "git",
+                "-C",
+                str(resources_root),
+                "rev-parse",
+                f"{resources_gitlink}:src/x86-ubuntu-gpu-ml",
+            ),
+        ) or ""
+    for field, expected, actual in (
+        ("source.build_top_commit", current_head, report_source.get("build_top_commit")),
+        ("source.validated_top_head", current_head, report_source.get("validated_top_head")),
+        ("source.snapshot_head", current_head, snapshot.get("head_commit")),
+        ("metadata.build_top_commit", current_head, guest_meta.get("build_top_commit")),
+        ("source.resources_gitlink", resources_gitlink, report_source.get("resources_gitlink")),
+        ("source.resources_head", resources_head, report_source.get("resources_head")),
+        ("source.resources_head_gitlink", resources_gitlink, resources_head),
+        ("metadata.resources_commit", resources_gitlink, guest_meta.get("resources_commit")),
+        ("metadata.template_tree", template_tree, guest_meta.get("template_tree")),
+        ("source.template_tree", template_tree, report_source.get("template_tree")),
+    ):
+        _expect_value(errors, field, expected or "", actual or "")
+    for field, expected, actual in (
+        (
+            "source.build_script_sha256",
+            head_build_script_sha,
+            report_source.get("build_script_sha256"),
+        ),
+        (
+            "source.provenance_validator_sha256",
+            head_validator_sha,
+            report_source.get("provenance_validator_sha256"),
+        ),
+        (
+            "metadata.build_script_sha256",
+            head_build_script_sha,
+            guest_meta.get("build_script_sha256"),
+        ),
+        (
+            "metadata.provenance_validator_sha256",
+            head_validator_sha,
+            guest_meta.get("provenance_validator_sha256"),
+        ),
+    ):
+        if expected is not None:
+            _expect_value(errors, field, expected, actual or "")
+    for field, path, expected in (
+        ("current.build_script_sha256", canonical_build_script, head_build_script_sha),
+        (
+            "current.provenance_validator_sha256",
+            canonical_validator,
+            head_validator_sha,
+        ),
+    ):
+        if path.is_file() and expected is not None:
+            _expect_value(errors, field, expected, _hash_file(path, cache))
+
+    for field, expected in (
+        ("guest_meta.path", canonical_meta),
+        ("guest_seal.path", canonical_seal),
+        ("metadata.image", canonical_image),
+        ("metadata.kernel", canonical_kernel),
+        ("report.image.path", canonical_image),
+        ("report.kernel.path", canonical_kernel),
+        ("report.m5.path", canonical_m5),
+    ):
+        raw = {
+            "guest_meta.path": report_meta.get("path"),
+            "guest_seal.path": report_seal.get("path"),
+            "metadata.image": guest_meta.get("image"),
+            "metadata.kernel": guest_meta.get("kernel"),
+            "report.image.path": report_image.get("path"),
+            "report.kernel.path": report_kernel.get("path"),
+            "report.m5.path": report_m5.get("path"),
+        }[field]
+        _expect_path(errors, field, raw, expected, repo_root)
+
+    current_stats: Dict[str, Mapping[str, object]] = {}
+    for role, path in (
+        ("image", canonical_image),
+        ("kernel", canonical_kernel),
+        ("m5", canonical_m5),
+    ):
+        if path.is_file():
+            current_stats[role] = _path_stat(path)
+    for role, recorded in (
+        ("image", report_image),
+        ("kernel", report_kernel),
+        ("m5", report_m5),
+    ):
+        current = current_stats.get(role, {})
+        for key in stat_keys:
+            _expect_typed_value(
+                errors,
+                f"report.{role}.{key}",
+                current.get(key, ""),
+                recorded.get(key, ""),
+            )
+
+    _expect_value(
+        errors,
+        "report.image.validation_method",
+        "sealed-stat",
+        report_image.get("validation_method", ""),
+    )
+    _expect_value(
+        errors,
+        "report.kernel.validation_method",
+        "full-sha256",
+        report_kernel.get("validation_method", ""),
+    )
+    _expect_value(
+        errors,
+        "report.m5.validation_method",
+        "full-sha256",
+        report_m5.get("validation_method", ""),
+    )
+    for role, path, recorded in (
+        ("image", canonical_image, guest_meta.get("image_sha256")),
+        ("kernel", canonical_kernel, guest_meta.get("kernel_sha256")),
+        ("m5", canonical_m5, guest_meta.get("m5_sha256")),
+        ("qemu", canonical_qemu, guest_meta.get("qemu_binary_sha256")),
+        ("qemu_img", canonical_qemu_img, guest_meta.get("qemu_img_sha256")),
+    ):
+        _verify_file_hash(errors, f"guest_metadata.{role}_sha256", path, recorded, cache)
+    if canonical_image.is_file():
+        image_stat_after_hash = _path_stat(canonical_image)
+        if image_stat_after_hash != current_stats.get("image"):
+            _add_error(
+                errors,
+                "guest_image_changed_during_hash",
+                f"before={current_stats.get('image')!r}:after={image_stat_after_hash!r}",
+            )
+    for role, recorded, metadata_key in (
+        ("image", report_image, "image_sha256"),
+        ("kernel", report_kernel, "kernel_sha256"),
+        ("m5", report_m5, "m5_sha256"),
+    ):
+        _expect_value(
+            errors,
+            f"report.{role}.sha256",
+            guest_meta.get(metadata_key, ""),
+            recorded.get("sha256", ""),
+        )
+    _expect_value(
+        errors,
+        "report.toolchain.qemu_binary_sha256",
+        guest_meta.get("qemu_binary_sha256", ""),
+        report_toolchain.get("qemu_binary_sha256", ""),
+    )
+    _expect_value(
+        errors,
+        "report.toolchain.qemu_img_sha256",
+        guest_meta.get("qemu_img_sha256", ""),
+        report_toolchain.get("qemu_img_sha256", ""),
+    )
+
+    if current_stats.get("image"):
+        _expect_value(
+            errors,
+            "metadata.image_size",
+            current_stats["image"]["size"],
+            guest_meta.get("image_size", ""),
+        )
+    if current_stats.get("kernel"):
+        _expect_value(
+            errors,
+            "metadata.kernel_size",
+            current_stats["kernel"]["size"],
+            guest_meta.get("kernel_size", ""),
+        )
+    for key in (
+        "overlay_patch_sha256",
+        "guest_lock_sha256",
+        "recipe_fingerprint",
+        "build_script_sha256",
+        "provenance_validator_sha256",
+        "packer_sha256",
+        "packer_qemu_plugin_sha256",
+        "ubuntu_iso_sha256",
+        "qemu_binary_sha256",
+        "qemu_img_sha256",
+        "m5_sha256",
+        "image_sha256",
+        "kernel_sha256",
+    ):
+        _validate_sha(errors, f"guest_metadata.{key}", guest_meta.get(key))
+    _expect_value(
+        errors,
+        "guest_metadata.guest_lock_sha256",
+        archived_hashes["lock"],
+        guest_meta.get("guest_lock_sha256", ""),
+    )
+    _expect_value(
+        errors,
+        "guest_metadata.overlay_patch_sha256",
+        archived_hashes["patch"],
+        guest_meta.get("overlay_patch_sha256", ""),
+    )
+    _expect_value(errors, "guest_metadata.component", "guest", guest_meta.get("component", ""))
+    _validate_commit(
+        errors, "guest_metadata.build_top_commit", guest_meta.get("build_top_commit")
+    )
+    _expect_value(errors, "guest_metadata.schema", "2", guest_meta.get("schema", ""))
+    metadata_timestamp = guest_meta.get("timestamp", "")
+    if parse_rfc3339nano(metadata_timestamp) is None:
+        _add_error(
+            errors,
+            "invalid_guest_metadata",
+            f"timestamp={metadata_timestamp!r}",
+        )
+    artifacts_raw = guest_meta.get("artifacts", "")
+    artifacts_path = Path(os.path.abspath(artifacts_raw)) \
+        if artifacts_raw else Path()
+    expected_artifacts_root = (
+        repo_root / "artifacts/amd-gpu-learning-env/build/guest"
+    ).resolve()
+    try:
+        artifacts_path.relative_to(expected_artifacts_root)
+    except ValueError:
+        _add_error(
+            errors,
+            "invalid_guest_metadata",
+            f"artifacts={artifacts_raw!r}",
+        )
+
+    for key, value in guest_lock.items():
+        if key.endswith("_URL") and not value.startswith("https://"):
+            _add_error(errors, "invalid_guest_lock", f"{key}:non-https")
+        if key.endswith("_SHA256"):
+            _validate_sha(errors, f"guest_lock.{key}", value)
+    _expect_value(errors, "guest_lock.version", "1", guest_lock.get("GUEST_LOCK_VERSION", ""))
+    if re.fullmatch(
+        r"[0-9A-F]{40}", guest_lock.get("ROCM_KEY_FINGERPRINT", "")
+    ) is None:
+        _add_error(errors, "invalid_guest_lock", "ROCM_KEY_FINGERPRINT")
+    lock_pairs = {
+        "packer_version": "PACKER_VERSION",
+        "packer_sha256": "PACKER_SHA256",
+        "packer_qemu_plugin_version": "PACKER_QEMU_PLUGIN_VERSION",
+        "packer_qemu_plugin_sha256": "PACKER_QEMU_PLUGIN_SHA256",
+        "ubuntu_iso_url": "UBUNTU_ISO_URL",
+        "ubuntu_iso_sha256": "UBUNTU_ISO_SHA256",
+        "amdgpu_dkms_version": "AMDGPU_DKMS_VERSION",
+        "rocm_version": "ROCM_VERSION",
+        "kernel_version": "GUEST_KERNEL",
+    }
+    for metadata_key, lock_key in lock_pairs.items():
+        _expect_value(
+            errors,
+            f"guest_metadata.{metadata_key}",
+            guest_lock.get(lock_key, ""),
+            guest_meta.get(metadata_key, ""),
+        )
+
+    expected_recipe = guest_recipe_fingerprint(
+        (
+            "guest-recipe-v2",
+            f"build_top_commit={current_head or ''}",
+            f"build_script={head_build_script_sha or ''}",
+            f"provenance_validator={head_validator_sha or ''}",
+            f"resources_commit={resources_gitlink}",
+            f"template_tree={template_tree}",
+            f"overlay_patch={archived_hashes['patch']}",
+            f"m5={guest_meta.get('m5_sha256', '')}",
+            f"qemu={guest_meta.get('qemu_binary_sha256', '')}",
+            f"qemu_img={guest_meta.get('qemu_img_sha256', '')}",
+            f"packer={guest_lock.get('PACKER_SHA256', '')}",
+            f"packer_plugin={guest_lock.get('PACKER_QEMU_PLUGIN_SHA256', '')}",
+            f"guest_lock={archived_hashes['lock']}",
+        )
+    )
+    _expect_value(
+        errors,
+        "guest_metadata.recipe_fingerprint",
+        expected_recipe,
+        guest_meta.get("recipe_fingerprint", ""),
+    )
+    _expect_value(
+        errors,
+        "report.source.recipe_fingerprint",
+        expected_recipe,
+        report_source.get("recipe_fingerprint", ""),
+    )
+
+    seal_expected = {
+        "component": "guest-content-seal",
+        "schema": "1",
+        "guest_build_meta_sha256": archived_hashes["metadata"],
+        "image": str(canonical_image.resolve()),
+        "image_sha256": guest_meta.get("image_sha256", ""),
+        "image_size": str(current_stats.get("image", {}).get("size", "")),
+        "image_device": str(current_stats.get("image", {}).get("device", "")),
+        "image_inode": str(current_stats.get("image", {}).get("inode", "")),
+        "image_mtime_ns": str(current_stats.get("image", {}).get("mtime_ns", "")),
+        "image_ctime_ns": str(current_stats.get("image", {}).get("ctime_ns", "")),
+    }
+    for key, expected in seal_expected.items():
+        _expect_value(errors, f"guest_content_seal.{key}", expected, guest_seal.get(key, ""))
+    sealed_at = guest_seal.get("sealed_at", "")
+    if parse_rfc3339nano(sealed_at) is None:
+        _add_error(
+            errors,
+            "invalid_guest_content_seal",
+            f"sealed_at={sealed_at!r}",
+        )
+
+    base_keys = {
+        "schema",
+        "path",
+        "image_sha256",
+        "validation_method",
+        "size",
+        "device",
+        "inode",
+        "mtime_ns",
+        "ctime_ns",
+        "guest_build_meta_sha256",
+        "guest_content_seal_sha256",
+    }
+    if set(base_stat) != base_keys:
+        _add_error(errors, "invalid_guest_base_stat", f"keys={sorted(base_stat)!r}")
+    base_expected = {
+        "schema": "cosim-guest-base-stat/v2",
+        "path": report_image.get("path", ""),
+        "image_sha256": report_image.get("sha256", ""),
+        "validation_method": report_image.get("validation_method", ""),
+        "size": str(report_image.get("size", "")),
+        "device": str(report_image.get("device", "")),
+        "inode": str(report_image.get("inode", "")),
+        "mtime_ns": str(report_image.get("mtime_ns", "")),
+        "ctime_ns": str(report_image.get("ctime_ns", "")),
+        "guest_build_meta_sha256": report_meta.get("sha256", ""),
+        "guest_content_seal_sha256": report_seal.get("sha256", ""),
+    }
+    for key, expected in base_expected.items():
+        _expect_value(errors, f"guest_base_stat.{key}", expected, base_stat.get(key, ""))
+
+    post_keys = {"schema", "run_id", "captured_at", "image", "matches_pre"}
+    captured_times: Dict[str, Optional[int]] = {}
+    for role, stat_report in (("pre", pre_stat), ("post", post_stat)):
+        stat_report = _expect_exact_keys(errors, f"guest_{role}_stat", stat_report, post_keys)
+        _expect_value(
+            errors,
+            f"guest_{role}_stat.schema",
+            "cosim-guest-post-stat/v1",
+            stat_report.get("schema", ""),
+        )
+        _expect_value(errors, f"guest_{role}_stat.run_id", run_id, stat_report.get("run_id", ""))
+        _expect_typed_value(
+            errors,
+            f"guest_{role}_stat.matches_pre",
+            True,
+            stat_report.get("matches_pre"),
+        )
+        captured_at = stat_report.get("captured_at")
+        captured_ns = (
+            parse_rfc3339nano(captured_at)
+            if isinstance(captured_at, str)
+            else None
+        )
+        captured_times[role] = captured_ns
+        if captured_ns is None:
+            _add_error(
+                errors,
+                "invalid_guest_provenance",
+                f"guest_{role}_stat.invalid_captured_at",
+            )
+        stat_image = _expect_exact_keys(
+            errors,
+            f"guest_{role}_stat.image",
+            stat_report.get("image"),
+            stat_keys,
+        )
+        for key in stat_keys:
+            _expect_typed_value(
+                errors,
+                f"guest_{role}_stat.image.{key}",
+                report_image.get(key, ""),
+                stat_image.get(key, ""),
+            )
+
+    guest_lifecycle = (
+        (
+            "guest_metadata.timestamp",
+            parse_rfc3339nano(metadata_timestamp),
+        ),
+        (
+            "guest_content_seal.sealed_at",
+            parse_rfc3339nano(sealed_at),
+        ),
+        (
+            "run_preflight.generated_at",
+            parse_rfc3339nano(str(preflight.get("generated_at", ""))),
+        ),
+        ("guest_provenance.validated_at", validated_ns),
+        ("guest_pre_stat.captured_at", captured_times.get("pre")),
+        (
+            "runner_metadata.guest_test_started_at",
+            parse_rfc3339nano(runner_metadata.get("guest_test_started_at", "")),
+        ),
+        (
+            "runner_metadata.guest_test_finished_at",
+            parse_rfc3339nano(runner_metadata.get("guest_test_finished_at", "")),
+        ),
+        ("guest_post_stat.captured_at", captured_times.get("post")),
+    )
+    qemu_lifecycle = (
+        ("qemu_build_metadata.timestamp", qemu_build_timestamp_ns),
+        (
+            "run_preflight.generated_at",
+            parse_rfc3339nano(str(preflight.get("generated_at", ""))),
+        ),
+    )
+    timestamp_values = dict((*guest_lifecycle, *qemu_lifecycle))
+    for role, value in timestamp_values.items():
+        if value is None:
+            _add_error(errors, "invalid_guest_lifecycle_timestamp", role)
+    for chain_name, lifecycle in (
+        ("guest", guest_lifecycle),
+        ("qemu", qemu_lifecycle),
+    ):
+        if all(value is not None for _, value in lifecycle):
+            numeric = [int(value) for _, value in lifecycle if value is not None]
+            if numeric == sorted(numeric):
+                continue
+            _add_error(
+                errors,
+                "invalid_guest_lifecycle_order",
+                f"{chain_name}:"
+                + ":".join(f"{role}={value}" for role, value in lifecycle),
+            )
+
+    _expect_path(
+        errors,
+        "launch_invocation.qemu_img",
+        launch_invocation.get("qemu_img"),
+        canonical_qemu_img,
+        repo_root,
+    )
+    _expect_value(
+        errors,
+        "launch_invocation.strict_acceptance",
+        "1",
+        launch_invocation.get("strict_acceptance", ""),
+    )
+
+
 def _validate_row(
     manifest: Mapping[str, str],
     top_rows: Sequence[Mapping[str, str]],
     repo_root: Path,
-    cache: MutableMapping[Path, str],
+    cache: HashCache,
+    derived_cache: DerivedCache,
 ) -> Dict[str, object]:
     row_id = manifest.get("row_id", "")
     program = manifest.get("program", "")
@@ -1152,11 +2478,23 @@ def _validate_row(
         "binary_provenance": artifact_dir / "patch" / "binary-provenance.txt",
         "gem5_build_meta": artifact_dir / "patch" / "gem5-build-meta.txt",
         "gem5_baseline_lock": artifact_dir / "patch" / "gem5-baseline.lock",
+        "qemu_build_meta": artifact_dir / "qemu-build-meta.txt",
+        "toolchain_lock": artifact_dir / "toolchain.lock",
         "docker_inspect": artifact_dir / "docker-inspect.json",
         "guest_overlay": artifact_dir / "guest-overlay.json",
         "guest_base_stat": artifact_dir / "guest-base-stat.txt",
+        "guest_base_stat_pre": artifact_dir / "guest-base-stat-pre.json",
+        "guest_base_stat_post": artifact_dir / "guest-base-stat-post.json",
+        "guest_provenance": artifact_dir / "guest-provenance.json",
+        "guest_build_meta": artifact_dir / "guest-build-meta.txt",
+        "guest_content_seal": artifact_dir / "guest-content-seal.txt",
+        "guest_lock": artifact_dir / "guest.lock",
+        "guest_overlay_patch": artifact_dir / "guest-overlay.patch",
         "preflight_json": artifact_dir / "preflight" / "preflight.json",
         "preflight_text": artifact_dir / "preflight" / "preflight.txt",
+        "preflight_guest_provenance": (
+            artifact_dir / "preflight" / "guest-provenance.json"
+        ),
         "preflight_resources": artifact_dir / "preflight-resources.log",
         "qemu_log": artifact_dir / "qemu.log",
         "gem5_log": artifact_dir / "gem5.log",
@@ -1209,8 +2547,26 @@ def _validate_row(
     guest_base_stat = _read_key_values(
         paths["guest_base_stat"], errors, "guest_base_stat"
     )
+    guest_provenance = _load_json(
+        paths["guest_provenance"], errors, "guest_provenance"
+    )
+    guest_base_stat_pre = _load_json(
+        paths["guest_base_stat_pre"], errors, "guest_base_stat_pre"
+    )
+    guest_base_stat_post = _load_json(
+        paths["guest_base_stat_post"], errors, "guest_base_stat_post"
+    )
     preflight = _load_json(paths["preflight_json"], errors, "run_preflight")
     cleanup = _read_key_values(paths["cleanup"], errors, "cleanup_status")
+
+    qemu_build_timestamp_ns = _verify_qemu_provenance(
+        errors,
+        paths,
+        launch_invocation,
+        repo_root,
+        cache,
+        derived_cache,
+    )
 
     expected_build_meta_keys = {
         "commit",
@@ -1235,8 +2591,12 @@ def _validate_row(
         "gem5_build_meta.docker_build_recipe_fingerprint",
         gem5_build_meta.get("docker_build_recipe_fingerprint"),
     )
-    if not gem5_build_meta.get("timestamp"):
-        _add_error(errors, "invalid_gem5_build_metadata", "missing timestamp")
+    if parse_rfc3339nano(gem5_build_meta.get("timestamp", "")) is None:
+        _add_error(
+            errors,
+            "invalid_gem5_build_metadata",
+            f"timestamp={gem5_build_meta.get('timestamp', '')!r}",
+        )
     if not re.fullmatch(
         r"sha256:[0-9a-f]{64}", gem5_build_meta.get("docker_image", "")
     ):
@@ -1307,7 +2667,73 @@ def _validate_row(
         "gem5-run:local",
         docker_config.get("Image", ""),
     )
+    _expect_value(
+        errors,
+        "docker_inspect.name",
+        f"/gem5-cosim-{metadata.get('run_id', '')}",
+        docker_container.get("Name", ""),
+    )
+    _expect_value(
+        errors,
+        "docker_inspect.path",
+        "/gem5/build/VEGA_X86/gem5.opt",
+        docker_container.get("Path", ""),
+    )
+    docker_args = docker_container.get("Args")
+    if not isinstance(docker_args, list) or not all(
+        isinstance(value, str) for value in docker_args
+    ):
+        _add_error(errors, "invalid_docker_inspect", "Args must be string list")
+        docker_args = []
+    docker_state = docker_container.get("State")
+    if not isinstance(docker_state, Mapping):
+        _add_error(errors, "invalid_docker_inspect", "missing State")
+        docker_state = {}
+    for field, expected in (
+        ("Status", "running"),
+        ("Running", True),
+        ("Paused", False),
+        ("Restarting", False),
+        ("OOMKilled", False),
+        ("Dead", False),
+        ("ExitCode", 0),
+    ):
+        _expect_typed_value(
+            errors,
+            f"docker_inspect.state.{field}",
+            expected,
+            docker_state.get(field, ""),
+        )
+    _expect_typed_value(
+        errors,
+        "docker_inspect.restart_count",
+        0,
+        docker_container.get("RestartCount", ""),
+    )
 
+    expected_preflight_keys = {
+        "schema",
+        "profile",
+        "generated_at",
+        "repo_root",
+        "overall_status",
+        "required_failure_count",
+        "checks",
+    }
+    if set(preflight) != expected_preflight_keys:
+        _add_error(
+            errors,
+            "invalid_run_preflight",
+            f"keys={sorted(preflight)!r}",
+        )
+    generated_at = preflight.get("generated_at")
+    if not isinstance(generated_at, str) or \
+            parse_rfc3339nano(generated_at) is None:
+        _add_error(
+            errors,
+            "invalid_run_preflight",
+            f"generated_at={generated_at!r}",
+        )
     _expect_value(
         errors,
         "run_preflight.schema",
@@ -1342,6 +2768,19 @@ def _validate_row(
         if not isinstance(check, Mapping):
             _add_error(errors, "invalid_run_preflight", "non-object check")
             continue
+        if set(check) != {"id", "status", "required", "summary", "detail"}:
+            _add_error(
+                errors,
+                "invalid_run_preflight",
+                f"check keys={sorted(check)!r}",
+            )
+        if type(check.get("required")) is not bool or \
+                check.get("status") not in {"PASS", "WARN", "FAIL"}:
+            _add_error(
+                errors,
+                "invalid_run_preflight",
+                f"check types:{check.get('id', '')}",
+            )
         check_id = str(check.get("id", ""))
         checks_by_id.setdefault(check_id, []).append(check)
         if check.get("required") is True and check.get("status") != "PASS":
@@ -1350,7 +2789,16 @@ def _validate_row(
                 "run_preflight_failed",
                 f"{check_id}:{check.get('status')}",
             )
-    for check_id in ("run.gem5_provenance", "run.qemu_provenance"):
+    actual_check_ids = set(checks_by_id)
+    if actual_check_ids != RUN_PREFLIGHT_CHECK_IDS:
+        _add_error(
+            errors,
+            "invalid_run_preflight",
+            "check_ids:missing="
+            f"{sorted(RUN_PREFLIGHT_CHECK_IDS - actual_check_ids)!r}:extra="
+            f"{sorted(actual_check_ids - RUN_PREFLIGHT_CHECK_IDS)!r}",
+        )
+    for check_id in sorted(RUN_PREFLIGHT_CHECK_IDS):
         matching_checks = checks_by_id.get(check_id, [])
         if len(matching_checks) != 1:
             _add_error(
@@ -1358,9 +2806,24 @@ def _validate_row(
                 "invalid_run_preflight",
                 f"{check_id} count={len(matching_checks)}",
             )
-        elif matching_checks[0].get("status") != "PASS" or \
-                matching_checks[0].get("required") is not True:
+            continue
+        expected_required = check_id in RUN_PREFLIGHT_REQUIRED_IDS
+        if matching_checks[0].get("required") is not expected_required:
+            _add_error(
+                errors,
+                "invalid_run_preflight",
+                f"{check_id}:required={matching_checks[0].get('required')!r}",
+            )
+        if expected_required and matching_checks[0].get("status") != "PASS":
             _add_error(errors, "run_preflight_failed", check_id)
+    strict_checks = checks_by_id.get("run.strict_acceptance", [])
+    if len(strict_checks) == 1:
+        _expect_value(
+            errors,
+            "run_preflight.strict_acceptance.detail",
+            "COSIM_STRICT_ACCEPTANCE=1",
+            strict_checks[0].get("detail", ""),
+        )
 
     _expect_value(errors, "top.row_id", row_id, top.get("row_id", ""))
     for field in ("program", "program_source", "source_sha256"):
@@ -1516,31 +2979,22 @@ def _validate_row(
             disk_size,
             guest_base_stat.get("size", ""),
         )
-    if set(guest_base_stat) != {"path", "size", "mtime"}:
-        _add_error(
-            errors,
-            "invalid_guest_base_stat",
-            f"keys={sorted(guest_base_stat)!r}",
-        )
-    _expect_path(
+    _verify_guest_provenance(
         errors,
-        "guest_base_stat.path",
-        guest_base_stat.get("path"),
-        canonical_disk,
+        paths,
+        guest_provenance,
+        guest_base_stat_pre,
+        guest_base_stat_post,
+        guest_base_stat,
+        launch_invocation,
+        snapshot,
+        metadata,
+        preflight,
+        qemu_build_timestamp_ns,
         repo_root,
+        local.get("session_id", ""),
+        cache,
     )
-    current_disk_mtime = _command_output(
-        errors,
-        "disk_image_mtime",
-        ("stat", "-c", "%y", str(canonical_disk)),
-    ) if disk_ready else None
-    if current_disk_mtime is not None:
-        _expect_value(
-            errors,
-            "guest_base_stat.mtime",
-            current_disk_mtime,
-            guest_base_stat.get("mtime", ""),
-        )
 
     runner_cwd = Path(invocation.get("cwd", ""))
     launch_cwd = Path(launch_invocation.get("cwd", ""))
@@ -1872,89 +3326,137 @@ def _validate_row(
         _add_error(errors, "invalid_verdict_check", "effective_environment")
     result["effective_hsa"] = verdict_hsa
 
-    qemu_hsa: List[str] = []
-    qemu_test_timeouts: List[str] = []
-    exact_pass_count = 0
-    fail_count = 0
-    try:
-        with paths["qemu_log"].open(
-            "r", encoding="utf-8", errors="replace"
-        ) as handle:
-            for raw_line in handle:
-                line = raw_line.rstrip("\r\n")
-                match = HSA_RE.fullmatch(line)
-                if match:
-                    qemu_hsa.append(match.group(1))
-                timeout_match = TEST_TIMEOUT_RE.fullmatch(line)
-                if timeout_match:
-                    qemu_test_timeouts.append(timeout_match.group(1))
-                if line == f"[PASS] {program}":
-                    exact_pass_count += 1
-                if line == "[FAIL]" or line.startswith("[FAIL] "):
-                    fail_count += 1
-    except OSError as error:
-        _add_error(errors, "file_read_error", f"qemu_log:{error}")
-    if set(qemu_hsa) != {expected_hsa}:
+    expected_test_timeout = manifest.get("test_timeout", "")
+    expected_run_id = local.get("session_id", "")
+    qemu_analysis = analyze_qemu_log(
+        paths["qemu_log"],
+        expected_run_id=expected_run_id,
+        expected_program=program,
+        expected_hsa=expected_hsa,
+        expected_test_timeout=expected_test_timeout,
+    )
+    result["qemu_guest_execution"] = qemu_analysis
+    exact_pass_count = _parse_int(qemu_analysis.get("pass_count")) or 0
+    fail_count = _parse_int(qemu_analysis.get("fail_count")) or 0
+    if qemu_analysis.get("read_error") is not None or \
+            qemu_analysis.get("stable_snapshot_ok") is not True:
+        _add_error(
+            errors,
+            "qemu_log_snapshot_invalid",
+            str(qemu_analysis.get("read_error")),
+        )
+    run_markers = qemu_analysis.get("run_markers")
+    if not isinstance(run_markers, list) or len(run_markers) != 1 or \
+            not isinstance(run_markers[0], Mapping) or \
+            run_markers[0].get("run_id") != expected_run_id:
+        _add_error(
+            errors,
+            "qemu_run_identity_mismatch",
+            repr(qemu_analysis.get("run_markers")),
+        )
+    if qemu_analysis.get("hsa_values") != [expected_hsa]:
         _add_error(
             errors,
             "hsa_mismatch",
-            f"qemu_log={sorted(set(qemu_hsa))!r}:expected={expected_hsa}",
+            f"qemu_log={qemu_analysis.get('hsa_values')!r}:expected={expected_hsa}",
         )
-    expected_test_timeout = manifest.get("test_timeout", "")
-    if set(qemu_test_timeouts) != {expected_test_timeout}:
+    if qemu_analysis.get("test_timeout_values") != [expected_test_timeout]:
         _add_error(
             errors,
             "timeout_mismatch",
             "qemu_log.test_timeout="
-            f"{sorted(set(qemu_test_timeouts))!r}:expected={expected_test_timeout}",
+            f"{qemu_analysis.get('test_timeout_values')!r}:"
+            f"expected={expected_test_timeout}",
         )
+    if _parse_int(qemu_analysis.get("fatal_count")) != 0:
+        _add_error(
+            errors,
+            "simulator_fatal",
+            f"qemu_log:{qemu_analysis.get('fatal_events')!r}",
+        )
+    if qemu_analysis.get("timeout_signal_lines"):
+        _add_error(
+            errors,
+            "timeout_observed",
+            f"qemu_log:{qemu_analysis.get('timeout_signal_lines')!r}",
+        )
+    if qemu_analysis.get("simulator_exit_lines"):
+        _add_error(
+            errors,
+            "simulator_fatal",
+            f"qemu_log:exit={qemu_analysis.get('simulator_exit_lines')!r}",
+        )
+    if qemu_analysis.get("sequence", {}).get("ok") is not True:
+        _add_error(
+            errors,
+            "invalid_qemu_sequence",
+            "order="
+            f"{qemu_analysis.get('order_errors')!r}:suspicious="
+            f"{qemu_analysis.get('suspicious_completion_lines')!r}",
+        )
+    guest_script_bytes: Optional[bytes]
     try:
-        guest_script = paths["guest_script"].read_text(
-            encoding="utf-8", errors="strict"
-        )
-    except (OSError, UnicodeError) as error:
+        guest_script_bytes = paths["guest_script"].read_bytes()
+    except OSError as error:
         _add_error(errors, "file_read_error", f"guest_script:{error}")
-        guest_script = ""
-    expected_guest_timeout_line = (
-        f"TEST_TIMEOUT_SECS={expected_test_timeout} ./run_tests.sh {program}"
+        guest_script_bytes = None
+    try:
+        expected_guest_script_bytes: Optional[bytes] = render_guest_run_script(
+            program=program,
+            run_id=expected_run_id,
+            hsa_enable_interrupt=expected_hsa,
+            test_timeout=expected_test_timeout,
+        ).encode("utf-8", errors="strict")
+    except (UnicodeError, ValueError) as error:
+        _add_error(errors, "guest_script_render_error", str(error))
+        expected_guest_script_bytes = None
+    if guest_script_bytes is not None and \
+            expected_guest_script_bytes is not None and \
+            guest_script_bytes != expected_guest_script_bytes:
+        _add_error(
+            errors,
+            "guest_script_mismatch",
+            "expected_sha256="
+            f"{hashlib.sha256(expected_guest_script_bytes).hexdigest()}:"
+            "actual_sha256="
+            f"{hashlib.sha256(guest_script_bytes).hexdigest()}:"
+            f"expected_size={len(expected_guest_script_bytes)}:"
+            f"actual_size={len(guest_script_bytes)}",
+        )
+    cleanup_join_ok = (
+        metadata.get("cleanup_status") == "verified"
+        and metadata.get("cleanup_exit_code") == "0"
+        and cleanup.get("result") == "PASS"
+        and cleanup.get("primary_category") == "test_pass"
+        and cleanup.get("secondary_category") == "none"
     )
-    if expected_guest_timeout_line not in guest_script.splitlines():
+    if qemu_analysis.get("expected_cleanup_events") and not cleanup_join_ok:
         _add_error(
             errors,
-            "timeout_mismatch",
-            f"guest_script:{expected_guest_timeout_line}",
+            "simulator_fatal",
+            "qemu_log:cleanup SIGTERM lacks verified cleanup join",
         )
-    compile_tokens = [
-        match.group(1)
-        for line in guest_script.splitlines()
-        if (match := COMPILE_TOKEN_SCRIPT_RE.fullmatch(line))
-    ]
-    test_tokens = [
-        match.group(1)
-        for line in guest_script.splitlines()
-        if (match := TEST_TOKEN_SCRIPT_RE.fullmatch(line))
-    ]
-    if len(compile_tokens) != 1 or len(test_tokens) != 1:
+    actual_qemu_log_sha = str(qemu_analysis.get("qemu_log_sha256", ""))
+    recorded_qemu_log_sha = _validate_sha(
+        errors,
+        "metadata.qemu_log_sha256",
+        metadata.get("qemu_log_sha256"),
+    )
+    if recorded_qemu_log_sha is not None and \
+            recorded_qemu_log_sha != actual_qemu_log_sha:
         _add_error(
             errors,
-            "invalid_guest_completion_token",
-            f"compile={compile_tokens!r}:test={test_tokens!r}",
+            "qemu_log_hash_mismatch",
+            f"expected={recorded_qemu_log_sha}:actual={actual_qemu_log_sha}",
         )
-    else:
-        try:
-            normalized_qemu_log = paths["qemu_log"].read_text(
-                encoding="utf-8", errors="replace"
-            ).replace("\r", "")
-        except OSError:
-            normalized_qemu_log = ""
-        for role, token in (("compile", compile_tokens[0]), ("test", test_tokens[0])):
-            marker = f"__{token}__:0"
-            if normalized_qemu_log.splitlines().count(marker) != 1:
-                _add_error(
-                    errors,
-                    "invalid_guest_completion_token",
-                    f"{role}:{marker}",
-                )
+    _expect_value(
+        errors,
+        "verdict.provenance.qemu_log_sha256",
+        actual_qemu_log_sha,
+        _nested(verdict, "provenance", "qemu_log_sha256"),
+    )
+    if _nested(verdict, "checks", "qemu_completion", "ok") is not True:
+        _add_error(errors, "invalid_verdict_check", "qemu_completion")
 
     outcome = verdict.get("outcome", "")
     exit_code = verdict.get("exit_code", "")
@@ -2020,6 +3522,101 @@ def _validate_row(
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_value) or \
                 ".." in run_value:
             _add_error(errors, "unsafe_run_id", f"{role}:{run_value}")
+
+    gem5_analysis = analyze_gem5_log(
+        paths["gem5_log"],
+        expected_run_id=local.get("session_id", ""),
+        test_started_at=metadata.get("guest_test_started_at", ""),
+        test_finished_at=metadata.get("guest_test_finished_at", ""),
+    )
+    result["gem5_gpu_execution"] = gem5_analysis
+    docker_command = [str(docker_container.get("Path", "")), *docker_args]
+    _expect_value(
+        errors,
+        "docker_inspect.command",
+        repr(gem5_analysis.get("command_words", [])),
+        repr(docker_command),
+    )
+    recorded_gem5_log_sha = _validate_sha(
+        errors,
+        "metadata.gem5_log_sha256",
+        metadata.get("gem5_log_sha256"),
+    )
+    actual_gem5_log_sha = str(gem5_analysis.get("gem5_log_sha256", ""))
+    if recorded_gem5_log_sha is not None and \
+            recorded_gem5_log_sha != actual_gem5_log_sha:
+        _add_error(
+            errors,
+            "gem5_log_hash_mismatch",
+            f"expected={recorded_gem5_log_sha}:actual={actual_gem5_log_sha}",
+        )
+    if gem5_analysis.get("read_error") is not None:
+        _add_error(
+            errors,
+            "gem5_log_read_error",
+            str(gem5_analysis.get("read_error")),
+        )
+    if gem5_analysis.get("stable_snapshot_ok") is not True:
+        _add_error(
+            errors,
+            "gem5_log_snapshot_invalid",
+            str(gem5_analysis.get("snapshot_stat_identity")),
+        )
+    if gem5_analysis.get("timestamp_contract_ok") is not True:
+        _add_error(
+            errors,
+            "invalid_gem5_timestamp",
+            "timestamp_lines="
+            f"{gem5_analysis.get('invalid_timestamp_lines')}:encoding_lines="
+            f"{gem5_analysis.get('invalid_encoding_lines')}:regression_lines="
+            f"{gem5_analysis.get('timestamp_regression_lines')}",
+        )
+    if _parse_int(gem5_analysis.get("fatal_count")) != 0:
+        _add_error(
+            errors,
+            "simulator_fatal",
+            repr(gem5_analysis.get("fatal_events")),
+        )
+    if gem5_analysis.get("command_identity_ok") is not True:
+        _add_error(
+            errors,
+            "gem5_command_identity_mismatch",
+            "count="
+            f"{gem5_analysis.get('command_line_count')}:missing="
+            f"{gem5_analysis.get('missing_run_tokens')}:debug="
+            f"{gem5_analysis.get('missing_debug_flags')}",
+        )
+    if _parse_int(gem5_analysis.get("client_connected_count")) in {None, 0}:
+        _add_error(errors, "gem5_client_not_connected", "missing client marker")
+    if gem5_analysis.get("causal_chain_ok") is not True:
+        _add_error(
+            errors,
+            "gem5_causal_chain_unproven",
+            "command="
+            f"{gem5_analysis.get('command_event')!r}:client="
+            f"{gem5_analysis.get('client_event')!r}:launch="
+            f"{gem5_analysis.get('gpu_sequence', {}).get('launch')!r}",
+        )
+    if gem5_analysis.get("window_ok") is not True:
+        _add_error(errors, "invalid_guest_test_window", "runner_metadata")
+    if gem5_analysis.get("gpu_sequence", {}).get("ok") is not True:
+        _add_error(
+            errors,
+            "gem5_gpu_execution_unproven",
+            "launch="
+            f"{gem5_analysis.get('kernel_launch_count')}:dispatch="
+            f"{gem5_analysis.get('workgroup_dispatch_count')}:completion="
+            f"{gem5_analysis.get('workgroup_completion_count')}:kernel_completion="
+            f"{gem5_analysis.get('kernel_completion_count')}",
+        )
+    if _nested(verdict, "checks", "gem5_gpu_execution", "ok") is not True:
+        _add_error(errors, "invalid_verdict_check", "gem5_gpu_execution")
+    _expect_value(
+        errors,
+        "verdict.provenance.gem5_log_sha256",
+        actual_gem5_log_sha,
+        _nested(verdict, "provenance", "gem5_log_sha256"),
+    )
 
     if verdict.get("schema") != "cosim-run-verdict/v1":
         _add_error(errors, "invalid_verdict_schema", str(verdict.get("schema")))
@@ -2592,12 +4189,33 @@ def _validate_row(
 
 
 def verify_matrix(
-    manifest_path: Path, matrix_path: Path, repo_root: Path = REPO_ROOT
+    manifest_path: Path,
+    matrix_path: Path,
+    repo_root: Path = REPO_ROOT,
+    expected_spec_path: Optional[Path] = None,
 ) -> Dict[str, object]:
     manifest_path = manifest_path.resolve()
     matrix_path = matrix_path.resolve()
     repo_root = repo_root.resolve()
     global_errors: List[Error] = []
+    build_lock_handle = None
+    build_lock_path = repo_root / ".local/cosim/build.lock"
+    try:
+        build_lock_handle = build_lock_path.open("rb")
+        fcntl.flock(build_lock_handle.fileno(), fcntl.LOCK_SH)
+    except OSError as error:
+        _add_error(
+            global_errors,
+            "guest_build_lock_error",
+            f"{build_lock_path}:{error}",
+        )
+    if expected_spec_path is None:
+        expected_spec_path = repo_root / EXPECTED_ROWS_RELATIVE
+    elif not expected_spec_path.is_absolute():
+        expected_spec_path = repo_root / expected_spec_path
+    expected_rows, expected_rows_info = _load_expected_rows(
+        expected_spec_path, repo_root, global_errors
+    )
     try:
         manifest_rows = _load_tsv(manifest_path, MANIFEST_COLUMNS)
     except (OSError, UnicodeError, ValueError) as error:
@@ -2608,6 +4226,10 @@ def verify_matrix(
     except (OSError, UnicodeError, ValueError) as error:
         _add_error(global_errors, "matrix_error", str(error))
         matrix_rows = []
+    if not manifest_rows:
+        _add_error(global_errors, "empty_manifest", str(manifest_path))
+    if not matrix_rows:
+        _add_error(global_errors, "empty_matrix", str(matrix_path))
 
     manifest_ids: Dict[str, List[Mapping[str, str]]] = {}
     accepted: List[Mapping[str, str]] = []
@@ -2642,6 +4264,22 @@ def verify_matrix(
                 "duplicate_manifest_row",
                 f"row_id={row_id}:count={len(rows)}",
             )
+
+    accepted_rows: CounterType[Tuple[str, str]] = Counter(
+        (
+            row.get("program", ""),
+            row.get("expected_hsa_interrupt", ""),
+        )
+        for row in accepted
+    )
+    if accepted_rows != expected_rows:
+        missing = expected_rows - accepted_rows
+        extra = accepted_rows - expected_rows
+        _add_error(
+            global_errors,
+            "expected_rows_mismatch",
+            f"missing={sorted(missing.items())!r}:extra={sorted(extra.items())!r}",
+        )
 
     artifact_ids: Dict[Path, List[str]] = {}
     for row in accepted:
@@ -2690,9 +4328,16 @@ def verify_matrix(
                 f"artifact={path}:rows={','.join(sorted(rows))}",
             )
 
-    cache: Dict[Path, str] = {}
+    cache: Dict[HashCacheKey, str] = {}
+    derived_cache: Dict[Tuple[str, Path], str] = {}
     results = [
-        _validate_row(row, matrix_by_id.get(row.get("row_id", ""), []), repo_root, cache)
+        _validate_row(
+            row,
+            matrix_by_id.get(row.get("row_id", ""), []),
+            repo_root,
+            cache,
+            derived_cache,
+        )
         for row in accepted
     ]
     for result in results:
@@ -2709,9 +4354,11 @@ def verify_matrix(
         row["verification_outcome"] != "PASS" for row in results
     ):
         overall = "FAIL"
-    return {
+    payload = {
         "accepted_row_count": len(accepted),
         "errors": normalized_global,
+        "expected_row_count": sum(expected_rows.values()),
+        "expected_row_spec": expected_rows_info,
         "ignored_matrix_rows": sorted(set(ignored_matrix_rows)),
         "ignored_rows": ignored,
         "manifest": str(manifest_path),
@@ -2722,6 +4369,10 @@ def verify_matrix(
         "rows": results,
         "schema": SCHEMA,
     }
+    if build_lock_handle is not None:
+        fcntl.flock(build_lock_handle.fileno(), fcntl.LOCK_UN)
+        build_lock_handle.close()
+    return payload
 
 
 def write_json_atomic(path: Path, payload: object) -> None:

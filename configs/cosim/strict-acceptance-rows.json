@@ -1,0 +1,13 @@
+{
+  "rows": [
+    {"expected_hsa_interrupt": "0", "program": "gemm"},
+    {"expected_hsa_interrupt": "0", "program": "histogram"},
+    {"expected_hsa_interrupt": "0", "program": "multi_gpu_verify"},
+    {"expected_hsa_interrupt": "0", "program": "prefix_scan"},
+    {"expected_hsa_interrupt": "0", "program": "reduction"},
+    {"expected_hsa_interrupt": "0", "program": "transpose"},
+    {"expected_hsa_interrupt": "0", "program": "vector_add"},
+    {"expected_hsa_interrupt": "1", "program": "vector_add"}
+  ],
+  "schema": "cosim-strict-expected-rows/v1"
+}

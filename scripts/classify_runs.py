@@ -20,6 +20,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+try:
+    from scripts.cosim_log_evidence import (
+        analyze_gem5_log,
+        analyze_qemu_log,
+        simulator_fatal_kind,
+    )
+except ModuleNotFoundError:  # 允许直接执行 scripts/classify_runs.py。
+    from cosim_log_evidence import (
+        analyze_gem5_log,
+        analyze_qemu_log,
+        simulator_fatal_kind,
+    )
+
 
 SCHEMA = "cosim-run-verdict/v1"
 
@@ -83,12 +96,6 @@ TIMEOUT_POLICY_RE = re.compile(
 SIMULATOR_EXIT_SIGNAL_RE = re.compile(
     r"^\[COSIM_(?:GEM5|QEMU|SIMULATOR|LAUNCHER)_EXIT\](?:\s|$)"
 )
-SIMULATOR_FATAL_RE = re.compile(
-    r"^(?:(?:gem5\s+)?(?:panic|fatal):|Assertion .+ failed\.?$|"
-    r"qemu-system-[^:]+: terminating on signal)"
-)
-
-
 @dataclass(frozen=True)
 class LocatedFile:
     role: str
@@ -313,6 +320,8 @@ def classify_artifact(
     category = (metadata.get("category") or "").lower()
     timeout_seen = category in TIMEOUT_CATEGORIES
     simulator_exit_seen = category in SIMULATOR_EXIT_CATEGORIES
+    simulator_fatal_events: List[Dict[str, object]] = []
+    expected_cleanup_events: List[Dict[str, object]] = []
     if category == "cleanup_fail":
         cleanup_proven = True
         cleanup_ok = False
@@ -321,9 +330,32 @@ def classify_artifact(
     fail_count = 0
     env_values: List[str] = []
     guest_log = evidence["guest_log"].path
-    if guest_log is not None:
+    qemu_log = evidence["qemu_log"].path
+    qemu_analysis: Optional[Dict[str, object]] = None
+    if qemu_log is not None:
+        qemu_analysis = analyze_qemu_log(
+            qemu_log,
+            expected_run_id=metadata.get("run_id", ""),
+            expected_program=program or "",
+            expected_hsa=metadata.get("expected_hsa_enable_interrupt", ""),
+            expected_test_timeout=metadata.get("test_timeout", ""),
+        )
+
+    guest_is_qemu = bool(
+        guest_log is not None
+        and qemu_log is not None
+        and guest_log.resolve() == qemu_log.resolve()
+    )
+    if guest_is_qemu and qemu_analysis is not None:
+        pass_count = int(qemu_analysis.get("pass_count", 0))
+        fail_count = int(qemu_analysis.get("fail_count", 0))
+        env_values = [str(value) for value in qemu_analysis.get("hsa_values", [])]
+        timeout_seen = timeout_seen or bool(
+            qemu_analysis.get("timeout_signal_lines")
+        )
+    elif guest_log is not None:
         exact_pass = f"[PASS] {program}" if program else None
-        for _, line in _iter_normalized_lines(guest_log):
+        for line_number, line in _iter_normalized_lines(guest_log):
             if exact_pass is not None and line == exact_pass:
                 pass_count += 1
             if FAIL_RE.match(line):
@@ -337,20 +369,56 @@ def classify_artifact(
                 timeout_seen = True
             if SIMULATOR_EXIT_SIGNAL_RE.match(line):
                 simulator_exit_seen = True
-
-    scanned_logs = {guest_log.resolve()} if guest_log is not None else set()
-    for role in ("qemu_log", "gem5_log"):
-        path = evidence[role].path
-        if path is None or path.resolve() in scanned_logs:
-            continue
-        scanned_logs.add(path.resolve())
-        for _, line in _iter_normalized_lines(path):
-            if TIMEOUT_SIGNAL_RE.match(line) and not TIMEOUT_POLICY_RE.fullmatch(
-                line
-            ):
-                timeout_seen = True
-            if SIMULATOR_EXIT_SIGNAL_RE.match(line) or SIMULATOR_FATAL_RE.match(line):
+            fatal_kind = simulator_fatal_kind(line)
+            if fatal_kind is not None:
+                event = {
+                    "kind": fatal_kind,
+                    "line": line_number,
+                    "role": "guest_log",
+                    "text": line[:512],
+                }
                 simulator_exit_seen = True
+                if len(simulator_fatal_events) < 20:
+                    simulator_fatal_events.append(event)
+
+    if qemu_analysis is not None:
+        timeout_seen = timeout_seen or bool(qemu_analysis.get("timeout_signal_lines"))
+        for event in qemu_analysis.get("fatal_events", []):
+            if not isinstance(event, Mapping):
+                continue
+            simulator_exit_seen = True
+            if len(simulator_fatal_events) < 20:
+                simulator_fatal_events.append({"role": "qemu_log", **dict(event)})
+        for event in qemu_analysis.get("expected_cleanup_events", []):
+            if not isinstance(event, Mapping):
+                continue
+            joined_event = {"role": "qemu_log", **dict(event)}
+            if cleanup_ok:
+                if len(expected_cleanup_events) < 20:
+                    expected_cleanup_events.append(joined_event)
+            else:
+                simulator_exit_seen = True
+                if len(simulator_fatal_events) < 20:
+                    simulator_fatal_events.append(joined_event)
+
+    strict_acceptance = metadata.get("strict_acceptance") == "1"
+    gem5_analysis: Optional[Dict[str, object]] = None
+    gem5_log = evidence["gem5_log"].path
+    if gem5_log is not None:
+        gem5_analysis = analyze_gem5_log(
+            gem5_log,
+            expected_run_id=metadata.get("run_id", ""),
+            test_started_at=metadata.get("guest_test_started_at", ""),
+            test_finished_at=metadata.get("guest_test_finished_at", ""),
+        )
+        if int(gem5_analysis.get("fatal_count", 0)) > 0:
+            simulator_exit_seen = True
+            for event in gem5_analysis.get("fatal_events", []):
+                if len(simulator_fatal_events) >= 20 or not isinstance(event, Mapping):
+                    break
+                simulator_fatal_events.append(
+                    {"role": "gem5_log", **dict(event)}
+                )
 
     snapshot_ok, snapshot_problems = _source_snapshot_check(
         evidence["source_snapshot"].path
@@ -405,6 +473,50 @@ def classify_artifact(
     if _has_untracked_files(evidence["untracked_files"].path):
         if not evidence["untracked_archive"].present:
             missing_evidence.append("untracked_archive")
+    strict_qemu_completion_ok = not strict_acceptance
+    if strict_acceptance:
+        for key in (
+            "expected_hsa_enable_interrupt",
+            "qemu_log_sha256",
+            "test_timeout",
+        ):
+            if not metadata.get(key):
+                missing_evidence.append(f"metadata:{key}")
+        recorded_qemu_sha = metadata.get("qemu_log_sha256", "")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", recorded_qemu_sha):
+            missing_evidence.append("metadata:invalid_qemu_log_sha256")
+        elif qemu_analysis is not None and recorded_qemu_sha.lower() != \
+                qemu_analysis.get("qemu_log_sha256"):
+            missing_evidence.append("qemu_log:sha256_mismatch")
+        strict_qemu_completion_ok = bool(
+            qemu_analysis is not None
+            and qemu_analysis.get("ok") is True
+            and recorded_qemu_sha.lower() == qemu_analysis.get("qemu_log_sha256")
+        )
+        if not strict_qemu_completion_ok:
+            missing_evidence.append("qemu_log:strict_completion")
+    strict_gpu_execution_ok = not strict_acceptance
+    if strict_acceptance:
+        for key in (
+            "guest_test_started_at",
+            "guest_test_finished_at",
+            "gem5_log_sha256",
+        ):
+            if not metadata.get(key):
+                missing_evidence.append(f"metadata:{key}")
+        recorded_log_sha = metadata.get("gem5_log_sha256", "")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", recorded_log_sha):
+            missing_evidence.append("metadata:invalid_gem5_log_sha256")
+        elif gem5_analysis is not None and recorded_log_sha.lower() != \
+                gem5_analysis.get("gem5_log_sha256"):
+            missing_evidence.append("gem5_log:sha256_mismatch")
+        strict_gpu_execution_ok = bool(
+            gem5_analysis is not None
+            and gem5_analysis.get("ok") is True
+            and recorded_log_sha.lower() == gem5_analysis.get("gem5_log_sha256")
+        )
+        if not strict_gpu_execution_ok:
+            missing_evidence.append("gem5_log:strict_gpu_execution")
 
     reasons: List[str] = []
     if not identity_ok:
@@ -415,6 +527,10 @@ def classify_artifact(
         reasons.append("timeout")
     if simulator_exit_seen:
         reasons.append("simulator_early_exit")
+    if strict_acceptance and not strict_gpu_execution_ok:
+        reasons.append("gpu_execution_unproven")
+    if strict_acceptance and not strict_qemu_completion_ok:
+        reasons.append("qemu_completion_unproven")
     if test_exit_code is not None and test_exit_code != 0:
         reasons.append("nonzero_test_exit")
     if fail_count:
@@ -461,6 +577,18 @@ def classify_artifact(
             "simulator_lifetime": {
                 "ok": not simulator_exit_seen,
                 "early_exit_observed": simulator_exit_seen,
+                "fatal_events": simulator_fatal_events,
+                "expected_cleanup_events": expected_cleanup_events,
+            },
+            "gem5_gpu_execution": {
+                "ok": strict_gpu_execution_ok,
+                "required": strict_acceptance,
+                "analysis": gem5_analysis,
+            },
+            "qemu_completion": {
+                "ok": strict_qemu_completion_ok,
+                "required": strict_acceptance,
+                "analysis": qemu_analysis,
             },
             "cleanup": {
                 "ok": cleanup_ok,
@@ -486,6 +614,12 @@ def classify_artifact(
             for key in ("gem5_source_commit", "gem5_binary", "gem5_sha256")
         },
     }
+    result["provenance"]["gem5_log_sha256"] = (
+        gem5_analysis.get("gem5_log_sha256") if gem5_analysis is not None else None
+    )
+    result["provenance"]["qemu_log_sha256"] = (
+        qemu_analysis.get("qemu_log_sha256") if qemu_analysis is not None else None
+    )
     return result
 
 

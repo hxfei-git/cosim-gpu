@@ -45,6 +45,9 @@ EFFECTIVE_HOST_MEM="8G"
 EFFECTIVE_VRAM_SIZE="16GiB"
 EFFECTIVE_GEM5_DEBUG=""
 EFFECTIVE_GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
+STRICT_GEM5_DEBUG_FLAGS=(
+    HSAPacketProcessor GPUCommandProc GPUDisp GPUKernelInfo
+)
 GUEST_BRIDGE_POLICY="artifact-local"
 STRICT_ACCEPTANCE="${COSIM_STRICT_ACCEPTANCE:-0}"
 
@@ -143,7 +146,8 @@ Environment:
                           HSA_ENABLE_INTERRUPT=1 (default: empty -> 0)
   COSIM_STRICT_ACCEPTANCE 0：允许可重放的 dirty-tree 开发/诊断（默认）
                           1：strict v2 候选；要求顶层仓库与 gem5/ clean，
-                            且 tracked baseline lock 与 HEAD 一致
+                            且 tracked baseline lock 与 HEAD 一致，并显式启用
+                            HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo
 EOF
     exit 0
 }
@@ -171,6 +175,10 @@ while [[ $# -gt 0 ]]; do
         *)                  FILTER="$1"; shift ;;
     esac
 done
+
+[[ "$OUTPUT_DIR" != *$'\n'* && "$OUTPUT_DIR" != *$'\r'* && \
+   "$OUTPUT_DIR" != *$'\t'* ]] || \
+    error "control whitespace is not allowed in --output-dir"
 
 for timeout_name in BOOT_TIMEOUT_SECS TEST_TIMEOUT_SECS GUEST_RUN_TIMEOUT_SECS; do
     timeout_value="${!timeout_name}"
@@ -204,6 +212,12 @@ for ((arg_index=0; arg_index<${#PASSTHROUGH_ARGS[@]}; arg_index+=2)); do
     [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || \
         error "control whitespace is not allowed in passthrough values"
 done
+if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+    for required_debug_flag in "${STRICT_GEM5_DEBUG_FLAGS[@]}"; do
+        [[ ",${EFFECTIVE_GEM5_DEBUG}," == *",${required_debug_flag},"* ]] || \
+            error "strict acceptance requires --gem5-debug to include ${required_debug_flag}"
+    done
+fi
 [[ -x "$CANONICAL_GEM5_BIN" && ! -L "$CANONICAL_GEM5_BIN" ]] || \
     error "canonical gem5 binary is missing, non-executable, or symlinked: ${CANONICAL_GEM5_BIN}"
 CANONICAL_GEM5_REALPATH="$(realpath -e -- "$CANONICAL_GEM5_BIN")"
@@ -505,8 +519,11 @@ match_test() {
 
 TEST_NAME="$(match_test)"
 GUEST_SCRIPT=".cosim_guest_run.${COSIM_RUN_ID}.${TEST_NAME}.sh"
-TOKEN="COSIM_TEST_DONE_${TEST_NAME}_$(date +%s)"
-COMPILE_TOKEN="COSIM_COMPILE_DONE_${TEST_NAME}_$(date +%s)"
+TOKEN_RUN_SHA256="$(printf '%s' "$COSIM_RUN_ID" | sha256sum | awk '{print $1}')"
+[[ "$TOKEN_RUN_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+    error "failed to derive completion token identity from COSIM_RUN_ID"
+TOKEN="COSIM_TEST_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"
+COMPILE_TOKEN="COSIM_COMPILE_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"
 
 if [[ -n "$OUTPUT_DIR" ]]; then
     RUNNER_ARTIFACT_DIR="$(realpath -m -- "$OUTPUT_DIR")"
@@ -750,35 +767,13 @@ fi
     printf '\n'
 } > "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"
 
-cat >"$GUEST_SCRIPT_ARCHIVE" <<EOF
-#!/bin/bash
-set -uo pipefail
-
-export HSA_ENABLE_INTERRUPT="${GUEST_HSA_ENABLE_INTERRUPT}"
-case "\$HSA_ENABLE_INTERRUPT" in
-    0|1) ;;
-    *) echo "invalid HSA_ENABLE_INTERRUPT=\$HSA_ENABLE_INTERRUPT"; exit 2 ;;
-esac
-echo "[COSIM_ENV] HSA_ENABLE_INTERRUPT=\$HSA_ENABLE_INTERRUPT"
-echo "[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=${TEST_TIMEOUT_SECS}"
-
-if ! mountpoint -q /mnt; then
-    mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt
+if ! python3 -B "${SCRIPT_DIR}/cosim_log_evidence.py" render-guest-script \
+        --program "$TEST_NAME" \
+        --run-id "$COSIM_RUN_ID" \
+        --hsa-enable-interrupt "$GUEST_HSA_ENABLE_INTERRUPT" \
+        --test-timeout "$TEST_TIMEOUT_SECS" > "$GUEST_SCRIPT_ARCHIVE"; then
+    error "failed to render canonical Guest script"
 fi
-
-cd /mnt || exit 2
-make -j1
-build_rc=\$?
-echo "__${COMPILE_TOKEN}__:\${build_rc}"
-if [[ "\$build_rc" -ne 0 ]]; then
-    echo "__${TOKEN}__:\${build_rc}"
-    exit "\$build_rc"
-fi
-TEST_TIMEOUT_SECS=${TEST_TIMEOUT_SECS} ./run_tests.sh ${TEST_NAME}
-rc=\$?
-echo "__${TOKEN}__:\${rc}"
-exit "\${rc}"
-EOF
 chmod +x "$GUEST_SCRIPT_ARCHIVE"
 cp -- "$GUEST_SCRIPT_ARCHIVE" "$GUEST_SCRIPT_HOST"
 
@@ -825,6 +820,7 @@ if [[ -f "$SCREEN_LOG" ]]; then
 fi
 
 step "[${TEST_NAME}] Running test inside guest..."
+GUEST_TEST_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%S.%9NZ')"
 send_guest "if ! mountpoint -q /mnt; then mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt; fi; bash /mnt/${GUEST_SCRIPT}"
 
 last_printed=$((start_line - 1))
@@ -855,6 +851,12 @@ while true; do
     fi
     sleep 1
 done
+if ! session_alive; then
+    rm -f "$GUEST_SCRIPT_HOST"
+    record_category "$COSIM_CAT_QEMU_EXIT" "true"
+    error "[${TEST_NAME}] detached session exited after emitting the test completion token. Log tail:\n$(tail -n 80 "$SCREEN_LOG" 2>/dev/null)"
+fi
+GUEST_TEST_FINISHED_AT="$(date -u +'%Y-%m-%dT%H:%M:%S.%9NZ')"
 
 rm -f "$GUEST_SCRIPT_HOST"
 
@@ -930,6 +932,8 @@ docker inspect "$cname" > "${RUNNER_ARTIFACT_DIR}/docker-inspect.json" 2>&1 || t
     echo "exit_code=${result_rc}"
     echo "pass_count=${pass_count}"
     echo "fail_count=${fail_count}"
+    echo "guest_test_started_at=${GUEST_TEST_STARTED_AT}"
+    echo "guest_test_finished_at=${GUEST_TEST_FINISHED_AT}"
     echo "source_snapshot=${PATCH_DIR}/source-snapshot.txt"
     echo "gem5_baseline_lock=${GEM5_BASELINE_LOCK_ARCHIVE}"
     echo "gem5_baseline_lock_sha256=${GEM5_BASELINE_LOCK_SHA256}"
@@ -966,6 +970,29 @@ else
 fi
 
 exec {CONTROL_FD}>&-
+
+[[ -f "$SCREEN_LOG" && ! -L "$SCREEN_LOG" ]] || \
+    error "canonical QEMU log is missing or symlinked: ${SCREEN_LOG}"
+if ! QEMU_LOG_SHA256="$(python3 -B "${SCRIPT_DIR}/cosim_log_evidence.py" \
+        stable-sha256 "$SCREEN_LOG")"; then
+    error "canonical QEMU log failed stable snapshot hashing: ${SCREEN_LOG}"
+fi
+[[ "$QEMU_LOG_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+    error "canonical QEMU log produced an invalid SHA-256: ${SCREEN_LOG}"
+
+GEM5_LOG="${RUNNER_ARTIFACT_DIR}/gem5.log"
+[[ -f "$GEM5_LOG" && ! -L "$GEM5_LOG" ]] || \
+    error "canonical gem5 log is missing or symlinked: ${GEM5_LOG}"
+if ! GEM5_LOG_SHA256="$(python3 -B "${SCRIPT_DIR}/cosim_log_evidence.py" \
+        stable-sha256 "$GEM5_LOG")"; then
+    error "canonical gem5 log failed stable snapshot hashing: ${GEM5_LOG}"
+fi
+[[ "$GEM5_LOG_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+    error "canonical gem5 log produced an invalid SHA-256: ${GEM5_LOG}"
+{
+    echo "qemu_log_sha256=${QEMU_LOG_SHA256}"
+    echo "gem5_log_sha256=${GEM5_LOG_SHA256}"
+} >> "${RUNNER_ARTIFACT_DIR}/runner-metadata.txt"
 
 classifier_rc=0
 if python3 "${SCRIPT_DIR}/classify_runs.py" \

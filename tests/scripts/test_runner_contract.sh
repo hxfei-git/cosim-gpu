@@ -74,7 +74,7 @@ launch_line="$(grep -nF 'setsid stdbuf -oL -eL "$LAUNCH_SCRIPT"' "$HOST_RUNNER" 
 for needle in \
     '} > "${PATCH_DIR}/binary-provenance.txt"' \
     '} > "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"' \
-    'cat >"$GUEST_SCRIPT_ARCHIVE" <<EOF'; do
+    'cosim_log_evidence.py" render-guest-script'; do
     evidence_line="$(grep -nF "$needle" "$HOST_RUNNER" | cut -d: -f1)"
     [[ -n "$evidence_line" && "$evidence_line" -lt "$launch_line" ]] || \
         fail "pre-launch evidence is not persisted before setsid: $needle"
@@ -93,6 +93,17 @@ grep -Fq -- '--share-dir|--artifact-dir)' "$HOST_RUNNER" || \
 # shellcheck disable=SC2016
 grep -Fq 'cp -- "$GUEST_SCRIPT_ARCHIVE" "$GUEST_SCRIPT_HOST"' "$HOST_RUNNER" || \
     fail "Guest staging script is not copied from the archived script"
+# shellcheck disable=SC2016
+post_token_alive_line="$(grep -nF 'detached session exited after emitting the test completion token' \
+    "$HOST_RUNNER" | cut -d: -f1)"
+# shellcheck disable=SC2016
+guest_finished_line="$(grep -nF 'GUEST_TEST_FINISHED_AT=' "$HOST_RUNNER" | cut -d: -f1)"
+[[ -n "$post_token_alive_line" && -n "$guest_finished_line" && \
+   "$post_token_alive_line" -lt "$guest_finished_line" ]] || \
+    fail "runner does not confirm session liveness after the completion token"
+sed -n "$((post_token_alive_line - 3)),${post_token_alive_line}p" "$HOST_RUNNER" | \
+    grep -Fq 'if ! session_alive; then' || \
+    fail "post-token exit diagnostic is not guarded by session_alive"
 # shellcheck disable=SC2016
 grep -Fq '} >> "${PATCH_DIR}/binary-provenance.txt"' "$HOST_RUNNER" || \
     fail "test binary provenance is not appended"
@@ -129,6 +140,9 @@ grep -Fq "trap 'handle_signal' INT TERM" "$LAUNCHER" || \
 # shellcheck disable=SC2016
 grep -Fq 'error "--screen-log must equal ${CANONICAL_SCREEN_LOG}"' \
     "$HOST_RUNNER" || fail "runner does not fix the console log to artifact/qemu.log"
+# shellcheck disable=SC2016
+[[ "$(grep -Fc 'echo "  Run-ID:     $COSIM_RUN_ID"' "$LAUNCHER")" -eq 1 ]] || \
+    fail "launcher 未输出状态机要求的唯一 canonical Run-ID marker"
 
 for key in repo_status_sha256 gem5_status_sha256 gem5_patch_sha256 \
            gem5_untracked_list_sha256 gem5_untracked_archive_sha256 \
@@ -160,6 +174,46 @@ grep -Fq '[[ ! -s "${PATCH_DIR}/gem5-status.txt" ]]' "$HOST_RUNNER" || \
 # shellcheck disable=SC2016
 grep -Fq 'export COSIM_STRICT_ACCEPTANCE="$STRICT_ACCEPTANCE"' "$HOST_RUNNER" || \
     fail "runner does not export strict acceptance to launcher/preflight"
+for required_debug_flag in HSAPacketProcessor GPUCommandProc GPUDisp GPUKernelInfo; do
+    grep -Fq "$required_debug_flag" "$HOST_RUNNER" || \
+        fail "strict runner 缺少 debug flag 门禁：${required_debug_flag}"
+done
+grep -Fq "date -u +'%Y-%m-%dT%H:%M:%S.%9NZ'" "$HOST_RUNNER" || \
+    fail "runner 未记录 UTC 纳秒 Guest 测试时间窗"
+# shellcheck disable=SC2016
+grep -Fq 'gem5_log_sha256=${GEM5_LOG_SHA256}' "$HOST_RUNNER" || \
+    fail "runner 未在 metadata 记录 gem5.log SHA256"
+# shellcheck disable=SC2016
+grep -Fq 'TOKEN_RUN_SHA256="$(printf '\''%s'\'' "$COSIM_RUN_ID" | sha256sum' \
+    "$HOST_RUNNER" || fail "completion token 未绑定 COSIM_RUN_ID 的 SHA256"
+# shellcheck disable=SC2016
+grep -Fq 'TOKEN="COSIM_TEST_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"' \
+    "$HOST_RUNNER" || fail "test completion token 未使用 run ID identity"
+# shellcheck disable=SC2016
+grep -Fq 'COMPILE_TOKEN="COSIM_COMPILE_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"' \
+    "$HOST_RUNNER" || fail "compile completion token 未使用 run ID identity"
+# shellcheck disable=SC2016
+grep -Fq 'stable-sha256 "$SCREEN_LOG"' "$HOST_RUNNER" || \
+    fail "runner 未使用 O_NOFOLLOW 稳定快照哈希 QEMU 日志"
+# shellcheck disable=SC2016
+grep -Fq 'stable-sha256 "$GEM5_LOG"' "$HOST_RUNNER" || \
+    fail "runner 未使用 O_NOFOLLOW 稳定快照哈希 gem5 日志"
+# shellcheck disable=SC2016
+grep -Fq 'qemu_log_sha256=${QEMU_LOG_SHA256}' "$HOST_RUNNER" || \
+    fail "runner 未在 metadata 记录 qemu.log SHA256"
+# shellcheck disable=SC2016
+session_closed_line="$(grep -nF 'exec {CONTROL_FD}>&-' "$HOST_RUNNER" | cut -d: -f1)"
+# shellcheck disable=SC2016
+qemu_hash_line="$(grep -nF 'stable-sha256 "$SCREEN_LOG"' "$HOST_RUNNER" | cut -d: -f1)"
+# shellcheck disable=SC2016
+gem5_hash_line="$(grep -nF 'stable-sha256 "$GEM5_LOG"' "$HOST_RUNNER" | cut -d: -f1)"
+classifier_line="$(grep -nF 'classify_runs.py' "$HOST_RUNNER" | tail -n 1 | cut -d: -f1)"
+[[ -n "$session_closed_line" && -n "$qemu_hash_line" && \
+   -n "$gem5_hash_line" && -n "$classifier_line" && \
+   "$session_closed_line" -lt "$qemu_hash_line" && \
+   "$qemu_hash_line" -lt "$gem5_hash_line" && \
+   "$gem5_hash_line" -lt "$classifier_line" ]] || \
+    fail "QEMU log stable hash 必须位于 cleanup 完成后、classifier 之前"
 # shellcheck disable=SC2016
 [[ "$(grep -Fc 'echo "strict_acceptance=${STRICT_ACCEPTANCE}"' \
     "$HOST_RUNNER")" -eq 2 ]] || \
@@ -222,7 +276,8 @@ mkdir -p "${PRODUCER_ROOT}/scripts" "${PRODUCER_ROOT}/tests/kernels" \
     "${PRODUCER_ROOT}/configs/cosim"
 cp "$HOST_RUNNER" "$PRODUCER_RUNNER"
 cp "${COSIM_DIR}/scripts/cosim_lib.sh" \
-    "${COSIM_DIR}/scripts/cosim_guest_env.sh" "${PRODUCER_ROOT}/scripts/"
+    "${COSIM_DIR}/scripts/cosim_guest_env.sh" \
+    "${COSIM_DIR}/scripts/cosim_log_evidence.py" "${PRODUCER_ROOT}/scripts/"
 cp "$LAUNCHER" "$STRICT_LAUNCHER"
 cat > "${PRODUCER_ROOT}/scripts/cosim_build.sh" <<'EOF'
 #!/bin/bash
@@ -342,6 +397,25 @@ run_producer_case() {
         "$@" vector_add > "${PRODUCER_ROOT}/${case_name}.log" 2>&1
 }
 
+for control_whitespace in $'\n' $'\r' $'\t'; do
+    case "$control_whitespace" in
+        $'\n') control_name="newline" ;;
+        $'\r') control_name="carriage-return" ;;
+        $'\t') control_name="tab" ;;
+    esac
+    invalid_output="${PRODUCER_ROOT}/artifacts/invalid-${control_name}${control_whitespace}path"
+    invalid_log="${PRODUCER_ROOT}/invalid-output-${control_name}.log"
+    if PATH="${PRODUCER_FAKE_BIN}:${PATH}" \
+        COSIM_RUN_ID="invalid-output-${control_name}" "$PRODUCER_RUNNER" \
+        --output-dir "$invalid_output" vector_add > "$invalid_log" 2>&1; then
+        fail "runner accepted ${control_name} in --output-dir"
+    fi
+    grep -Fq 'control whitespace is not allowed in --output-dir' "$invalid_log" || \
+        fail "${control_name} output-dir rejection lacked a diagnostic"
+    [[ ! -e "$invalid_output" ]] || \
+        fail "${control_name} output-dir rejection created an artifact"
+done
+
 snapshot_value() {
     local snapshot="$1"
     local key="$2"
@@ -367,6 +441,12 @@ VALID_ARTIFACT="${PRODUCER_ROOT}/artifacts/producer-valid"
 VALID_PATCH="${VALID_ARTIFACT}/patch"
 grep -Fq '[FAKE_LAUNCH_REACHED]' "${VALID_ARTIFACT}/qemu.log" || \
     fail "valid producer provenance did not reach the launcher boundary"
+EXPECTED_GUEST_SCRIPT="${FIXTURE_DIR}/expected-guest-run.sh"
+python3 -B "${PRODUCER_ROOT}/scripts/cosim_log_evidence.py" render-guest-script \
+    --program vector_add --run-id producer-valid --hsa-enable-interrupt 0 \
+    --test-timeout 60 > "$EXPECTED_GUEST_SCRIPT"
+cmp -s "$EXPECTED_GUEST_SCRIPT" "${VALID_ARTIFACT}/guest-run.sh" || \
+    fail "producer did not archive the shared canonical Guest script"
 cmp -s "$PRODUCER_GEM5_META" "${VALID_PATCH}/gem5-build-meta.txt" || \
     fail "archived gem5 metadata differs from the validated source"
 cmp -s "$PRODUCER_GEM5_LOCK" "${VALID_PATCH}/gem5-baseline.lock" || \
@@ -407,7 +487,9 @@ grep -Fxq 'passthrough_args= --gem5-debug ContractDebugFlag' \
     "${PASSTHROUGH_ARTIFACT}/runner-invocation.txt" || \
     fail "非空 passthrough 的参数数量、顺序或值没有原样归档"
 
-if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-valid-strict; then
+STRICT_DEBUG_FLAGS='HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo'
+if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-valid-strict \
+        --gem5-debug "$STRICT_DEBUG_FLAGS"; then
     fail "strict producer fixture unexpectedly completed a fake launch"
 fi
 STRICT_VALID_ARTIFACT="${PRODUCER_ROOT}/artifacts/producer-valid-strict"
@@ -416,6 +498,15 @@ grep -Fq '[FAKE_LAUNCH_REACHED]' "${STRICT_VALID_ARTIFACT}/qemu.log" || \
 grep -Fq 'strict_acceptance=1' \
     "${STRICT_VALID_ARTIFACT}/runner-invocation.txt" || \
     fail "strict producer invocation does not record strict_acceptance=1"
+
+if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-strict-missing-debug; then
+    fail "strict producer 接受了缺失 GPU 执行证据 flags 的调用"
+fi
+grep -Fq 'strict acceptance requires --gem5-debug to include' \
+    "${PRODUCER_ROOT}/producer-strict-missing-debug.log" || \
+    fail "strict debug flag 拒绝缺少诊断"
+[[ ! -e "${PRODUCER_ROOT}/artifacts/producer-strict-missing-debug" ]] || \
+    fail "strict debug flag 拒绝发生在 artifact 创建之后"
 
 if COSIM_STRICT_ACCEPTANCE=invalid run_producer_case producer-invalid-strict; then
     fail "runner accepted an invalid COSIM_STRICT_ACCEPTANCE value"
@@ -507,7 +598,8 @@ run_producer_case producer-replay-dirty-lock || true
 grep -Fq '[FAKE_LAUNCH_REACHED]' \
     "${PRODUCER_ROOT}/artifacts/producer-replay-dirty-lock/qemu.log" || \
     fail "default replay mode rejected a semantically identical dirty lock"
-if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-strict-dirty-lock; then
+if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-strict-dirty-lock \
+        --gem5-debug "$STRICT_DEBUG_FLAGS"; then
     fail "strict acceptance accepted a baseline lock that differs from HEAD"
 fi
 grep -Fq 'baseline lock differs from HEAD' \
@@ -522,7 +614,8 @@ run_producer_case producer-replay-dirty-gem5 || true
 grep -Fq '[FAKE_LAUNCH_REACHED]' \
     "${PRODUCER_ROOT}/artifacts/producer-replay-dirty-gem5/qemu.log" || \
     fail "default replay mode rejected a fingerprint-matched dirty gem5 tree"
-if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-strict-dirty-gem5; then
+if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-strict-dirty-gem5 \
+        --gem5-debug "$STRICT_DEBUG_FLAGS"; then
     fail "strict acceptance accepted a dirty gem5 source tree"
 fi
 grep -Fq 'gem5 source tree must be clean before a strict acceptance run' \
@@ -538,7 +631,8 @@ run_producer_case producer-replay-dirty-top || true
 grep -Fq '[FAKE_LAUNCH_REACHED]' \
     "${PRODUCER_ROOT}/artifacts/producer-replay-dirty-top/qemu.log" || \
     fail "default replay mode rejected a dirty top-level source tree"
-if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-strict-dirty-top; then
+if COSIM_STRICT_ACCEPTANCE=1 run_producer_case producer-strict-dirty-top \
+        --gem5-debug "$STRICT_DEBUG_FLAGS"; then
     fail "strict acceptance accepted a dirty top-level source tree"
 fi
 grep -Fq 'top-level source tree must be clean before a strict acceptance run' \

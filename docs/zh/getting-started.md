@@ -157,7 +157,7 @@ git submodule status --recursive
 
 QEMU、gem5 和 m5 默认各使用 4 个构建 job。只通过 wrapper 调用时的 `QEMU_BUILD_JOBS`、`GEM5_BUILD_JOBS` 与 `M5_BUILD_JOBS` 调整；Host 内存紧张时首先减少 job 数。
 
-日常环境搭建不要调用 `lock-qemu-source`：tracked lock 已包含接受的源码 SHA-256。Hash 不匹配属于 provenance 失败，不能据此在本地替换 lock。
+日常环境搭建不要调用 `lock-qemu-source`：tracked lock 已包含接受的源码归档 SHA-256 与解压后源码树 fingerprint。任一 fingerprint 不匹配都属于 provenance 失败，不能据此在本地替换 lock。
 
 构建完成后必须执行运行 preflight：
 
@@ -212,24 +212,33 @@ clean HEAD；其结果不能作为严格的 `cosim-matrix-verification/v2` accep
 
 ```bash
 COSIM_STRICT_ACCEPTANCE=1 GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
-    ./scripts/run_cosim_tests.sh vector_add
+    ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
+    vector_add
 
 COSIM_STRICT_ACCEPTANCE=1 GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
-    ./scripts/run_cosim_tests.sh vector_add
+    ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo,AMDGPUDevice,MI300XCosim \
+    vector_add
 ```
 
 这些是 strict v2 acceptance command：只有 top-level 与 gem5 source tree 都 clean
-时才能启动。必须把两种模式记录为独立实验。模式 1 使用中断支持的 HSA signal，
-不能与模式 0 baseline 互换。`matrix.tsv` 必须包含从 Guest 观察到的实际值；
-`unknown` 或与预期不符都会使该行无效。
+且命令包含四个必需的执行证据 debug flags 时才能启动。必须把两种模式记录为独立
+实验。interrupt comparison 还会额外启用 `AMDGPUDevice` 与 `MI300XCosim`；模式 1
+使用中断支持的 HSA signal，不能与模式 0 baseline 互换。`matrix.tsv` 必须包含从
+Guest 观察到的实际值；`unknown` 或与预期不符都会使该行无效。
 
 当前 runner timeout 为：等待 Guest 登录提示 240 秒、Guest 内程序执行 60 秒、Guest 编译加执行的 Host deadline 1,800 秒。只能通过 `run_cosim_tests.sh` 选项覆盖，并应把实际命令与证据一起记录。
 
 Smoke test 通过后执行：
 
 ```bash
-COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh --repeat 3 vector_add
-COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh --all
+COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
+    --repeat 3 vector_add
+COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
+    --all
 ```
 
 `--repeat` 的每次迭代都会创建全新会话。`--all` 会发现排序后的 `tests/kernels/*.cpp` 集合，并为每个程序创建全新的子会话与 artifact 目录；当前集合为 `gemm`、`histogram`、`multi_gpu_verify`、`prefix_scan`、`reduction`、`transpose` 和 `vector_add`。后续源码变更可能改变该集合，因此目录和归档的 source snapshot 才是权威依据。
@@ -252,14 +261,22 @@ Runner 会打印确切的 artifact 目录。自定义 `--output-dir` 只能位�
 | `patch/repo-status.txt`、`patch/repo.patch` | 该行使用的顶层 tracked 与未提交源码状态 |
 | `patch/gem5-status.txt`、`patch/gem5.patch` | 该行使用的 gem5 submodule 状态 |
 | `qemu.log`、`gem5.log` | 为诊断保留的完整 Guest console 与仿真器证据 |
+| `guest-provenance.json` 与 `guest-*` 构建/stat 证据 | Guest image、kernel、m5、QEMU、锁文件、overlay patch、submodule 与 recipe 的严格连接；base image 只读运行前后状态 |
+| `docker-inspect.json` | 实际 gem5 container 名称、argv、运行/OOM/restart 状态 |
 | `cleanup-status.txt` | Manifest 范围内的资源清理结果 |
+
+`guest-provenance.json` 是从 clean HEAD 锚定的 builder/validator/lock、实时
+Guest meta/seal 与重新计算的 image/kernel hash 派生的本地 snapshot，不是签名或
+远程 attestation。该 contract 面向受信任的本机所有者，不能抵抗拥有同 UID、
+Docker/root-equivalent 或宿主管理员权限者对全部本地证据进行协调伪造。
 
 一行只有在以下条件全部满足时才可接受：命令显式设置
 `COSIM_STRICT_ACCEPTANCE=1`；两个 source tree 都 clean；runner 返回 0；
 `verdict.json` 为 `PASS` 且原因为 `all_acceptance_gates_passed`；`matrix.tsv` 一致；
 实际 HSA 值和三种 timeout 匹配目标模式；`cosim-matrix-verification/v2` 对
 manifest、invocation、Guest script/log、源码/二进制 provenance 的连接验证通过；
-清理已验证。即使 HIP 输出看起来正确，缺少证据也属于失败。Diagnostic mode 会为
+`gem5.log` 在本行测试时间窗内包含 kernel launch、workgroup dispatch、`WgCompl`
+和同 ID kernel completion；清理已验证。即使 HIP 输出看起来正确，缺少证据也属于失败。Diagnostic mode 会为
 学习和 replay 保留 dirty provenance，但这不会把 dirty row 变成 strict v2 acceptance；
 只有记录 `COSIM_STRICT_ACCEPTANCE=1` 的 artifact 才能进入 final v2 matrix。
 

@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COSIM_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUNNER="${COSIM_DIR}/scripts/run_cosim_tests.sh"
+LOG_EVIDENCE="${COSIM_DIR}/scripts/cosim_log_evidence.py"
 FIXTURE_DIR="$(mktemp -d /tmp/cosim-guest-env-contract.XXXXXX)"
 trap 'rm -rf -- "$FIXTURE_DIR"' EXIT
 
@@ -55,8 +56,14 @@ grep -Fq 'source "${SCRIPT_DIR}/cosim_guest_env.sh"' "$RUNNER" || \
 grep -Fq 'GUEST_HSA_ENABLE_INTERRUPT="$(cosim_guest_hsa_interrupt "$GUEST_TEST_PREFIX")"' \
     "$RUNNER" || fail "host runner does not resolve GUEST_TEST_PREFIX"
 # shellcheck disable=SC2016
-grep -Fq 'export HSA_ENABLE_INTERRUPT="${GUEST_HSA_ENABLE_INTERRUPT}"' "$RUNNER" || \
-    fail "resolved HSA interrupt value is not embedded in the Guest script"
+grep -Fq -- '--hsa-enable-interrupt "$GUEST_HSA_ENABLE_INTERRUPT"' "$RUNNER" || \
+    fail "runner does not pass the resolved HSA value to the canonical renderer"
+rendered_guest_script="$(python3 -B "$LOG_EVIDENCE" render-guest-script \
+    --program vector_add --run-id guest-env-contract \
+    --hsa-enable-interrupt 1 --test-timeout 60)" || \
+    fail "canonical Guest script renderer rejected a valid HSA value"
+grep -Fqx 'export HSA_ENABLE_INTERRUPT="1"' <<<"$rendered_guest_script" || \
+    fail "canonical Guest script does not embed the resolved HSA value"
 # shellcheck disable=SC2016
 grep -Fq 'cosim_guest_hsa_interrupt_from_log "$SCREEN_LOG"' "$RUNNER" || \
     fail "runner matrix does not use the CR-safe effective environment parser"

@@ -157,7 +157,7 @@ For a focused build, replace `all` with `qemu`, `gem5`, `m5`, or `guest`. `--for
 
 QEMU, gem5, and m5 build parallelism defaults to 4 jobs. Tune only through `QEMU_BUILD_JOBS`, `GEM5_BUILD_JOBS`, and `M5_BUILD_JOBS` on the wrapper invocation; reducing jobs is the first response to host memory pressure.
 
-Do not invoke `lock-qemu-source` during ordinary setup: the tracked lock already contains the accepted source SHA-256. A mismatch is a provenance failure, not permission to replace the lock locally.
+Do not invoke `lock-qemu-source` during ordinary setup: the tracked lock already contains the accepted source-archive SHA-256 and extracted source-tree fingerprint. A mismatch in either fingerprint is a provenance failure, not permission to replace the lock locally.
 
 After the build, require a runtime preflight:
 
@@ -213,25 +213,35 @@ The empty `GUEST_TEST_PREFIX` also means `HSA_ENABLE_INTERRUPT=0`. Use one of on
 
 ```bash
 COSIM_STRICT_ACCEPTANCE=1 GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
-    ./scripts/run_cosim_tests.sh vector_add
+    ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
+    vector_add
 
 COSIM_STRICT_ACCEPTANCE=1 GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
-    ./scripts/run_cosim_tests.sh vector_add
+    ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo,AMDGPUDevice,MI300XCosim \
+    vector_add
 ```
 
 These are strict v2 acceptance commands: start them only with clean top-level
-and gem5 source trees. Record the two modes as separate experiments. Mode 1
-exercises interrupt-backed HSA signaling and is not interchangeable with the
-mode-0 baseline. `matrix.tsv` must contain the effective value observed from
-the guest; an unknown or unexpected value invalidates the row.
+and gem5 source trees, and include the four required execution-evidence debug
+flags. Record the two modes as separate experiments. The interrupt comparison
+additionally enables `AMDGPUDevice` and `MI300XCosim`; mode 1 exercises
+interrupt-backed HSA signaling and is not interchangeable with the mode-0
+baseline. `matrix.tsv` must contain the effective value observed from the
+guest; an unknown or unexpected value invalidates the row.
 
 Current runner timeouts are 240 seconds to reach the guest login prompt, 60 seconds for the program inside the guest, and a 1,800-second host deadline for guest compilation plus execution. Override them only through `run_cosim_tests.sh` options and record the resulting command with the evidence.
 
 Once the smoke test passes:
 
 ```bash
-COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh --repeat 3 vector_add
-COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh --all
+COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
+    --repeat 3 vector_add
+COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
+    --all
 ```
 
 `--repeat` creates a fresh session for each iteration. `--all` discovers the sorted `tests/kernels/*.cpp` set and creates a fresh child session and artifact directory for every program; the current set is `gemm`, `histogram`, `multi_gpu_verify`, `prefix_scan`, `reduction`, `transpose`, and `vector_add`. A later source change can change this set, so the directory and archived source snapshot remain authoritative.
@@ -254,14 +264,25 @@ The runner prints the exact artifact directory. A custom `--output-dir` is allow
 | `patch/repo-status.txt`, `patch/repo.patch` | Top-level tracked and uncommitted source state used by the row |
 | `patch/gem5-status.txt`, `patch/gem5.patch` | gem5 submodule state used by the row |
 | `qemu.log`, `gem5.log` | Full guest console and simulator evidence retained for diagnosis |
+| `guest-provenance.json` and `guest-*` build/stat evidence | Strict join across the Guest image, kernel, m5, QEMU, locks, overlay patch, submodule, recipe, and pre/post read-only base-image state |
+| `docker-inspect.json` | Effective gem5 container name, argv, running/OOM/restart state |
 | `cleanup-status.txt` | Manifest-scoped resource cleanup result |
+
+`guest-provenance.json` is a local snapshot derived from the clean-HEAD
+builder, validator and locks, the live Guest metadata/seal, and recomputed
+image/kernel hashes; it is not a signature or remote attestation. This
+contract assumes a trusted local owner and cannot resist coordinated forgery
+by an actor with the same UID, Docker/root-equivalent, or host-administrator
+access.
 
 A row is accepted only when its command explicitly sets
 `COSIM_STRICT_ACCEPTANCE=1`, both source trees are clean, the runner exits 0,
 `verdict.json` says `PASS` with `all_acceptance_gates_passed`, `matrix.tsv`
 agrees, the effective HSA value and all three timeouts match the intended mode,
 the `cosim-matrix-verification/v2` join across the manifest, invocations, Guest
-script/log, and source/binary provenance passes, and cleanup is verified.
+script/log, and source/binary provenance passes; `gem5.log` contains an
+in-window kernel launch, workgroup dispatch, `WgCompl`, and same-ID kernel
+completion; and cleanup is verified.
 Missing evidence is a failure, even if the HIP output looks correct. Diagnostic
 mode deliberately preserves dirty provenance for learning and replay, but that
 does not turn a dirty row into strict v2 acceptance. Only artifacts recording

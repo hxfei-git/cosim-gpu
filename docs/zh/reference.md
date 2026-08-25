@@ -81,7 +81,7 @@ COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
     GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
-    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,AMDGPUDevice,MI300XCosim \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo,AMDGPUDevice,MI300XCosim \
     vector_add
 ```
 
@@ -94,6 +94,7 @@ RUN_ID="regression-$(date +%Y%m%d-%H%M%S)"
 COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
     GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh --all \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
     --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}"
 ```
 
@@ -104,6 +105,7 @@ RUN_ID="vector-repeat-$(date +%Y%m%d-%H%M%S)"
 COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
     GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh --repeat 3 \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
     --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
     vector_add
 ```
@@ -179,7 +181,7 @@ launcher 用 `.local/cosim/runtime.lock` 串行化访问；并发 runtime sessio
 | `--repeat N` | 同一精确 operator，N 个 fresh session |
 | `--keep-alive` | 只用于诊断；与 repeat mode 不兼容 |
 | operator | 精确 lowercase kernel stem，例如 `vector_add`；不接受 substring match |
-| `COSIM_STRICT_ACCEPTANCE` | `0`/未设置：允许 diagnostic mode 与 dirty replay；`1`：strict v2 acceptance，且两个 source tree 必须 clean |
+| `COSIM_STRICT_ACCEPTANCE` | `0`/未设置：允许 diagnostic mode 与 dirty replay；`1`：strict v2 acceptance，两个 source tree 必须 clean，且 `--gem5-debug` 必须包含 `HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo` |
 
 未知 `--name VALUE` option 会传给 `cosim_launch.sh`。每个 output directory 必须
 不存在或为空，也不能是 symlink。Diagnostic mode 仍会归档 dirty provenance，
@@ -191,7 +193,7 @@ launcher 用 `.local/cosim/runtime.lock` 串行化访问；并发 runtime sessio
 
 | Component | Identity |
 |---|---|
-| QEMU source | 10.1.5；archive SHA-256 `1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693` |
+| QEMU source | 10.1.5；archive SHA-256 `1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693`；源码树 fingerprint `9e2d43798bdfe7baaa7e8413ddbc35fdf409c8b435a47e5f5d435af4fd25d4b1` |
 | QEMU binary | SHA-256 `89eccd422cac9ce206171a31ec1f5db963a3c76c2b3d8e8f53d1ebd058a9a5eb` |
 | Guest OS/kernel | Ubuntu 24.04.2 recipe；`6.8.0-79-generic` |
 | ROCm / DKMS | `7.0.0.70000-38~24.04`；`1:6.14.14.30100000-2204008.24.04` |
@@ -203,8 +205,17 @@ launcher 用 `.local/cosim/runtime.lock` 串行化访问；并发 runtime sessio
 Phase 4 trace row 采集于当前 qcow2-overlay hardening 之前。它们仍是对应 source 与
 binary 的有效 dispatch/interrupt mechanism evidence，但不能证明当前 launcher 的
 disk-isolation contract。新的 acceptance run 还必须归档 `guest-overlay.json`、
-`guest-base-stat.txt` 与 `guest-build-meta.txt`，并证明执行前后 raw base image hash
-不变。
+`guest-provenance.json`、`guest-build-meta.txt`、`guest-content-seal.txt`、构建输入
+以及运行前后 stat。最终 verifier 会对当前 raw base image 完整计算一次 SHA-256，
+并把它连接到 seal、kernel、m5、QEMU、submodule gitlink 与构建 recipe；运行前后
+inode/ctime/mtime/size 任一漂移都会失败。
+
+这里的信任边界是本机仓库与构建目录的所有者：tracked builder/validator 与输入锁由
+clean HEAD 锚定，最终 verifier 会重新完整计算 Guest image 和 kernel hash；实时
+`guest-content-seal.txt` 则是本次本机构建输出的信任根。因此 strict v2 能发现陈旧、
+局部替换和运行期漂移，但不声称抵抗已经取得工作区写权限并同步伪造全部本地构建证据的
+恶意主体。需要跨主体证明时，应把最终 matrix、seal 和对应 Git commit 导出到独立的
+只读或签名存储；这不属于本地学习环境的 acceptance scope。
 
 ## 5. Artifact 验收 contract
 
@@ -222,14 +233,17 @@ disk-isolation contract。新的 acceptance run 还必须归档 `guest-overlay.j
 | binary identity | `patch/binary-provenance.txt` |
 | lifecycle | `runner-category.txt`、`launcher-category.txt`、`cleanup-status.txt` |
 | resource state | process、socket 与 `/dev/shm` snapshot |
-| 新运行的 disk isolation | `guest-overlay.json`、`guest-base-stat.txt`、`guest-build-meta.txt` |
+| Guest 构建与 disk isolation | `guest-overlay.json`、`guest-provenance.json`、`guest-build-meta.txt`、`guest-content-seal.txt`、`guest.lock`、`guest-overlay.patch`、`guest-base-stat.txt`、`guest-base-stat-pre.json`、`guest-base-stat-post.json` |
+| container 身份 | `docker-inspect.json` 中的名称、命令、参数、运行状态、OOM/restart 状态 |
 
 Strict v2 PASS 必须显式设置 `COSIM_STRICT_ACCEPTANCE=1`，且 top-level 与 gem5
 source tree 都 clean；同一个 artifact 还必须证明：精确 program identity、compile
 exit 0、test exit 0、恰好一个 `[PASS] <program>`、无 FAIL marker 或
 timeout/early simulator exit、唯一 effective HSA interrupt value、manifest 与实际
 invocation/timeout 一致、完整 source/binary provenance、完整 QEMU/gem5 evidence 与
-verified cleanup。普通学习或 dirty replay 默认属于 diagnostic mode，不是 strict v2
+verified cleanup。`gem5.log` 还必须在该行测试时间窗内给出同一 kernel ID 的
+launch → workgroup dispatch → `WgCompl` → kernel completion，并与
+`docker-inspect.json` 的实际 argv 一致。普通学习或 dirty replay 默认属于 diagnostic mode，不是 strict v2
 PASS；只有记录 `COSIM_STRICT_ACCEPTANCE=1` 的 artifact 才能进入 final v2 matrix。
 
 `scripts/classify_runs.py` 会刻意拒绝只有 PASS marker 的结果。主要 reason 包括
@@ -508,5 +522,8 @@ git diff --check
   performance 超出 accepted baseline。
 - 严格 runner 当前拒绝当前 `gem5/` source tree 之外的 `--gem5-bin`，避免把 alternate
   worktree binary 与当前树的 Python config/commit 混合；这是明确的 provenance 边界。
+- strict v2 是本机单用户验收，不是 cryptographic attestation；同 UID、
+  Docker/root-equivalent 或 Host 管理员协调改写全部 Guest build/runtime 证据不在其
+  保证范围内。
 - source、Guest、QEMU、gem5 binary、environment mode 或 launcher contract 任一
   改变都需要新 artifact，不能把旧 PASS 重新命名为当前 validation。

@@ -19,6 +19,7 @@ QEMU_URL="https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz"
 QEMU_SIG_URL="${QEMU_URL}.sig"
 QEMU_KEY_URL="https://keys.openpgp.org/vks/v1/by-fingerprint/${QEMU_RELEASE_KEY}"
 QEMU_SOURCE_SHA256=""
+QEMU_SOURCE_FINGERPRINT=""
 QEMU_SOURCE_DIR="${LOCAL_ROOT}/src/qemu-${QEMU_VERSION}"
 QEMU_SOURCE_PROVENANCE="${LOCAL_ROOT}/src/qemu-${QEMU_VERSION}.source-meta"
 QEMU_BUILD_DIR="${LOCAL_ROOT}/build/qemu-${QEMU_VERSION}"
@@ -54,6 +55,8 @@ PACKER_CONFIG_ROOT="${LOCAL_ROOT}/packer/config"
 GUEST_TEMPLATE_REL="src/x86-ubuntu-gpu-ml"
 GUEST_BUILD_ROOT="${LOCAL_ROOT}/build/guest"
 GUEST_META="${GUEST_BUILD_ROOT}/.cosim-build-meta"
+GUEST_SEAL="${GUEST_BUILD_ROOT}/.cosim-content-seal"
+GUEST_PROVENANCE_VALIDATOR="${SCRIPT_DIR}/guest_provenance.py"
 GUEST_IMAGE="${RESOURCES_DIR}/${GUEST_TEMPLATE_REL}/disk-image/x86-ubuntu-rocm70"
 GUEST_KERNEL_IMAGE="${RESOURCES_DIR}/${GUEST_TEMPLATE_REL}/vmlinux-rocm70"
 GUEST_ARTIFACT_ROOT="${COSIM_DIR}/artifacts/amd-gpu-learning-env/build/guest"
@@ -66,7 +69,7 @@ GUEST_KERNEL_DEB_KEYS=(
     GUEST_KERNEL_HEADERS_GENERIC_DEB
 )
 GUEST_KERNEL_DEB_FILES=()
-GUEST_RECIPE_VERSION=1
+GUEST_RECIPE_VERSION=2
 GUEST_PACKER_INIT_EXIT_CODE="not_run"
 GUEST_PACKER_VALIDATE_EXIT_CODE="not_run"
 GUEST_PACKER_BUILD_EXIT_CODE="not_run"
@@ -92,10 +95,11 @@ Environment:
 
 --force reruns the normal incremental build. It never deletes build trees.
 
-QEMU source identity is fixed by configs/cosim/toolchain.lock. A missing
-archive SHA-256 is a hard stop and is checked before any download starts.
-Use lock-qemu-source once to verify the official detached signature and print
-the SHA-256 that Codex must record in the tracked lock before building.
+QEMU source identity is fixed by configs/cosim/toolchain.lock. Missing or
+partially populated identities are a hard stop before a normal build.
+Use lock-qemu-source with both digest fields empty to verify the official
+detached signature and print the archive SHA-256 plus extracted source-tree
+fingerprint for explicit review. The action never writes the tracked lock.
 EOF
 }
 
@@ -106,6 +110,28 @@ die() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+tracked_head_file_sha256() {
+    local file="$1"
+    local role="$2"
+    local canonical repo_root relative current_sha head_sha
+
+    canonical="$(realpath -e -- "$file")" || die "${role} is not accessible: ${file}"
+    repo_root="$(realpath -e -- "$COSIM_DIR")"
+    case "$canonical" in
+        "${repo_root}/"*) relative="${canonical#"${repo_root}/"}" ;;
+        *) die "${role} is outside the repository: ${canonical}" ;;
+    esac
+    git -C "$repo_root" ls-files --error-unmatch -- "$relative" >/dev/null 2>&1 || \
+        die "${role} is not tracked: ${relative}"
+    git -C "$repo_root" diff --quiet HEAD -- "$relative" || \
+        die "${role} differs from HEAD: ${relative}"
+    current_sha="$(sha256sum -- "$canonical" | awk '{print $1}')"
+    head_sha="$(git -C "$repo_root" show "HEAD:${relative}" | sha256sum | awk '{print $1}')"
+    [[ "$current_sha" == "$head_sha" ]] || \
+        die "${role} worktree does not match its HEAD blob: ${relative}"
+    printf '%s\n' "$current_sha"
 }
 
 fingerprint_worktree_path() {
@@ -221,7 +247,7 @@ lock_value() {
 }
 
 validate_qemu_lock() {
-    local allow_empty_sha="${1:-false}"
+    local allow_empty_identity="${1:-false}"
     [[ -f "$TOOLCHAIN_LOCK" ]] || die "toolchain lock not found: $TOOLCHAIN_LOCK"
     [[ "$(lock_value QEMU_VERSION || true)" == "$QEMU_VERSION" ]] || \
         die "toolchain lock QEMU_VERSION must be ${QEMU_VERSION}"
@@ -235,12 +261,57 @@ validate_qemu_lock() {
         die "toolchain lock QEMU_RELEASE_KEY_URL does not match the official key URL"
 
     QEMU_SOURCE_SHA256="$(lock_value QEMU_SOURCE_SHA256 || true)"
-    if [[ -z "$QEMU_SOURCE_SHA256" ]]; then
-        [[ "$allow_empty_sha" == "true" ]] && return 0
+    QEMU_SOURCE_FINGERPRINT="$(lock_value QEMU_SOURCE_FINGERPRINT || true)"
+    if [[ -z "$QEMU_SOURCE_SHA256" && -z "$QEMU_SOURCE_FINGERPRINT" ]]; then
+        [[ "$allow_empty_identity" == "true" ]] && return 0
         die "QEMU_SOURCE_SHA256 is empty in $TOOLCHAIN_LOCK; establish it from the GPG-verified official qemu-${QEMU_VERSION}.tar.xz before building"
     fi
+    [[ -n "$QEMU_SOURCE_SHA256" ]] || die \
+        "QEMU_SOURCE_SHA256 is empty while QEMU_SOURCE_FINGERPRINT is populated; both QEMU identity fields must be empty for bootstrap or populated for builds"
     [[ "$QEMU_SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die \
         "QEMU_SOURCE_SHA256 in $TOOLCHAIN_LOCK is not a lowercase SHA-256"
+
+    [[ -n "$QEMU_SOURCE_FINGERPRINT" ]] || die \
+        "QEMU_SOURCE_FINGERPRINT is empty while QEMU_SOURCE_SHA256 is populated; both QEMU identity fields must be empty for bootstrap or populated for builds"
+    [[ "$QEMU_SOURCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || die \
+        "QEMU_SOURCE_FINGERPRINT in $TOOLCHAIN_LOCK is not a lowercase SHA-256"
+}
+
+require_qemu_source_fingerprint() {
+    local observed="$1"
+    local role="$2"
+
+    [[ "$QEMU_SOURCE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || die \
+        "QEMU source fingerprint lock is not initialized"
+    [[ "$observed" =~ ^[0-9a-f]{64}$ ]] || die \
+        "${role} is not a lowercase SHA-256"
+    [[ "$observed" == "$QEMU_SOURCE_FINGERPRINT" ]] || die \
+        "${role} does not match QEMU_SOURCE_FINGERPRINT in $TOOLCHAIN_LOCK: expected $QEMU_SOURCE_FINGERPRINT, observed $observed"
+}
+
+extract_qemu_archive_fingerprint() {
+    local tarball="$1"
+    local extract_dir extracted_source fingerprint
+
+    extract_dir="$(mktemp -d "${LOCAL_ROOT}/src/.qemu-bootstrap.XXXXXX")"
+    extracted_source="${extract_dir}/qemu-${QEMU_VERSION}"
+    if ! tar -C "$extract_dir" -xf "$tarball"; then
+        rm -rf -- "$extract_dir"
+        die "failed to extract the signature-verified QEMU archive for fingerprinting"
+    fi
+    if [[ ! -f "${extracted_source}/configure" || \
+          -L "${extracted_source}/configure" ]]; then
+        rm -rf -- "$extract_dir"
+        die "QEMU archive did not contain the expected regular source tree"
+    fi
+    if ! fingerprint="$(directory_fingerprint "$extracted_source")"; then
+        rm -rf -- "$extract_dir"
+        die "failed to fingerprint the extracted QEMU source tree"
+    fi
+    rm -rf -- "$extract_dir"
+    [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || die \
+        "extracted QEMU source fingerprint is not a lowercase SHA-256"
+    printf '%s\n' "$fingerprint"
 }
 
 guest_lock_value() {
@@ -520,7 +591,11 @@ verify_qemu_metadata() {
     verify_qemu_features quiet || return 1
     [[ "$(metadata_value "$QEMU_META" version || true)" == "$QEMU_VERSION" ]] || return 1
     [[ "$(metadata_value "$QEMU_META" source_sha256 || true)" == "$archive_sha" ]] || return 1
+    [[ "$(metadata_value "$QEMU_META" initial_source_fingerprint || true)" == \
+        "$QEMU_SOURCE_FINGERPRINT" ]] || return 1
+    [[ "$source_tree_fingerprint" == "$QEMU_SOURCE_FINGERPRINT" ]] || return 1
     [[ "$(metadata_value "$QEMU_META" source_fingerprint || true)" == "$source_tree_fingerprint" ]] || return 1
+    [[ "$(metadata_value "$QEMU_META" source_pristine || true)" == "true" ]] || return 1
     [[ "$(metadata_value "$QEMU_META" configure_fingerprint || true)" == "$configure_fingerprint" ]] || return 1
     [[ "$(metadata_value "$QEMU_META" build_fingerprint || true)" == "$build_fingerprint" ]] || return 1
     [[ "$(metadata_value "$QEMU_META" signing_verified || true)" == "true" ]] || return 1
@@ -597,6 +672,7 @@ refresh_gem5_baseline_lock() {
 prepare_qemu_source() {
     local allow_unlocked_sha="${1:-false}"
     local extract_source="${2:-true}"
+    local report_extracted_fingerprint="${3:-false}"
     local downloads="${LOCAL_ROOT}/downloads"
     local key_dir="${LOCAL_ROOT}/keys/qemu-release"
     local gnupg_home="${key_dir}/gnupg"
@@ -629,6 +705,8 @@ prepare_qemu_source() {
     fi
 
     local archive_sha key_listing observed_fingerprint primary_key_count
+    local extracted_source_fingerprint provenance_initial_fingerprint
+    local live_source_fingerprint
     archive_sha="$(sha256sum "$tarball" | awk '{print $1}')"
     if [[ "$allow_unlocked_sha" != "true" ]]; then
         [[ "$archive_sha" == "$QEMU_SOURCE_SHA256" ]] || die \
@@ -664,7 +742,13 @@ prepare_qemu_source() {
         "QEMU signature primary signer mismatch: ${valid_signers[0]:-missing}"
 
     if [[ "$extract_source" != "true" ]]; then
-        printf '%s\n' "$archive_sha"
+        if [[ "$report_extracted_fingerprint" == "true" ]]; then
+            extracted_source_fingerprint="$(extract_qemu_archive_fingerprint \
+                "$tarball")"
+            printf '%s\t%s\n' "$archive_sha" "$extracted_source_fingerprint"
+        else
+            printf '%s\n' "$archive_sha"
+        fi
         return 0
     fi
 
@@ -674,12 +758,16 @@ prepare_qemu_source() {
         tar -C "$extract_dir" -xf "$tarball"
         [[ -f "${extract_dir}/qemu-${QEMU_VERSION}/configure" ]] || \
             die "QEMU archive did not contain the expected source tree"
+        extracted_source_fingerprint="$(directory_fingerprint \
+            "${extract_dir}/qemu-${QEMU_VERSION}")"
+        require_qemu_source_fingerprint "$extracted_source_fingerprint" \
+            "QEMU extracted source fingerprint"
         mv "${extract_dir}/qemu-${QEMU_VERSION}" "$QEMU_SOURCE_DIR"
         rmdir "$extract_dir"
         write_metadata "$QEMU_SOURCE_PROVENANCE" \
             "archive_sha256=${archive_sha}" \
             "fingerprint_algorithm=2" \
-            "initial_source_fingerprint=$(directory_fingerprint "$QEMU_SOURCE_DIR")"
+            "initial_source_fingerprint=${extracted_source_fingerprint}"
     else
         [[ -f "$QEMU_SOURCE_PROVENANCE" ]] || die \
             "existing QEMU source lacks extraction provenance: $QEMU_SOURCE_DIR"
@@ -691,6 +779,8 @@ prepare_qemu_source() {
             tar -C "$verify_dir" -xf "$tarball"
             verified_source="${verify_dir}/qemu-${QEMU_VERSION}"
             verified_fingerprint="$(directory_fingerprint "$verified_source")"
+            require_qemu_source_fingerprint "$verified_fingerprint" \
+                "QEMU verified archive source fingerprint"
             current_fingerprint="$(directory_fingerprint "$QEMU_SOURCE_DIR")"
             if [[ "$verified_fingerprint" != "$current_fingerprint" ]]; then
                 echo "preserving verification tree after source mismatch: $verify_dir" >&2
@@ -704,21 +794,40 @@ prepare_qemu_source() {
         fi
     fi
 
+    provenance_initial_fingerprint="$(metadata_value \
+        "$QEMU_SOURCE_PROVENANCE" initial_source_fingerprint || true)"
+    require_qemu_source_fingerprint "$provenance_initial_fingerprint" \
+        "QEMU extraction provenance initial source fingerprint"
+    live_source_fingerprint="$(directory_fingerprint "$QEMU_SOURCE_DIR")"
+    require_qemu_source_fingerprint "$live_source_fingerprint" \
+        "QEMU live source fingerprint"
+
     printf '%s\n' "$archive_sha"
 }
 
 lock_qemu_source() {
     validate_qemu_lock true
-    if [[ -n "$QEMU_SOURCE_SHA256" ]]; then
-        echo "QEMU source lock is already populated: ${QEMU_SOURCE_SHA256}"
+    if [[ -n "$QEMU_SOURCE_SHA256" && -n "$QEMU_SOURCE_FINGERPRINT" ]]; then
+        echo "QEMU source lock is already populated:"
+        echo "QEMU_SOURCE_SHA256=${QEMU_SOURCE_SHA256}"
+        echo "QEMU_SOURCE_FINGERPRINT=${QEMU_SOURCE_FINGERPRINT}"
         return 0
     fi
 
-    local verified_sha
-    verified_sha="$(prepare_qemu_source true false)"
+    local verified_identity verified_sha verified_fingerprint extra
+    if ! verified_identity="$(prepare_qemu_source true false true)"; then
+        die "failed to bootstrap QEMU source identity"
+    fi
+    IFS=$'\t' read -r verified_sha verified_fingerprint extra <<< \
+        "$verified_identity"
+    [[ "$verified_sha" =~ ^[0-9a-f]{64}$ && \
+       "$verified_fingerprint" =~ ^[0-9a-f]{64}$ && -z "$extra" && \
+       "$verified_identity" != *$'\n'* ]] || \
+        die "QEMU source bootstrap returned malformed identity output"
     echo "QEMU detached signature verified against ${QEMU_RELEASE_KEY}."
     echo "QEMU_SOURCE_SHA256=${verified_sha}"
-    echo "Record this exact value in ${TOOLCHAIN_LOCK}, then run the qemu action."
+    echo "QEMU_SOURCE_FINGERPRINT=${verified_fingerprint}"
+    echo "Review and record both exact values in ${TOOLCHAIN_LOCK}; this action did not modify the tracked lock."
 }
 
 build_qemu() {
@@ -741,15 +850,16 @@ build_qemu() {
         "--enable-virtfs"
     )
     local initial_source_fingerprint source_tree_fingerprint source_pristine
+    local post_build_source_fingerprint
     local configure_fingerprint build_fingerprint
     initial_source_fingerprint="$(metadata_value \
         "$QEMU_SOURCE_PROVENANCE" initial_source_fingerprint)"
     source_tree_fingerprint="$(directory_fingerprint "$QEMU_SOURCE_DIR")"
-    if [[ "$source_tree_fingerprint" == "$initial_source_fingerprint" ]]; then
-        source_pristine=true
-    else
-        source_pristine=false
-    fi
+    require_qemu_source_fingerprint "$initial_source_fingerprint" \
+        "QEMU build initial source fingerprint"
+    require_qemu_source_fingerprint "$source_tree_fingerprint" \
+        "QEMU build live source fingerprint"
+    source_pristine=true
     configure_fingerprint="$(array_fingerprint "${configure_args[@]}")"
     build_fingerprint="$(array_fingerprint \
         "$archive_sha" "$source_tree_fingerprint" "$configure_fingerprint")"
@@ -781,6 +891,11 @@ build_qemu() {
         2>&1 | tee "${QEMU_BUILD_DIR}/build.log"
     PYTHONDONTWRITEBYTECODE=1 make -C "$QEMU_BUILD_DIR" install \
         2>&1 | tee "${QEMU_BUILD_DIR}/install.log"
+
+    post_build_source_fingerprint="$(directory_fingerprint "$QEMU_SOURCE_DIR")"
+    require_qemu_source_fingerprint "$post_build_source_fingerprint" \
+        "QEMU post-build live source fingerprint"
+    source_tree_fingerprint="$post_build_source_fingerprint"
 
     verify_qemu_features verbose || die "QEMU feature verification failed"
 
@@ -1090,19 +1205,41 @@ validate_guest_kernel() {
 
 guest_metadata_matches() {
     local recipe_fingerprint="$1"
-    local image_sha kernel_sha
 
     [[ "$(metadata_value "$GUEST_META" component || true)" == "guest" ]] || return 1
-    [[ "$(metadata_value "$GUEST_META" schema || true)" == "1" ]] || return 1
+    [[ "$(metadata_value "$GUEST_META" schema || true)" == "2" ]] || return 1
     [[ "$(metadata_value "$GUEST_META" recipe_fingerprint || true)" == \
         "$recipe_fingerprint" ]] || return 1
-    validate_guest_image "$GUEST_IMAGE" || return 1
-    validate_guest_kernel "$GUEST_KERNEL_IMAGE" || return 1
-    image_sha="$(sha256sum "$GUEST_IMAGE" | awk '{print $1}')" || return 1
-    kernel_sha="$(sha256sum "$GUEST_KERNEL_IMAGE" | awk '{print $1}')" || return 1
-    [[ "$(metadata_value "$GUEST_META" image_sha256 || true)" == "$image_sha" ]] || \
-        return 1
-    [[ "$(metadata_value "$GUEST_META" kernel_sha256 || true)" == "$kernel_sha" ]]
+    guest_provenance verify >/dev/null 2>&1
+}
+
+guest_provenance() {
+    local action="$1"
+    shift
+
+    python3 "$GUEST_PROVENANCE_VALIDATOR" "$action" \
+        --repo-root "$COSIM_DIR" \
+        --resources-dir "$RESOURCES_DIR" \
+        --metadata "$GUEST_META" \
+        --seal "$GUEST_SEAL" \
+        --guest-lock "$GUEST_LOCK" \
+        --guest-patch "$GUEST_PATCH" \
+        --image "$GUEST_IMAGE" \
+        --kernel "$GUEST_KERNEL_IMAGE" \
+        --m5 "$M5_GUEST_FILE" \
+        --qemu-bin "$QEMU_BIN" \
+        --qemu-img "$QEMU_IMG" \
+        --run-id build-guest "$@"
+}
+
+guest_metadata_reseal() {
+    local recipe_fingerprint="$1"
+
+    [[ "$(metadata_value "$GUEST_META" component || true)" == "guest" ]] || return 1
+    [[ "$(metadata_value "$GUEST_META" schema || true)" == "2" ]] || return 1
+    [[ "$(metadata_value "$GUEST_META" recipe_fingerprint || true)" == \
+        "$recipe_fingerprint" ]] || return 1
+    guest_provenance seal >/dev/null 2>&1
 }
 
 stage_guest_outputs() {
@@ -1395,25 +1532,24 @@ write_guest_attempt_status() {
 build_guest() {
     [[ -d "${RESOURCES_DIR}/.git" || -f "${RESOURCES_DIR}/.git" ]] || \
         die "gem5-resources submodule is not initialized: ${RESOURCES_DIR}"
-    require_command patch
-    require_command tar
-    require_command jq
-    require_command readelf
-    require_command shellcheck
-    require_command timeout
-    [[ -r /dev/kvm && -w /dev/kvm ]] || \
-        die "the current process cannot read/write /dev/kvm"
+    require_command python3
+    [[ -f "$GUEST_PROVENANCE_VALIDATOR" ]] || \
+        die "Guest provenance validator not found: ${GUEST_PROVENANCE_VALIDATOR}"
 
     validate_guest_lock
     build_qemu
     build_m5
-    prepare_packer_toolchain
-    prepare_guest_kernel_debs
 
-    local resources_commit template_tree patch_sha m5_sha qemu_sha qemu_img_sha
-    local lock_sha recipe_fingerprint attempt_id attempt_root context artifact_dir
+    local build_top_commit build_script_sha validator_sha resources_commit
+    local template_tree patch_sha m5_sha qemu_sha qemu_img_sha lock_sha
+    local recipe_fingerprint attempt_id attempt_root context artifact_dir
     local built_image built_kernel image_sha kernel_sha image_size kernel_size
     local classification secondary_classification log_name kernel_deb
+    build_top_commit="$(git -C "$COSIM_DIR" rev-parse HEAD)"
+    build_script_sha="$(tracked_head_file_sha256 \
+        "${SCRIPT_DIR}/cosim_build.sh" "Guest build script")"
+    validator_sha="$(tracked_head_file_sha256 \
+        "$GUEST_PROVENANCE_VALIDATOR" "Guest provenance validator")"
     resources_commit="$(git -C "$RESOURCES_DIR" rev-parse HEAD)"
     template_tree="$(git -C "$RESOURCES_DIR" rev-parse "${resources_commit}:${GUEST_TEMPLATE_REL}")"
     patch_sha="$(sha256sum "$GUEST_PATCH" | awk '{print $1}')"
@@ -1423,6 +1559,9 @@ build_guest() {
     lock_sha="$(sha256sum "$GUEST_LOCK" | awk '{print $1}')"
     recipe_fingerprint="$(array_fingerprint \
         "guest-recipe-v${GUEST_RECIPE_VERSION}" \
+        "build_top_commit=${build_top_commit}" \
+        "build_script=${build_script_sha}" \
+        "provenance_validator=${validator_sha}" \
         "resources_commit=${resources_commit}" \
         "template_tree=${template_tree}" \
         "overlay_patch=${patch_sha}" \
@@ -1437,6 +1576,21 @@ build_guest() {
         echo "guest image up to date (resources commit ${resources_commit}), skipping build"
         return 0
     fi
+    if [[ "$FORCE" -eq 0 ]] && guest_metadata_reseal "$recipe_fingerprint"; then
+        echo "guest image provenance sealed (resources commit ${resources_commit}), skipping build"
+        return 0
+    fi
+
+    require_command patch
+    require_command tar
+    require_command jq
+    require_command readelf
+    require_command shellcheck
+    require_command timeout
+    [[ -r /dev/kvm && -w /dev/kvm ]] || \
+        die "the current process cannot read/write /dev/kvm"
+    prepare_packer_toolchain
+    prepare_guest_kernel_debs
 
     attempt_id="$(date +%Y%m%dT%H%M%S)-$$"
     attempt_root="${GUEST_BUILD_ROOT}/attempts/${attempt_id}"
@@ -1514,7 +1668,10 @@ build_guest() {
     stage_guest_outputs "$built_image" "$built_kernel" "$attempt_id"
     write_metadata "$GUEST_META" \
         "component=guest" \
-        "schema=1" \
+        "schema=2" \
+        "build_top_commit=${build_top_commit}" \
+        "build_script_sha256=${build_script_sha}" \
+        "provenance_validator_sha256=${validator_sha}" \
         "resources_commit=${resources_commit}" \
         "template_tree=${template_tree}" \
         "overlay_patch_sha256=${patch_sha}" \
@@ -1540,7 +1697,10 @@ build_guest() {
         "kernel_size=${kernel_size}" \
         "artifacts=${artifact_dir}" \
         "timestamp=$(date -Iseconds)"
+    guest_provenance seal --known-image-sha256 "$image_sha" >/dev/null || \
+        die "new Guest outputs failed provenance sealing"
     cp "$GUEST_META" "${artifact_dir}/provenance.txt"
+    cp "$GUEST_SEAL" "${artifact_dir}/content-seal.txt"
     write_guest_attempt_status "${artifact_dir}/attempt-status.txt" \
         passed guest_build_complete none "$attempt_id"
     echo "guest image built: ${GUEST_IMAGE}"

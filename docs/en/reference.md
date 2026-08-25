@@ -85,7 +85,7 @@ COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
     GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
-    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,AMDGPUDevice,MI300XCosim \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo,AMDGPUDevice,MI300XCosim \
     vector_add
 ```
 
@@ -99,6 +99,7 @@ RUN_ID="regression-$(date +%Y%m%d-%H%M%S)"
 COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
     GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh --all \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
     --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}"
 ```
 
@@ -109,6 +110,7 @@ RUN_ID="vector-repeat-$(date +%Y%m%d-%H%M%S)"
 COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
     GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh --repeat 3 \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
     --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
     vector_add
 ```
@@ -185,7 +187,7 @@ runtime sessions are intentionally rejected.
 | `--repeat N` | same exact operator, N fresh sessions |
 | `--keep-alive` | diagnostic only; incompatible with repeat mode |
 | operator | exact lowercase kernel stem such as `vector_add`; substring matching is not accepted |
-| `COSIM_STRICT_ACCEPTANCE` | `0`/unset: diagnostic mode and dirty replay are allowed; `1`: strict v2 acceptance and both source trees must be clean |
+| `COSIM_STRICT_ACCEPTANCE` | `0`/unset: diagnostic mode and dirty replay are allowed; `1`: strict v2 acceptance, both source trees must be clean, and `--gem5-debug` must include `HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo` |
 
 Unknown `--name VALUE` options are passed to `cosim_launch.sh`. Each output
 directory must be absent or empty and must not be a symlink. Diagnostic mode
@@ -199,7 +201,7 @@ automatic promise for a later rebuild:
 
 | Component | Identity |
 |---|---|
-| QEMU source | 10.1.5; archive SHA-256 `1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693` |
+| QEMU source | 10.1.5; archive SHA-256 `1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693`; source-tree fingerprint `9e2d43798bdfe7baaa7e8413ddbc35fdf409c8b435a47e5f5d435af4fd25d4b1` |
 | QEMU binary | SHA-256 `89eccd422cac9ce206171a31ec1f5db963a3c76c2b3d8e8f53d1ebd058a9a5eb` |
 | Guest OS/kernel | Ubuntu 24.04.2 recipe; `6.8.0-79-generic` |
 | ROCm / DKMS | `7.0.0.70000-38~24.04`; `1:6.14.14.30100000-2204008.24.04` |
@@ -212,8 +214,22 @@ The Phase 4 trace rows were collected before the current qcow2-overlay
 hardening. They remain valid dispatch/interrupt mechanism evidence for their
 recorded source and binary, but they are not proof of the current launcher's
 disk-isolation contract. New acceptance runs must also archive
-`guest-overlay.json`, `guest-base-stat.txt` and `guest-build-meta.txt`, and must
-prove that the raw base image hash is unchanged before and after execution.
+`guest-overlay.json`, `guest-provenance.json`, `guest-build-meta.txt`,
+`guest-content-seal.txt`, the build inputs, and pre/post-run stats. The final
+verifier fully hashes the current raw base image once and joins it to the seal,
+kernel, m5, QEMU, submodule gitlink, and build recipe; any inode, ctime, mtime,
+or size drift across the run fails acceptance.
+
+The trust boundary is the owner of the local repository and build directory.
+The clean HEAD anchors the tracked builder, validator, and input locks; the
+final verifier fully rehashes the Guest image and kernel. The live
+`guest-content-seal.txt` is the trust root for that local build output. Strict
+v2 therefore detects stale evidence, partial replacement, and runtime drift,
+but does not claim to resist a malicious actor who can write the workspace and
+coherently forge every local build artifact. Cross-party attestation requires
+exporting the final matrix, seal, and matching Git commit to independent
+read-only or signed storage, which is outside the local learning environment's
+acceptance scope.
 
 ## 5. Artifact acceptance contract
 
@@ -231,7 +247,8 @@ An operator artifact normally contains:
 | binary identity | `patch/binary-provenance.txt` |
 | lifecycle | `runner-category.txt`, `launcher-category.txt`, `cleanup-status.txt` |
 | resource state | process, socket and `/dev/shm` snapshots |
-| disk isolation on new runs | `guest-overlay.json`, `guest-base-stat.txt`, `guest-build-meta.txt` |
+| Guest build and disk isolation | `guest-overlay.json`, `guest-provenance.json`, `guest-build-meta.txt`, `guest-content-seal.txt`, `guest.lock`, `guest-overlay.patch`, `guest-base-stat.txt`, `guest-base-stat-pre.json`, `guest-base-stat-post.json` |
+| container identity | name, command, arguments, running state, OOM state, and restart state in `docker-inspect.json` |
 
 Strict v2 PASS requires `COSIM_STRICT_ACCEPTANCE=1`, clean top-level and gem5
 source trees, and all of the following from one artifact: exact program
@@ -239,7 +256,9 @@ identity, compile exit 0, test exit 0, exactly one `[PASS] <program>`, no FAIL
 marker or timeout/early simulator exit, one effective HSA interrupt value,
 agreement between the manifest and effective invocation/timeouts, complete
 source/binary provenance, full QEMU/gem5 evidence, and verified cleanup. An
-ordinary learning or dirty-replay run defaults to diagnostic mode and is not a
+accepted `gem5.log` must also show, inside that row's test window, a same-kernel
+launch, workgroup dispatch, `WgCompl`, and kernel completion sequence, with
+argv matching `docker-inspect.json`. An ordinary learning or dirty-replay run defaults to diagnostic mode and is not a
 strict v2 PASS. Only artifacts recording `COSIM_STRICT_ACCEPTANCE=1` may enter
 the final v2 matrix.
 
@@ -531,5 +550,9 @@ builds, logs, and `artifacts/` must not enter a commit.
 - The strict runner rejects `--gem5-bin` outside the current `gem5/` source
   tree so an alternate-worktree binary cannot be mixed with this tree's Python
   config/commit; this is an explicit provenance boundary.
+- Strict v2 is local single-user acceptance, not cryptographic attestation.
+  Coordinated rewriting of all Guest build/runtime evidence by the same UID,
+  Docker/root-equivalent access, or a host administrator is outside its
+  guarantees.
 - A new source, Guest, QEMU, gem5 binary, environment mode or launcher contract
   requires new artifacts. Do not relabel an old PASS as current validation.

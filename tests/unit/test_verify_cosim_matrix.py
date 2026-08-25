@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -16,7 +17,22 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.verify_cosim_matrix import SCHEMA, verify_matrix  # noqa: E402
+from scripts.guest_provenance import (  # noqa: E402
+    LOCK_KEYS as GUEST_LOCK_KEYS,
+    META_KEYS as GUEST_META_KEYS,
+    SEAL_KEYS as GUEST_SEAL_KEYS,
+    recipe_fingerprint as guest_recipe_fingerprint,
+)
+from scripts.cosim_log_evidence import render_guest_run_script  # noqa: E402
+from scripts.verify_cosim_matrix import (  # noqa: E402
+    RUN_PREFLIGHT_CHECK_IDS,
+    RUN_PREFLIGHT_REQUIRED_IDS,
+    SCHEMA,
+    _array_fingerprint,
+    _directory_fingerprint,
+    _hash_file,
+    verify_matrix,
+)
 
 
 MANIFEST_FIELDS = (
@@ -93,6 +109,48 @@ LOCAL_MATRIX_FIELDS = (
     "test_timeout",
     "guest_run_timeout",
 )
+STRICT_DEBUG_FLAGS = "HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo"
+GEM5_LOG_TEXT = (
+    "2026-01-01T00:00:00.100000000Z command line: "
+    "/gem5/build/VEGA_X86/gem5.opt "
+    f"--debug-flags={STRICT_DEBUG_FLAGS} "
+    "--socket-path=/tmp/gem5-mi300x-unit-vector.sock "
+    "--shmem-path=/mi300x-vram-unit-vector "
+    "--shmem-host-path=/cosim-guest-ram-unit-vector\n"
+    "2026-01-01T00:00:00.200000000Z src/dev/amdgpu/mi300x_vfio_user.cc:312: "
+    "info: MI300XVfioUser: client connected (vfio-user)\n"
+    "2026-01-01T00:00:01.100000000Z 10: "
+    "system.Shader.gpu_cmd_proc.dispatcher: launching kernel: "
+    "Some kernel, dispatch ID: 0\n"
+    "2026-01-01T00:00:01.200000000Z 11: system.Shader: "
+    "Dispatching a workgroup to CU 0: WG 0\n"
+    "2026-01-01T00:00:01.300000000Z 12: dispatcher: notify WgCompl 0\n"
+    "2026-01-01T00:00:01.400000000Z 13: dispatcher: Completed kernel 0\n"
+)
+GEM5_LOG_SHA256 = hashlib.sha256(GEM5_LOG_TEXT.encode()).hexdigest()
+GEM5_DOCKER_ARGS = (
+    f"--debug-flags={STRICT_DEBUG_FLAGS}",
+    "--socket-path=/tmp/gem5-mi300x-unit-vector.sock",
+    "--shmem-path=/mi300x-vram-unit-vector",
+    "--shmem-host-path=/cosim-guest-ram-unit-vector",
+)
+QEMU_SIGTERM_LINE = (
+    "\x1b[?2004hroot@gem5:~# qemu-system-x86_64: "
+    "terminating on signal 15 from pid 1 (/bin/bash)"
+)
+UNIT_RUN_SHA256 = hashlib.sha256(b"unit-vector").hexdigest()
+UNIT_COMPILE_TOKEN = f"COSIM_COMPILE_DONE_vector_add_{UNIT_RUN_SHA256}"
+UNIT_TEST_TOKEN = f"COSIM_TEST_DONE_vector_add_{UNIT_RUN_SHA256}"
+QEMU_LOG_TEXT = (
+    "  Run-ID:     unit-vector\n"
+    "[COSIM_ENV] HSA_ENABLE_INTERRUPT=0\n"
+    "[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=30\n"
+    f"__{UNIT_COMPILE_TOKEN}__:0\n"
+    "[PASS] vector_add\n"
+    f"__{UNIT_TEST_TOKEN}__:0\n"
+    f"{QEMU_SIGTERM_LINE}\n"
+)
+QEMU_LOG_SHA256 = hashlib.sha256(QEMU_LOG_TEXT.encode()).hexdigest()
 
 
 def sha256(path: Path) -> str:
@@ -157,6 +215,48 @@ def replace_key_value(path: Path, key: str, value: str) -> None:
     path.write_text("\n".join(output) + "\n", encoding="utf-8")
 
 
+class HashCacheTests(unittest.TestCase):
+    def test_same_path_replacement_does_not_reuse_stale_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "payload"
+            path.write_bytes(b"AAAA")
+            before = path.stat()
+            cache = {}
+            first = _hash_file(path, cache)
+            replacement = path.with_name("replacement")
+            replacement.write_bytes(b"BBBB")
+            os.utime(
+                replacement,
+                ns=(before.st_atime_ns, before.st_mtime_ns),
+            )
+            os.replace(replacement, path)
+            second = _hash_file(path, cache)
+            self.assertNotEqual(first, second)
+            self.assertEqual(hashlib.sha256(b"BBBB").hexdigest(), second)
+
+
+def path_stat(path: Path) -> dict[str, object]:
+    info = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": info.st_size,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
+
+
+def write_key_values(
+    path: Path, keys: tuple[str, ...], values: dict[str, str]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(f"{key}={values[key]}\n" for key in keys),
+        encoding="utf-8",
+    )
+
+
 class MatrixFixture:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -166,12 +266,326 @@ class MatrixFixture:
         self.source = root / "tests" / "kernels" / "vector_add.cpp"
         self.test_binary = self.staging / "build" / "vector_add"
         self.gem5_binary = root / "gem5" / "build" / "VEGA_X86" / "gem5.opt"
+        self.resources = root / "gem5-resources"
+        self.guest_template = self.resources / "src/x86-ubuntu-gpu-ml"
+        self.disk_image = self.guest_template / "disk-image/x86-ubuntu-rocm70"
+        self.kernel = self.guest_template / "vmlinux-rocm70"
+        self.m5 = self.guest_template / "files/m5"
+        self.qemu_binary = (
+            root / ".local/cosim/qemu/10.1.5/bin/qemu-system-x86_64"
+        )
+        self.qemu_img = root / ".local/cosim/qemu/10.1.5/bin/qemu-img"
+        self.qemu_source = root / ".local/cosim/src/qemu-10.1.5"
+        self.qemu_build_meta = (
+            root / ".local/cosim/build/qemu-10.1.5/.cosim-build-meta"
+        )
+        self.toolchain_lock = root / "configs/cosim/toolchain.lock"
+        self.guest_build_meta = (
+            root / ".local/cosim/build/guest/.cosim-build-meta"
+        )
+        self.guest_content_seal = (
+            root / ".local/cosim/build/guest/.cosim-content-seal"
+        )
+        self.guest_lock = root / "configs/cosim/guest.lock"
+        self.guest_patch = (
+            root / "scripts/patches/0002-guest-core-reproducible.patch"
+        )
         self.manifest = root / "run-manifest.tsv"
         self.matrix = root / "matrix.tsv"
         self.output = root / "verification.json"
         self.manifest_rows: list[dict[str, str]] = []
         self.matrix_rows: list[dict[str, str]] = []
         self._create()
+
+    @staticmethod
+    def _git(repo: Path, *arguments: str, output: bool = False) -> str:
+        completed = subprocess.run(
+            ("git", "-C", str(repo), *arguments),
+            check=True,
+            stdout=subprocess.PIPE if output else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return completed.stdout.strip() if output else ""
+
+    @classmethod
+    def _configure_git(cls, repo: Path) -> None:
+        cls._git(repo, "config", "user.name", "Test")
+        cls._git(repo, "config", "user.email", "test@example.invalid")
+
+    @staticmethod
+    def _guest_lock_values() -> dict[str, str]:
+        values: dict[str, str] = {}
+        for index, key in enumerate(GUEST_LOCK_KEYS, 1):
+            if key.endswith("_URL"):
+                values[key] = f"https://example.invalid/{key.lower()}"
+            elif key.endswith("_SHA256"):
+                values[key] = f"{index:064x}"
+            else:
+                values[key] = f"value-{index}"
+        values["GUEST_LOCK_VERSION"] = "1"
+        values["ROCM_KEY_FINGERPRINT"] = "A" * 40
+        values["PACKER_VERSION"] = "1.10.0"
+        values["PACKER_QEMU_PLUGIN_VERSION"] = "1.1.6"
+        values["AMDGPU_DKMS_VERSION"] = "fixture-dkms"
+        values["ROCM_VERSION"] = "fixture-rocm"
+        values["GUEST_KERNEL"] = "fixture-kernel"
+        return values
+
+    def _write_qemu_provenance(self) -> None:
+        source_fingerprint = _directory_fingerprint(self.qemu_source, {})
+        configure_args = (
+            f"--prefix={self.root / '.local/cosim/qemu/10.1.5'}",
+            "--target-list=x86_64-softmmu",
+            "--disable-download",
+            "--disable-docs",
+            "--disable-gtk",
+            "--disable-sdl",
+            "--disable-werror",
+            "--enable-kvm",
+            "--enable-slirp",
+            "--enable-tools",
+            "--enable-virtfs",
+        )
+        source_sha = "1" * 64
+        configure_fingerprint = _array_fingerprint(configure_args)
+        build_fingerprint = _array_fingerprint(
+            (source_sha, source_fingerprint, configure_fingerprint)
+        )
+        metadata = {
+            "version": "10.1.5",
+            "source_url": "https://download.qemu.org/qemu-10.1.5.tar.xz",
+            "source_sha256": source_sha,
+            "signature_url": "https://download.qemu.org/qemu-10.1.5.tar.xz.sig",
+            "signing_key": "CEACC9E15534EBABB82D3FA03353C9CEF108B584",
+            "signing_verified": "true",
+            "initial_source_fingerprint": source_fingerprint,
+            "source_fingerprint": source_fingerprint,
+            "source_pristine": "true",
+            "configure_fingerprint": configure_fingerprint,
+            "build_fingerprint": build_fingerprint,
+            "configure_args": " ".join(configure_args),
+            "binary": str(self.qemu_binary.resolve()),
+            "binary_sha256": sha256(self.qemu_binary),
+            "qemu_img": str(self.qemu_img.resolve()),
+            "qemu_img_sha256": sha256(self.qemu_img),
+            "compiler": "cc fixture 1.0",
+            "timestamp": "2026-01-01T00:00:00Z",
+        }
+        write_key_values(
+            self.qemu_build_meta,
+            tuple(metadata),
+            metadata,
+        )
+        (self.artifact / "qemu-build-meta.txt").write_bytes(
+            self.qemu_build_meta.read_bytes()
+        )
+        (self.artifact / "toolchain.lock").write_bytes(
+            self.toolchain_lock.read_bytes()
+        )
+
+    def _write_guest_provenance(self) -> None:
+        lock_sha = sha256(self.guest_lock)
+        patch_sha = sha256(self.guest_patch)
+        image_sha = sha256(self.disk_image)
+        kernel_sha = sha256(self.kernel)
+        m5_sha = sha256(self.m5)
+        qemu_sha = sha256(self.qemu_binary)
+        qemu_img_sha = sha256(self.qemu_img)
+        build_script_sha = sha256(self.root / "scripts/cosim_build.sh")
+        validator_sha = sha256(self.root / "scripts/guest_provenance.py")
+        recipe = guest_recipe_fingerprint(
+            (
+                "guest-recipe-v2",
+                f"build_top_commit={self.head_commit}",
+                f"build_script={build_script_sha}",
+                f"provenance_validator={validator_sha}",
+                f"resources_commit={self.resources_commit}",
+                f"template_tree={self.template_tree}",
+                f"overlay_patch={patch_sha}",
+                f"m5={m5_sha}",
+                f"qemu={qemu_sha}",
+                f"qemu_img={qemu_img_sha}",
+                f"packer={self.guest_lock_values['PACKER_SHA256']}",
+                "packer_plugin="
+                f"{self.guest_lock_values['PACKER_QEMU_PLUGIN_SHA256']}",
+                f"guest_lock={lock_sha}",
+            )
+        )
+        metadata = {
+            "component": "guest",
+            "schema": "2",
+            "build_top_commit": self.head_commit,
+            "build_script_sha256": build_script_sha,
+            "provenance_validator_sha256": validator_sha,
+            "resources_commit": self.resources_commit,
+            "template_tree": self.template_tree,
+            "overlay_patch_sha256": patch_sha,
+            "guest_lock_sha256": lock_sha,
+            "recipe_fingerprint": recipe,
+            "packer_version": self.guest_lock_values["PACKER_VERSION"],
+            "packer_sha256": self.guest_lock_values["PACKER_SHA256"],
+            "packer_qemu_plugin_version": self.guest_lock_values[
+                "PACKER_QEMU_PLUGIN_VERSION"
+            ],
+            "packer_qemu_plugin_sha256": self.guest_lock_values[
+                "PACKER_QEMU_PLUGIN_SHA256"
+            ],
+            "ubuntu_iso_url": self.guest_lock_values["UBUNTU_ISO_URL"],
+            "ubuntu_iso_sha256": self.guest_lock_values[
+                "UBUNTU_ISO_SHA256"
+            ],
+            "amdgpu_dkms_version": self.guest_lock_values[
+                "AMDGPU_DKMS_VERSION"
+            ],
+            "rocm_version": self.guest_lock_values["ROCM_VERSION"],
+            "kernel_version": self.guest_lock_values["GUEST_KERNEL"],
+            "qemu_binary_sha256": qemu_sha,
+            "qemu_img_sha256": qemu_img_sha,
+            "m5_sha256": m5_sha,
+            "image": str(self.disk_image.resolve()),
+            "image_sha256": image_sha,
+            "image_size": str(self.disk_image.stat().st_size),
+            "kernel": str(self.kernel.resolve()),
+            "kernel_sha256": kernel_sha,
+            "kernel_size": str(self.kernel.stat().st_size),
+            "artifacts": str(
+                self.root
+                / "artifacts/amd-gpu-learning-env/build/guest/unit-build"
+            ),
+            "timestamp": "2026-01-01T00:00:00Z",
+        }
+        write_key_values(self.guest_build_meta, GUEST_META_KEYS, metadata)
+        metadata_sha = sha256(self.guest_build_meta)
+
+        image_stat = path_stat(self.disk_image)
+        seal = {
+            "component": "guest-content-seal",
+            "schema": "1",
+            "guest_build_meta_sha256": metadata_sha,
+            "image": str(image_stat["path"]),
+            "image_sha256": image_sha,
+            "image_size": str(image_stat["size"]),
+            "image_device": str(image_stat["device"]),
+            "image_inode": str(image_stat["inode"]),
+            "image_mtime_ns": str(image_stat["mtime_ns"]),
+            "image_ctime_ns": str(image_stat["ctime_ns"]),
+            "sealed_at": "2026-01-01T00:00:00.050000000Z",
+        }
+        write_key_values(self.guest_content_seal, GUEST_SEAL_KEYS, seal)
+        seal_sha = sha256(self.guest_content_seal)
+
+        (self.artifact / "guest-build-meta.txt").write_bytes(
+            self.guest_build_meta.read_bytes()
+        )
+        (self.artifact / "guest-content-seal.txt").write_bytes(
+            self.guest_content_seal.read_bytes()
+        )
+        (self.artifact / "guest.lock").write_bytes(self.guest_lock.read_bytes())
+        (self.artifact / "guest-overlay.patch").write_bytes(
+            self.guest_patch.read_bytes()
+        )
+
+        report = {
+            "schema": "cosim-guest-provenance/v2",
+            "run_id": "unit-vector",
+            "validated_at": "2026-01-01T00:00:00.200000000Z",
+            "guest_build_meta": {
+                "path": str(self.guest_build_meta.resolve()),
+                "sha256": metadata_sha,
+            },
+            "guest_content_seal": {
+                "path": str(self.guest_content_seal.resolve()),
+                "sha256": seal_sha,
+            },
+            "source": {
+                "build_top_commit": self.head_commit,
+                "validated_top_head": self.head_commit,
+                "build_script_sha256": build_script_sha,
+                "provenance_validator_sha256": validator_sha,
+                "resources_gitlink": self.resources_commit,
+                "resources_head": self.resources_commit,
+                "template_tree": self.template_tree,
+                "guest_lock_sha256": lock_sha,
+                "overlay_patch_sha256": patch_sha,
+                "recipe_fingerprint": recipe,
+            },
+            "toolchain": {
+                "qemu_binary_sha256": qemu_sha,
+                "qemu_img_sha256": qemu_img_sha,
+            },
+            "image": {
+                **image_stat,
+                "sha256": image_sha,
+                "validation_method": "sealed-stat",
+            },
+            "kernel": {
+                **path_stat(self.kernel),
+                "sha256": kernel_sha,
+                "validation_method": "full-sha256",
+            },
+            "m5": {
+                **path_stat(self.m5),
+                "sha256": m5_sha,
+                "validation_method": "full-sha256",
+            },
+        }
+        report_bytes = (
+            json.dumps(report, indent=2, sort_keys=True) + "\n"
+        ).encode()
+        (self.artifact / "guest-provenance.json").write_bytes(report_bytes)
+        preflight_dir = self.artifact / "preflight"
+        preflight_dir.mkdir(parents=True, exist_ok=True)
+        (preflight_dir / "guest-provenance.json").write_bytes(report_bytes)
+
+        base_stat = {
+            "schema": "cosim-guest-base-stat/v2",
+            "path": str(report["image"]["path"]),
+            "image_sha256": image_sha,
+            "validation_method": "sealed-stat",
+            "size": str(image_stat["size"]),
+            "device": str(image_stat["device"]),
+            "inode": str(image_stat["inode"]),
+            "mtime_ns": str(image_stat["mtime_ns"]),
+            "ctime_ns": str(image_stat["ctime_ns"]),
+            "guest_build_meta_sha256": metadata_sha,
+            "guest_content_seal_sha256": seal_sha,
+        }
+        base_keys = (
+            "schema",
+            "path",
+            "image_sha256",
+            "validation_method",
+            "size",
+            "device",
+            "inode",
+            "mtime_ns",
+            "ctime_ns",
+            "guest_build_meta_sha256",
+            "guest_content_seal_sha256",
+        )
+        write_key_values(
+            self.artifact / "guest-base-stat.txt", base_keys, base_stat
+        )
+        pre_stat_report = {
+            "schema": "cosim-guest-post-stat/v1",
+            "run_id": "unit-vector",
+            "captured_at": "2026-01-01T00:00:00.500000000Z",
+            "image": image_stat,
+            "matches_pre": True,
+        }
+        post_stat_report = {
+            **pre_stat_report,
+            "captured_at": "2026-01-01T00:00:03.000000000Z",
+        }
+        pre_stat_bytes = (
+            json.dumps(pre_stat_report, indent=2, sort_keys=True) + "\n"
+        ).encode()
+        post_stat_bytes = (
+            json.dumps(post_stat_report, indent=2, sort_keys=True) + "\n"
+        ).encode()
+        (self.artifact / "guest-base-stat-pre.json").write_bytes(pre_stat_bytes)
+        (self.artifact / "guest-base-stat-post.json").write_bytes(post_stat_bytes)
 
     def _create(self) -> None:
         (self.root / "scripts").mkdir(parents=True)
@@ -189,8 +603,23 @@ class MatrixFixture:
             f"source_fingerprint() {{ printf '%s\\n' {'c' * 64!r}; }}\n",
             encoding="utf-8",
         )
+        (self.root / "scripts" / "guest_provenance.py").write_text(
+            "#!/usr/bin/env python3\n# synthetic provenance validator\n",
+            encoding="utf-8",
+        )
         (self.root / "scripts" / "Dockerfile.run").write_text(
             "FROM synthetic.invalid/gem5-run\n",
+            encoding="utf-8",
+        )
+        self.guest_lock_values = self._guest_lock_values()
+        write_key_values(
+            self.guest_lock,
+            GUEST_LOCK_KEYS,
+            self.guest_lock_values,
+        )
+        self.guest_patch.parent.mkdir(parents=True, exist_ok=True)
+        self.guest_patch.write_text(
+            "synthetic Guest overlay patch\n",
             encoding="utf-8",
         )
         self.source.parent.mkdir(parents=True)
@@ -203,6 +632,45 @@ class MatrixFixture:
         )
         self.test_binary.write_bytes(synthetic_hip_executable())
         self.test_binary.chmod(0o755)
+
+        self.guest_template.mkdir(parents=True)
+        (self.guest_template / "files").mkdir()
+        (self.guest_template / "recipe.txt").write_text(
+            "synthetic Guest recipe\n",
+            encoding="utf-8",
+        )
+        (self.guest_template / "files" / ".keep").write_text(
+            "tracked\n",
+            encoding="utf-8",
+        )
+        (self.resources / ".gitignore").write_text(
+            "/src/x86-ubuntu-gpu-ml/disk-image/\n"
+            "/src/x86-ubuntu-gpu-ml/vmlinux-rocm70\n"
+            "/src/x86-ubuntu-gpu-ml/files/m5\n",
+            encoding="utf-8",
+        )
+        subprocess.run(("git", "init", "-q", str(self.resources)), check=True)
+        self._configure_git(self.resources)
+        self._git(self.resources, "add", ".")
+        self._git(self.resources, "commit", "-qm", "fixture")
+        self.resources_commit = self._git(
+            self.resources,
+            "rev-parse",
+            "HEAD",
+            output=True,
+        )
+        self.template_tree = self._git(
+            self.resources,
+            "rev-parse",
+            f"{self.resources_commit}:src/x86-ubuntu-gpu-ml",
+            output=True,
+        )
+
+        self.disk_image.parent.mkdir(parents=True)
+        self.disk_image.write_bytes(b"synthetic guest disk\n")
+        self.kernel.write_bytes(b"synthetic guest kernel\n")
+        self.m5.write_bytes(b"synthetic guest m5\n")
+
         self.gem5_binary.parent.mkdir(parents=True)
         self.gem5_binary.write_bytes(b"synthetic gem5 binary\n")
         self.gem5_binary.chmod(0o755)
@@ -270,7 +738,7 @@ class MatrixFixture:
         )
 
         current_lock = self.root / "configs" / "cosim" / "gem5-baseline.lock"
-        current_lock.parent.mkdir(parents=True)
+        current_lock.parent.mkdir(parents=True, exist_ok=True)
         current_lock.write_text(
             "\n".join(
                 (
@@ -285,27 +753,61 @@ class MatrixFixture:
             ),
             encoding="utf-8",
         )
+        (current_lock.parent / "strict-acceptance-rows.json").write_text(
+            json.dumps(
+                {
+                    "schema": "cosim-strict-expected-rows/v1",
+                    "rows": [
+                        {
+                            "program": "vector_add",
+                            "expected_hsa_interrupt": "0",
+                        }
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         gem5_baseline_lock = self.patch / "gem5-baseline.lock"
         gem5_baseline_lock.write_bytes(current_lock.read_bytes())
 
-        self.qemu_binary = (
-            self.root / ".local/cosim/qemu/10.1.5/bin/qemu-system-x86_64"
+        self.qemu_source.mkdir(parents=True)
+        (self.qemu_source / "README.rst").write_text(
+            "synthetic qemu source\n", encoding="utf-8"
         )
+        qemu_source_fingerprint = _directory_fingerprint(self.qemu_source, {})
+        write_key_values(
+            self.toolchain_lock,
+            (
+                "QEMU_VERSION",
+                "QEMU_SOURCE_URL",
+                "QEMU_SIGNATURE_URL",
+                "QEMU_RELEASE_KEY_FINGERPRINT",
+                "QEMU_RELEASE_KEY_URL",
+                "QEMU_SOURCE_SHA256",
+                "QEMU_SOURCE_FINGERPRINT",
+            ),
+            {
+                "QEMU_VERSION": "10.1.5",
+                "QEMU_SOURCE_URL": "https://download.qemu.org/qemu-10.1.5.tar.xz",
+                "QEMU_SIGNATURE_URL": "https://download.qemu.org/qemu-10.1.5.tar.xz.sig",
+                "QEMU_RELEASE_KEY_FINGERPRINT": "CEACC9E15534EBABB82D3FA03353C9CEF108B584",
+                "QEMU_RELEASE_KEY_URL": "https://keys.openpgp.org/vks/v1/by-fingerprint/CEACC9E15534EBABB82D3FA03353C9CEF108B584",
+                "QEMU_SOURCE_SHA256": "1" * 64,
+                "QEMU_SOURCE_FINGERPRINT": qemu_source_fingerprint,
+            },
+        )
+
         self.qemu_binary.parent.mkdir(parents=True)
         self.qemu_binary.write_bytes(b"synthetic qemu binary\n")
         self.qemu_binary.chmod(0o755)
-        self.disk_image = (
-            self.root
-            / "gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
-        )
-        self.disk_image.parent.mkdir(parents=True)
-        self.disk_image.write_bytes(b"synthetic guest disk\n")
-        self.kernel = (
-            self.root
-            / "gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
-        )
-        self.kernel.parent.mkdir(parents=True, exist_ok=True)
-        self.kernel.write_bytes(b"synthetic guest kernel\n")
+        self.qemu_img.write_bytes(b"synthetic qemu-img binary\n")
+        self.qemu_img.chmod(0o755)
+        build_lock = self.root / ".local/cosim/build.lock"
+        build_lock.parent.mkdir(parents=True, exist_ok=True)
+        build_lock.write_bytes(b"")
 
         (self.root / ".gitignore").write_text(
             "/.local/\n/artifacts/\n/run-manifest.tsv\n/matrix.tsv\n",
@@ -340,6 +842,8 @@ class MatrixFixture:
         self.head_commit = subprocess.check_output(
             ("git", "-C", str(self.root), "rev-parse", "HEAD"), text=True
         ).strip()
+        self._write_qemu_provenance()
+        self._write_guest_provenance()
 
         repo_patch = self.patch / "repo.patch"
         repo_status = self.patch / "repo-status.txt"
@@ -421,7 +925,8 @@ class MatrixFixture:
                     f"gem5_binary={self.gem5_binary}",
                     "gem5_docker_image_name=gem5-run:local",
                     f"gem5_docker_image=sha256:{'e' * 64}",
-                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB",
+                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
+                    f"debug-flags={STRICT_DEBUG_FLAGS}",
                     f"output_dir={self.artifact}",
                     f"artifact_dir={self.artifact}",
                     "artifact_dir_pattern=-",
@@ -434,8 +939,9 @@ class MatrixFixture:
                     f"argv0={self.root / 'scripts' / 'run_cosim_tests.sh'}",
                     "argv=--boot-timeout 240 --test-timeout 30 "
                     "--guest-run-timeout 1800 "
-                    f"--output-dir {self.artifact} vector_add",
-                    "passthrough_args=",
+                    f"--output-dir {self.artifact} "
+                    f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
+                    f"passthrough_args= --gem5-debug {STRICT_DEBUG_FLAGS}",
                     "",
                 )
             ),
@@ -450,31 +956,36 @@ class MatrixFixture:
                     f"share_dir={self.staging}",
                     f"gem5_binary={self.gem5_binary}",
                     "gem5_container_binary=/gem5/build/VEGA_X86/gem5.opt",
-                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB",
+                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
+                    f"debug-flags={STRICT_DEBUG_FLAGS}",
                     "gem5_docker_image=gem5-run:local",
                     "qemu_binary="
                     f"{self.root / '.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64'}",
+                    f"qemu_img={self.qemu_img}",
                     "disk_image="
                     f"{self.root / 'gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70'}",
                     "kernel="
                     f"{self.root / 'gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70'}",
+                    "strict_acceptance=1",
                     "host_cpus=4",
                     "gem5_init_timeout=120",
                     f"cwd={self.root}",
                     f"argv0={self.root / 'scripts' / 'cosim_launch.sh'}",
                     f"argv=--share-dir {self.staging} "
-                    f"--artifact-dir {self.artifact}",
+                    f"--artifact-dir {self.artifact} "
+                    f"--gem5-debug {STRICT_DEBUG_FLAGS}",
                     "",
                 )
             ),
             encoding="utf-8",
         )
         (self.artifact / "guest-run.sh").write_text(
-            "#!/bin/bash\n"
-            "echo '[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=30'\n"
-            'echo "__COSIM_COMPILE_DONE_vector_add_1__:${build_rc}"\n'
-            "TEST_TIMEOUT_SECS=30 ./run_tests.sh vector_add\n"
-            'echo "__COSIM_TEST_DONE_vector_add_1__:${rc}"\n',
+            render_guest_run_script(
+                program="vector_add",
+                run_id="unit-vector",
+                hsa_enable_interrupt="0",
+                test_timeout="30",
+            ),
             encoding="utf-8",
         )
         (self.artifact / "runner-metadata.txt").write_text(
@@ -500,7 +1011,8 @@ class MatrixFixture:
                     f"gem5_binary={self.gem5_binary}",
                     "gem5_docker_image_name=gem5-run:local",
                     f"gem5_docker_image=sha256:{'e' * 64}",
-                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB",
+                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
+                    f"debug-flags={STRICT_DEBUG_FLAGS}",
                     "artifact_dir_pattern=-",
                     "guest_bridge_policy=artifact-local",
                     f"guest_bridge_host={self.staging}",
@@ -510,6 +1022,10 @@ class MatrixFixture:
                     "exit_code=0",
                     "pass_count=1",
                     "fail_count=0",
+                    "guest_test_started_at=2026-01-01T00:00:01.000000000Z",
+                    "guest_test_finished_at=2026-01-01T00:00:02.000000000Z",
+                    f"qemu_log_sha256={QEMU_LOG_SHA256}",
+                    f"gem5_log_sha256={GEM5_LOG_SHA256}",
                     f"source_snapshot={self.patch / 'source-snapshot.txt'}",
                     f"gem5_baseline_lock={gem5_baseline_lock}",
                     f"gem5_baseline_lock_sha256={sha256(gem5_baseline_lock)}",
@@ -524,15 +1040,11 @@ class MatrixFixture:
             encoding="utf-8",
         )
         (self.artifact / "qemu.log").write_text(
-            "[COSIM_ENV] HSA_ENABLE_INTERRUPT=0\n"
-            "[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=30\n"
-            "__COSIM_COMPILE_DONE_vector_add_1__:0\n"
-            "[PASS] vector_add\n"
-            "__COSIM_TEST_DONE_vector_add_1__:0\n",
+            QEMU_LOG_TEXT,
             encoding="utf-8",
         )
         (self.artifact / "gem5.log").write_text(
-            "gem5 GPU execution\n", encoding="utf-8"
+            GEM5_LOG_TEXT, encoding="utf-8"
         )
         (self.artifact / "cleanup-status.txt").write_text(
             "result=PASS\nprimary_category=test_pass\nsecondary_category=none\n",
@@ -542,8 +1054,21 @@ class MatrixFixture:
             json.dumps(
                 [
                     {
+                        "Name": "/gem5-cosim-unit-vector",
                         "Image": f"sha256:{'e' * 64}",
                         "Config": {"Image": "gem5-run:local"},
+                        "Path": "/gem5/build/VEGA_X86/gem5.opt",
+                        "Args": list(GEM5_DOCKER_ARGS),
+                        "State": {
+                            "Status": "running",
+                            "Running": True,
+                            "Paused": False,
+                            "Restarting": False,
+                            "OOMKilled": False,
+                            "Dead": False,
+                            "ExitCode": 0,
+                        },
+                        "RestartCount": 0,
                     }
                 ],
                 indent=2,
@@ -574,42 +1099,28 @@ class MatrixFixture:
             + "\n",
             encoding="utf-8",
         )
-        disk_mtime = subprocess.check_output(
-            ("stat", "-c", "%y", str(self.disk_image)), text=True
-        ).strip()
-        (self.artifact / "guest-base-stat.txt").write_text(
-            f"path={self.disk_image}\n"
-            f"size={self.disk_image.stat().st_size}\n"
-            f"mtime={disk_mtime}\n",
-            encoding="utf-8",
-        )
         preflight_dir = self.artifact / "preflight"
-        preflight_dir.mkdir()
+        preflight_dir.mkdir(exist_ok=True)
         preflight = {
             "schema": "cosim-preflight-v1",
             "profile": "run",
-            "generated_at": "2026-01-01T00:00:00Z",
+            "generated_at": "2026-01-01T00:00:00.100000000Z",
             "repo_root": str(self.root),
             "overall_status": "PASS",
             "required_failure_count": 0,
             "checks": [
                 {
-                    "id": "run.gem5_provenance",
+                    "id": check_id,
                     "status": "PASS",
-                    "required": True,
+                    "required": check_id in RUN_PREFLIGHT_REQUIRED_IDS,
                     "summary": "synthetic",
-                    "detail": str(gem5_build_meta),
-                },
-                {
-                    "id": "run.qemu_provenance",
-                    "status": "PASS",
-                    "required": True,
-                    "summary": "synthetic",
-                    "detail": str(
-                        self.root
-                        / ".local/cosim/build/qemu-10.1.5/.cosim-build-meta"
+                    "detail": (
+                        "COSIM_STRICT_ACCEPTANCE=1"
+                        if check_id == "run.strict_acceptance"
+                        else "synthetic"
                     ),
-                },
+                }
+                for check_id in sorted(RUN_PREFLIGHT_CHECK_IDS)
             ],
         }
         (preflight_dir / "preflight.json").write_text(
@@ -639,6 +1150,7 @@ class MatrixFixture:
                     "fail_count": 0,
                     "ok": True,
                 },
+                "gem5_gpu_execution": {"ok": True},
                 "program_identity": {
                     "ok": True,
                     "program_binary": "tests/build/vector_add",
@@ -647,6 +1159,7 @@ class MatrixFixture:
                     "requested_program": "vector_add",
                     "runner_argument": "vector_add",
                 },
+                "qemu_completion": {"ok": True},
                 "required_evidence": {"missing": [], "ok": True},
                 "simulator_lifetime": {
                     "early_exit_observed": False,
@@ -671,6 +1184,8 @@ class MatrixFixture:
                 "gem5_binary": str(self.gem5_binary),
                 "gem5_sha256": sha256(self.gem5_binary),
                 "gem5_source_commit": self.gem5_commit,
+                "gem5_log_sha256": GEM5_LOG_SHA256,
+                "qemu_log_sha256": QEMU_LOG_SHA256,
             },
             "reason": "all_acceptance_gates_passed",
             "reasons": [],
@@ -716,7 +1231,8 @@ class MatrixFixture:
             "guest_test_prefix": "HSA_ENABLE_INTERRUPT=0",
             "expected_hsa_interrupt": "0",
             "gem5_binary": str(self.gem5_binary),
-            "gem5_config_args": "defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB",
+            "gem5_config_args": "defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
+            f"debug-flags={STRICT_DEBUG_FLAGS}",
             "output_dir": str(self.artifact),
             "artifact_dir": str(self.artifact),
             "artifact_dir_pattern": "-",
@@ -771,7 +1287,8 @@ class MatrixFixture:
             "test_timeout": "30",
             "guest_run_timeout": "1800",
             "guest_test_prefix": "HSA_ENABLE_INTERRUPT=0",
-            "gem5_config_args": "defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB",
+            "gem5_config_args": "defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
+            f"debug-flags={STRICT_DEBUG_FLAGS}",
             "artifact_dir_pattern": "-",
             "guest_bridge_policy": "artifact-local",
         }
@@ -816,6 +1333,47 @@ class VerifyCosimMatrixTests(unittest.TestCase):
     def verify(self) -> dict[str, object]:
         return verify_matrix(
             self.fixture.manifest, self.fixture.matrix, self.fixture.root
+        )
+
+    def synchronize_gem5_log_hash(self) -> str:
+        digest = sha256(self.fixture.artifact / "gem5.log")
+        replace_key_value(
+            self.fixture.artifact / "runner-metadata.txt",
+            "gem5_log_sha256",
+            digest,
+        )
+        verdict_path = self.fixture.artifact / "verdict.json"
+        verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+        verdict["provenance"]["gem5_log_sha256"] = digest
+        verdict_path.write_text(
+            json.dumps(verdict, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return digest
+
+    def synchronize_qemu_log_hash(self) -> str:
+        digest = sha256(self.fixture.artifact / "qemu.log")
+        replace_key_value(
+            self.fixture.artifact / "runner-metadata.txt",
+            "qemu_log_sha256",
+            digest,
+        )
+        verdict_path = self.fixture.artifact / "verdict.json"
+        verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+        verdict["provenance"]["qemu_log_sha256"] = digest
+        verdict_path.write_text(
+            json.dumps(verdict, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return digest
+
+    def mutate_docker_inspect(self, mutate) -> None:
+        path = self.fixture.artifact / "docker-inspect.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        mutate(payload[0])
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
 
     def mutate_program_identity(self, field: str, value: str) -> None:
@@ -880,6 +1438,7 @@ class VerifyCosimMatrixTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.synchronize_qemu_log_hash()
         verdict_path = self.fixture.artifact / "verdict.json"
         verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
         verdict["checks"]["effective_environment"]["hsa_enable_interrupt"] = value
@@ -919,15 +1478,23 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         runner = self.fixture.artifact / "runner-invocation.txt"
         runner_text = runner.read_text(encoding="utf-8")
         runner_text = runner_text.replace(
-            f"--output-dir {self.fixture.artifact} vector_add",
-            f"--output-dir {self.fixture.artifact} {option} {value} vector_add",
-        ).replace("passthrough_args=", f"passthrough_args= {option} {value}")
+            f"--output-dir {self.fixture.artifact} "
+            f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
+            f"--output-dir {self.fixture.artifact} {option} {value} "
+            f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
+        ).replace(
+            f"passthrough_args= --gem5-debug {STRICT_DEBUG_FLAGS}",
+            f"passthrough_args= {option} {value} "
+            f"--gem5-debug {STRICT_DEBUG_FLAGS}",
+        )
         runner.write_text(runner_text, encoding="utf-8")
         launcher = self.fixture.artifact / "launch-invocation.txt"
         launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(
-                f"--artifact-dir {self.fixture.artifact}",
-                f"--artifact-dir {self.fixture.artifact} {option} {value}",
+                f"--artifact-dir {self.fixture.artifact} "
+                f"--gem5-debug {STRICT_DEBUG_FLAGS}",
+                f"--artifact-dir {self.fixture.artifact} {option} {value} "
+                f"--gem5-debug {STRICT_DEBUG_FLAGS}",
             ),
             encoding="utf-8",
         )
@@ -963,7 +1530,8 @@ class VerifyCosimMatrixTests(unittest.TestCase):
     def test_zero_compute_units_are_rejected_even_when_coordinated(self) -> None:
         self.set_raw_passthrough("--num-cus", "0")
         self.set_structured_gem5_config(
-            "defaults:num-gpus=1,num-cus=0,host-mem=8G,vram-size=16GiB"
+            "defaults:num-gpus=1,num-cus=0,host-mem=8G,vram-size=16GiB;"
+            f"debug-flags={STRICT_DEBUG_FLAGS}"
         )
 
         result = self.verify()
@@ -1009,9 +1577,11 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         invocation = self.fixture.artifact / "runner-invocation.txt"
         invocation.write_text(
             invocation.read_text(encoding="utf-8").replace(
-                f"--output-dir {self.fixture.artifact} vector_add",
                 f"--output-dir {self.fixture.artifact} "
-                "--session-name ../../unsafe vector_add",
+                f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
+                f"--output-dir {self.fixture.artifact} "
+                "--session-name ../../unsafe "
+                f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
             ),
             encoding="utf-8",
         )
@@ -1062,9 +1632,11 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         invocation = self.fixture.artifact / "runner-invocation.txt"
         invocation.write_text(
             invocation.read_text(encoding="utf-8").replace(
-                f"--output-dir {self.fixture.artifact} vector_add",
                 f"--output-dir {self.fixture.artifact} "
-                "--gem5-debug $'Foo\\tBar' vector_add",
+                f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
+                f"--output-dir {self.fixture.artifact} "
+                "--num-cus $'2\\t3' "
+                f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
             ),
             encoding="utf-8",
         )
@@ -1120,18 +1692,40 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("binary_not_executable", error_codes(result))
 
-    def test_guest_completion_tokens_are_required(self) -> None:
+    def test_guest_script_preceding_exit_fails(self) -> None:
         guest_script = self.fixture.artifact / "guest-run.sh"
         guest_script.write_text(
-            "#!/bin/bash\n"
-            "echo '[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=30'\n"
-            "TEST_TIMEOUT_SECS=30 ./run_tests.sh vector_add\n",
+            guest_script.read_text(encoding="utf-8").replace(
+                "#!/bin/bash\n", "#!/bin/bash\nexit 0\n", 1
+            ),
             encoding="utf-8",
         )
 
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
-        self.assertIn("invalid_guest_completion_token", error_codes(result))
+        self.assertIn("guest_script_mismatch", error_codes(result))
+
+    def test_guest_script_missing_build_and_rc_fails(self) -> None:
+        guest_script = self.fixture.artifact / "guest-run.sh"
+        guest_script.write_text(
+            guest_script.read_text(encoding="utf-8").replace(
+                "make -j1\nbuild_rc=$?\n", "", 1
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("guest_script_mismatch", error_codes(result))
+
+    def test_guest_script_extra_completion_token_fails(self) -> None:
+        guest_script = self.fixture.artifact / "guest-run.sh"
+        with guest_script.open("a", encoding="utf-8") as handle:
+            handle.write(f'echo "__{UNIT_TEST_TOKEN}__:${{rc}}"\n')
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("guest_script_mismatch", error_codes(result))
 
     def test_noncanonical_screen_log_is_rejected(self) -> None:
         runner = self.fixture.artifact / "runner-invocation.txt"
@@ -1165,7 +1759,8 @@ class VerifyCosimMatrixTests(unittest.TestCase):
     def test_coherent_raw_and_structured_gem5_config_passes(self) -> None:
         self.set_raw_passthrough("--num-cus", "2")
         self.set_structured_gem5_config(
-            "defaults:num-gpus=1,num-cus=2,host-mem=8G,vram-size=16GiB"
+            "defaults:num-gpus=1,num-cus=2,host-mem=8G,vram-size=16GiB;"
+            f"debug-flags={STRICT_DEBUG_FLAGS}"
         )
 
         result = self.verify()
@@ -1202,6 +1797,268 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         written = json.loads(self.fixture.output.read_text(encoding="utf-8"))
         self.assertEqual(result, written)
+
+    def test_verifier_rescan_rejects_fatal_appended_after_verdict(self) -> None:
+        with (self.fixture.artifact / "gem5.log").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                "2026-01-01T00:00:01.400000000Z "
+                "src/base/logging.cc:10: fatal: appended after verdict\n"
+            )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("simulator_fatal", error_codes(result))
+        self.assertIn("gem5_log_hash_mismatch", error_codes(result))
+
+    def test_verifier_rescan_rejects_log_without_workgroup_dispatch(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            "\n".join(
+                line
+                for line in gem5_log.read_text(encoding="utf-8").splitlines()
+                if "Dispatching a workgroup" not in line
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
+
+    def test_verifier_rejects_missing_kernel_completion(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            "\n".join(
+                line
+                for line in gem5_log.read_text(encoding="utf-8").splitlines()
+                if "Completed kernel" not in line
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
+
+    def test_verifier_rejects_wrong_kernel_completion_id(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                "Completed kernel 0", "Completed kernel 1"
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
+
+    def test_verifier_rejects_wrong_workgroup_completion_id(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                "notify WgCompl 0", "notify WgCompl 99"
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
+
+    def test_verifier_rejects_kernel_completion_before_workgroup_completion(
+        self,
+    ) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                "2026-01-01T00:00:01.300000000Z 12: "
+                "dispatcher: notify WgCompl 0\n"
+                "2026-01-01T00:00:01.400000000Z 13: "
+                "dispatcher: Completed kernel 0\n",
+                "2026-01-01T00:00:01.300000000Z 12: "
+                "dispatcher: Completed kernel 0\n"
+                "2026-01-01T00:00:01.400000000Z 13: "
+                "dispatcher: notify WgCompl 0\n",
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
+
+    def test_verifier_rejects_swapped_run_scoped_gem5_log(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            GEM5_LOG_TEXT.replace("unit-vector", "other-row"),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_command_identity_mismatch", error_codes(result))
+
+    def test_expected_qemu_sigterm_and_running_container_are_accepted(self) -> None:
+        result = self.verify()
+        self.assertEqual("PASS", result["outcome"])
+        self.assertNotIn("simulator_fatal", error_codes(result))
+
+    def test_qemu_signal_9_or_11_after_completion_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        baseline = qemu_log.read_text(encoding="utf-8")
+        for signal_number in (9, 11):
+            with self.subTest(signal_number=signal_number):
+                qemu_log.write_text(
+                    baseline.replace(
+                        "terminating on signal 15",
+                        f"terminating on signal {signal_number}",
+                    ),
+                    encoding="utf-8",
+                )
+                result = self.verify()
+                self.assertEqual("FAIL", result["outcome"])
+                self.assertIn("simulator_fatal", error_codes(result))
+
+    def test_qemu_sigterm_before_completion_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        qemu_log.write_text(
+            qemu_log.read_text(encoding="utf-8").replace(
+                f"__{UNIT_TEST_TOKEN}__:0\n"
+                f"{QEMU_SIGTERM_LINE}\n",
+                f"{QEMU_SIGTERM_LINE}\n"
+                f"__{UNIT_TEST_TOKEN}__:0\n",
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("simulator_fatal", error_codes(result))
+
+    def test_stopped_docker_container_is_rejected(self) -> None:
+        def stop(container) -> None:
+            container["State"].update(
+                {"Status": "exited", "Running": False, "ExitCode": 1}
+            )
+
+        self.mutate_docker_inspect(stop)
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "docker_inspect.state.Running" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_oom_killed_docker_container_is_rejected(self) -> None:
+        def mark_oom(container) -> None:
+            container["State"]["OOMKilled"] = True
+
+        self.mutate_docker_inspect(mark_oom)
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "docker_inspect.state.OOMKilled" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_restarted_docker_container_is_rejected(self) -> None:
+        def increment_restart(container) -> None:
+            container["RestartCount"] = 1
+
+        self.mutate_docker_inspect(increment_restart)
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "docker_inspect.restart_count" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_swapped_docker_args_are_rejected(self) -> None:
+        def swap_args(container) -> None:
+            container["Args"][1] = (
+                "--socket-path=/tmp/gem5-mi300x-other-row.sock"
+            )
+
+        self.mutate_docker_inspect(swap_args)
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "docker_inspect.command" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_empty_manifest_and_matrix_fail_closed(self) -> None:
+        write_tsv(self.fixture.manifest, MANIFEST_FIELDS, [])
+        write_tsv(self.fixture.matrix, MATRIX_FIELDS, [])
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("empty_manifest", error_codes(result))
+        self.assertIn("empty_matrix", error_codes(result))
+
+    def test_expected_row_spec_must_match_tracked_head(self) -> None:
+        spec = (
+            self.fixture.root / "configs/cosim/strict-acceptance-rows.json"
+        )
+        spec.write_text(spec.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("expected_rows_differs_from_head", error_codes(result))
+
+    def test_accepted_row_counter_rejects_duplicate_semantics(self) -> None:
+        duplicate = dict(self.fixture.manifest_rows[0])
+        duplicate["row_id"] = "duplicate-vector"
+        self.fixture.manifest_rows.append(duplicate)
+        self.fixture.flush()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("expected_rows_mismatch", error_codes(result))
+
+    def test_repository_expected_rows_freeze_exact_eight_row_contract(self) -> None:
+        payload = json.loads(
+            (
+                REPO_ROOT / "configs/cosim/strict-acceptance-rows.json"
+            ).read_text(encoding="utf-8")
+        )
+        actual = {
+            (row["program"], row["expected_hsa_interrupt"])
+            for row in payload["rows"]
+        }
+        self.assertEqual(
+            {
+                ("gemm", "0"),
+                ("histogram", "0"),
+                ("multi_gpu_verify", "0"),
+                ("prefix_scan", "0"),
+                ("reduction", "0"),
+                ("transpose", "0"),
+                ("vector_add", "0"),
+                ("vector_add", "1"),
+            },
+            actual,
+        )
+        self.assertEqual(8, len(payload["rows"]))
 
     def test_missing_accepted_artifact_fails(self) -> None:
         missing = self.fixture.root / "missing-accepted-run"
@@ -1439,7 +2296,7 @@ class VerifyCosimMatrixTests(unittest.TestCase):
 
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
-        self.assertIn("timeout_mismatch", error_codes(result))
+        self.assertIn("guest_script_mismatch", error_codes(result))
 
     def test_accepted_nonpass_row_fails(self) -> None:
         verdict_path = self.fixture.artifact / "verdict.json"
@@ -1557,7 +2414,8 @@ class VerifyCosimMatrixTests(unittest.TestCase):
             invocation.read_text(encoding="utf-8").replace(
                 "argv=--boot-timeout 240 --test-timeout 30 "
                 "--guest-run-timeout 1800 "
-                f"--output-dir {self.fixture.artifact} vector_add",
+                f"--output-dir {self.fixture.artifact} "
+                f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
                 "argv=forged",
             ),
             encoding="utf-8",
@@ -1593,8 +2451,8 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         runner_invocation = self.fixture.artifact / "runner-invocation.txt"
         runner_invocation.write_text(
             runner_invocation.read_text(encoding="utf-8").replace(
-                "passthrough_args=\n",
-                "passthrough_args= ''\n",
+                f"passthrough_args= --gem5-debug {STRICT_DEBUG_FLAGS}\n",
+                f"passthrough_args= '' --gem5-debug {STRICT_DEBUG_FLAGS}\n",
             ),
             encoding="utf-8",
         )
@@ -1608,8 +2466,10 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         invocation = self.fixture.artifact / "runner-invocation.txt"
         invocation.write_text(
             invocation.read_text(encoding="utf-8").replace(
-                f"--output-dir {self.fixture.artifact} vector_add",
-                f"--output-dir {self.fixture.artifact} --qemu-trace forged vector_add",
+                f"--output-dir {self.fixture.artifact} "
+                f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
+                f"--output-dir {self.fixture.artifact} --qemu-trace forged "
+                f"--gem5-debug {STRICT_DEBUG_FLAGS} vector_add",
             ),
             encoding="utf-8",
         )
@@ -1702,7 +2562,9 @@ class VerifyCosimMatrixTests(unittest.TestCase):
             )
 
         result = self.verify()
-        self.assertEqual("PASS", result["outcome"])
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("expected_rows_mismatch", error_codes(result))
+        self.assertNotIn("noncanonical_guest_prefix_input", error_codes(result))
 
     def test_coordinated_shell_test_binary_fails_shape_check(self) -> None:
         self.fixture.test_binary.write_bytes(b"#!/bin/sh\necho forged\n")
@@ -1811,6 +2673,155 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("invalid_run_preflight", error_codes(result))
 
+    def test_guest_metadata_lock_and_patch_hashes_are_joined(self) -> None:
+        metadata_path = self.fixture.artifact / "guest-build-meta.txt"
+        replace_key_value(
+            metadata_path, "guest_lock_sha256", "1" * 64
+        )
+        replace_key_value(
+            metadata_path, "overlay_patch_sha256", "2" * 64
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        details = error_details(result)
+        self.assertTrue(
+            any("guest_metadata.guest_lock_sha256" in item for item in details)
+        )
+        self.assertTrue(
+            any(
+                "guest_metadata.overlay_patch_sha256" in item
+                for item in details
+            )
+        )
+
+    def test_same_size_guest_image_replacement_is_rejected(self) -> None:
+        original = self.fixture.disk_image.stat()
+        replacement = self.fixture.disk_image.with_name("replacement-image")
+        replacement.write_bytes(b"X" * original.st_size)
+        os.utime(
+            replacement,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+        os.replace(replacement, self.fixture.disk_image)
+        self.assertEqual(
+            original.st_size, self.fixture.disk_image.stat().st_size
+        )
+        self.assertEqual(
+            original.st_mtime_ns,
+            self.fixture.disk_image.stat().st_mtime_ns,
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("hash_mismatch", error_codes(result))
+        self.assertTrue(
+            any(
+                "guest_metadata.image_sha256" in item
+                for item in error_details(result)
+            )
+        )
+
+    def test_guest_pre_stat_drift_is_rejected(self) -> None:
+        pre_path = self.fixture.artifact / "guest-base-stat-pre.json"
+        pre_stat = json.loads(pre_path.read_text(encoding="utf-8"))
+        pre_stat["image"]["inode"] += 1
+        pre_path.write_text(
+            json.dumps(pre_stat, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "guest_pre_stat.image.inode" in item
+                for item in error_details(result)
+            )
+        )
+
+    def test_guest_post_stat_drift_is_rejected(self) -> None:
+        post_path = self.fixture.artifact / "guest-base-stat-post.json"
+        post_stat = json.loads(post_path.read_text(encoding="utf-8"))
+        post_stat["matches_pre"] = False
+        post_path.write_text(
+            json.dumps(post_stat, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "guest_post_stat.matches_pre" in item
+                for item in error_details(result)
+            )
+        )
+
+    def test_truncated_run_preflight_is_rejected(self) -> None:
+        preflight_path = self.fixture.artifact / "preflight" / "preflight.json"
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        preflight["checks"] = [
+            check
+            for check in preflight["checks"]
+            if check["id"]
+            in {"run.gem5_provenance", "run.qemu_provenance"}
+        ]
+        preflight_path.write_text(
+            json.dumps(preflight, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_run_preflight", error_codes(result))
+
+    def test_invalid_guest_metadata_timestamp_and_artifacts_are_rejected(
+        self,
+    ) -> None:
+        metadata_path = self.fixture.artifact / "guest-build-meta.txt"
+        replace_key_value(metadata_path, "timestamp", "not-a-time")
+        replace_key_value(metadata_path, "artifacts", "/tmp/forged-build")
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_guest_metadata", error_codes(result))
+
+    def test_invalid_guest_seal_timestamp_is_rejected(self) -> None:
+        replace_key_value(
+            self.fixture.artifact / "guest-content-seal.txt",
+            "sealed_at",
+            "not-a-time",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_guest_content_seal", error_codes(result))
+
+    def test_invalid_guest_lock_fingerprint_is_rejected(self) -> None:
+        replace_key_value(
+            self.fixture.artifact / "guest.lock",
+            "ROCM_KEY_FINGERPRINT",
+            "lowercase-is-not-valid",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_guest_lock", error_codes(result))
+
+    def test_invalid_preflight_timestamp_is_rejected(self) -> None:
+        preflight_path = self.fixture.artifact / "preflight" / "preflight.json"
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+        preflight["generated_at"] = "not-a-time"
+        preflight_path.write_text(
+            json.dumps(preflight, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_run_preflight", error_codes(result))
+
     def test_missing_canonical_qemu_binary_fails(self) -> None:
         self.fixture.qemu_binary.unlink()
 
@@ -1849,6 +2860,370 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertTrue(
             any("guest_overlay.format" in detail for detail in error_details(result))
         )
+
+    def test_guest_lifecycle_timestamps_must_be_ordered(self) -> None:
+        post_path = self.fixture.artifact / "guest-base-stat-post.json"
+        post = json.loads(post_path.read_text(encoding="utf-8"))
+        post["captured_at"] = "2026-01-01T00:00:00.500000000Z"
+        post_path.write_text(
+            json.dumps(post, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_guest_lifecycle_order", error_codes(result))
+
+    def test_preflight_timestamp_must_precede_guest_validation(self) -> None:
+        for report_path in (
+            self.fixture.artifact / "guest-provenance.json",
+            self.fixture.artifact / "preflight/guest-provenance.json",
+        ):
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["validated_at"] = "2026-01-01T00:00:00.050000000Z"
+            report_path.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_guest_lifecycle_order", error_codes(result))
+
+    def test_same_binary_qemu_metadata_refresh_after_guest_is_allowed(self) -> None:
+        for metadata_path in (
+            self.fixture.qemu_build_meta,
+            self.fixture.artifact / "qemu-build-meta.txt",
+        ):
+            replace_key_value(
+                metadata_path,
+                "timestamp",
+                "2026-01-01T00:00:00.075000000Z",
+            )
+
+        result = self.verify()
+        self.assertEqual("PASS", result["outcome"])
+
+    def test_qemu_metadata_timestamp_must_precede_preflight(self) -> None:
+        for metadata_path in (
+            self.fixture.qemu_build_meta,
+            self.fixture.artifact / "qemu-build-meta.txt",
+        ):
+            replace_key_value(
+                metadata_path,
+                "timestamp",
+                "2026-01-01T00:00:00.150000000Z",
+            )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_guest_lifecycle_order", error_codes(result))
+
+    def test_guest_builder_identity_is_joined_to_head(self) -> None:
+        replace_key_value(
+            self.fixture.artifact / "guest-build-meta.txt",
+            "build_script_sha256",
+            "f" * 64,
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "metadata.build_script_sha256" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_qemu_configure_fingerprint_is_independently_rebuilt(self) -> None:
+        for path in (
+            self.fixture.qemu_build_meta,
+            self.fixture.artifact / "qemu-build-meta.txt",
+        ):
+            replace_key_value(path, "configure_fingerprint", "f" * 64)
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "qemu_meta.configure_fingerprint" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_qemu_source_tree_fingerprint_is_independently_rebuilt(self) -> None:
+        (self.fixture.qemu_source / "README.rst").write_text(
+            "mutated qemu source\n", encoding="utf-8"
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "qemu_lock.source_fingerprint" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_qemu_source_rewrite_cannot_rekey_mutable_metadata(self) -> None:
+        (self.fixture.qemu_source / "README.rst").write_text(
+            "coordinated qemu source rewrite\n", encoding="utf-8"
+        )
+        source_fingerprint = _directory_fingerprint(
+            self.fixture.qemu_source, {}
+        )
+        configure_fingerprint = _array_fingerprint(
+            (
+                f"--prefix={self.fixture.root / '.local/cosim/qemu/10.1.5'}",
+                "--target-list=x86_64-softmmu",
+                "--disable-download",
+                "--disable-docs",
+                "--disable-gtk",
+                "--disable-sdl",
+                "--disable-werror",
+                "--enable-kvm",
+                "--enable-slirp",
+                "--enable-tools",
+                "--enable-virtfs",
+            )
+        )
+        build_fingerprint = _array_fingerprint(
+            ("1" * 64, source_fingerprint, configure_fingerprint)
+        )
+        for path in (
+            self.fixture.qemu_build_meta,
+            self.fixture.artifact / "qemu-build-meta.txt",
+        ):
+            replace_key_value(
+                path, "initial_source_fingerprint", source_fingerprint
+            )
+            replace_key_value(path, "source_fingerprint", source_fingerprint)
+            replace_key_value(path, "build_fingerprint", build_fingerprint)
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "qemu_lock.source_fingerprint" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_qemu_toolchain_lock_must_equal_head(self) -> None:
+        for path in (
+            self.fixture.toolchain_lock,
+            self.fixture.artifact / "toolchain.lock",
+        ):
+            replace_key_value(path, "QEMU_SOURCE_SHA256", "2" * 64)
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertTrue(
+            any(
+                "qemu_toolchain_lock.archive_head_sha256" in detail
+                for detail in error_details(result)
+            )
+        )
+
+    def test_qemu_binary_hash_is_independently_verified(self) -> None:
+        self.fixture.qemu_binary.write_bytes(b"mutated qemu binary\n")
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("hash_mismatch", error_codes(result))
+
+    def test_gem5_build_timestamp_must_be_rfc3339nano(self) -> None:
+        replace_key_value(
+            self.fixture.patch / "gem5-build-meta.txt", "timestamp", "not-a-time"
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_gem5_build_metadata", error_codes(result))
+
+    def test_nested_duplicate_json_key_is_rejected(self) -> None:
+        verdict_path = self.fixture.artifact / "verdict.json"
+        text = verdict_path.read_text(encoding="utf-8")
+        verdict_path.write_text(
+            text.replace(
+                '"effective_environment": {',
+                '"effective_environment": {"ok": false,',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("json_read_error", error_codes(result))
+
+    def test_unknown_tsv_column_is_rejected(self) -> None:
+        rows = [{**row, "forged": "value"} for row in self.fixture.manifest_rows]
+        write_tsv(
+            self.fixture.manifest,
+            (*MANIFEST_FIELDS, "forged"),
+            rows,
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("manifest_error", error_codes(result))
+
+    def test_stale_qemu_run_marker_is_rejected_after_hashes_are_coordinated(
+        self,
+    ) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        qemu_log.write_text(
+            qemu_log.read_text(encoding="utf-8").replace(
+                "  Run-ID:     unit-vector", "  Run-ID:     stale-vector"
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("qemu_run_identity_mismatch", error_codes(result))
+
+    def test_qemu_pass_after_sigterm_is_rejected_after_hashes_are_coordinated(
+        self,
+    ) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        text = qemu_log.read_text(encoding="utf-8")
+        text = text.replace("[PASS] vector_add\n", "")
+        text += "[PASS] vector_add\n"
+        qemu_log.write_text(text, encoding="utf-8")
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_qemu_sequence", error_codes(result))
+
+    def test_qemu_completion_token_for_another_run_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        qemu_log.write_text(
+            qemu_log.read_text(encoding="utf-8").replace(
+                UNIT_RUN_SHA256, "f" * 64
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_qemu_sequence", error_codes(result))
+
+    def test_qemu_log_symlink_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        target = self.fixture.artifact / "qemu-target.log"
+        qemu_log.rename(target)
+        qemu_log.symlink_to(target)
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("symlink_not_allowed", error_codes(result))
+
+    def test_native_gem5_abort_after_gpu_completion_is_rejected(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8")
+            + "2026-01-01T00:00:01.500000000Z Program aborted at tick 42\n",
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("simulator_fatal", error_codes(result))
+
+    def test_native_gem5_segfault_before_gpu_completion_is_rejected(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        text = gem5_log.read_text(encoding="utf-8")
+        needle = "2026-01-01T00:00:01.400000000Z 13: dispatcher: Completed kernel 0\n"
+        gem5_log.write_text(
+            text.replace(
+                needle,
+                "2026-01-01T00:00:01.350000000Z "
+                "gem5 has encountered a segmentation fault!\n"
+                + needle,
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("simulator_fatal", error_codes(result))
+
+    def test_gem5_command_and_client_after_gpu_sequence_are_rejected(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        lines = gem5_log.read_text(encoding="utf-8").splitlines()
+        command = lines.pop(0).replace(
+            "2026-01-01T00:00:00.100000000Z",
+            "2026-01-01T00:00:01.500000000Z",
+        )
+        client = lines.pop(0).replace(
+            "2026-01-01T00:00:00.200000000Z",
+            "2026-01-01T00:00:01.600000000Z",
+        )
+        gem5_log.write_text(
+            "\n".join([*lines, command, client]) + "\n", encoding="utf-8"
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_causal_chain_unproven", error_codes(result))
+
+    def test_gem5_timestamp_regression_is_rejected(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                "2026-01-01T00:00:01.200000000Z",
+                "2026-01-01T00:00:01.050000000Z",
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_gem5_timestamp", error_codes(result))
+
+    def test_nested_duplicate_docker_json_key_is_rejected(self) -> None:
+        inspect_path = self.fixture.artifact / "docker-inspect.json"
+        text = inspect_path.read_text(encoding="utf-8")
+        inspect_path.write_text(
+            text.replace(
+                '"State": {',
+                '"State": {"Running": false,',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("json_read_error", error_codes(result))
+
+    def test_unknown_top_matrix_column_is_rejected(self) -> None:
+        rows = [{**row, "forged": "value"} for row in self.fixture.matrix_rows]
+        write_tsv(self.fixture.matrix, (*MATRIX_FIELDS, "forged"), rows)
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("matrix_error", error_codes(result))
+
+    def test_unknown_local_matrix_column_is_rejected(self) -> None:
+        local_path = self.fixture.artifact / "matrix.tsv"
+        with local_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+        rows[0]["forged"] = "value"
+        write_tsv(local_path, (*LOCAL_MATRIX_FIELDS, "forged"), rows)
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("local_matrix_error", error_codes(result))
 
 
 if __name__ == "__main__":

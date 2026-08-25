@@ -38,9 +38,12 @@ GEM5_BIN="$CANONICAL_GEM5_BIN"
 GEM5_CONFIG="${GEM5_DIR}/configs/example/gpufs/mi300_cosim.py"
 GEM5_DOCKER_IMAGE="${GEM5_DOCKER_IMAGE:-gem5-run:local}"
 GEM5_CONTAINER="$(cosim_container_name "$COSIM_RUN_ID")"
+STRICT_ACCEPTANCE="${COSIM_STRICT_ACCEPTANCE:-0}"
 
 LOCAL_QEMU_BIN="${COSIM_DIR}/.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64"
 LOCAL_QEMU_IMG="${COSIM_DIR}/.local/cosim/qemu/10.1.5/bin/qemu-img"
+QEMU_BUILD_META="${COSIM_DIR}/.local/cosim/build/qemu-10.1.5/.cosim-build-meta"
+TOOLCHAIN_LOCK="${COSIM_DIR}/configs/cosim/toolchain.lock"
 QEMU_BIN="${QEMU_BIN:-}"
 QEMU_IMG="${QEMU_IMG:-}"
 if [[ -z "$QEMU_BIN" && -x "$LOCAL_QEMU_BIN" ]]; then
@@ -56,8 +59,15 @@ elif [[ -z "$QEMU_IMG" && -n "$QEMU_BIN" && \
 elif [[ -z "$QEMU_IMG" ]]; then
     QEMU_IMG="$(command -v qemu-img 2>/dev/null || true)"
 fi
-DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
-KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
+CANONICAL_DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
+CANONICAL_KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
+GUEST_META="${COSIM_DIR}/.local/cosim/build/guest/.cosim-build-meta"
+GUEST_SEAL="${COSIM_DIR}/.local/cosim/build/guest/.cosim-content-seal"
+GUEST_LOCK="${COSIM_DIR}/configs/cosim/guest.lock"
+GUEST_PATCH="${SCRIPT_DIR}/patches/0002-guest-core-reproducible.patch"
+GUEST_PROVENANCE_VALIDATOR="${SCRIPT_DIR}/guest_provenance.py"
+DISK_IMAGE="$CANONICAL_DISK_IMAGE"
+KERNEL="$CANONICAL_KERNEL"
 
 SOCKET_PATH="/tmp/gem5-mi300x-${COSIM_RUN_ID}.sock"
 SHMEM_PATH="/mi300x-vram-${COSIM_RUN_ID}"
@@ -82,6 +92,7 @@ ARTIFACT_DIR="${COSIM_DIR}/artifacts/standalone/${COSIM_RUN_ID}"
 COSIM_FAILURE_CATEGORY=""
 COSIM_SECONDARY_STATUS=""
 GEM5_LOG_PID=""
+GUEST_PROVENANCE_READY=0
 
 # ---- Colors ----
 
@@ -158,11 +169,14 @@ done
 [[ "$COSIM_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || \
     error "unsafe COSIM_RUN_ID: $COSIM_RUN_ID"
 [[ "$COSIM_RUN_ID" != *..* ]] || error "unsafe COSIM_RUN_ID: $COSIM_RUN_ID"
+[[ "$STRICT_ACCEPTANCE" == "0" || "$STRICT_ACCEPTANCE" == "1" ]] || \
+    error "COSIM_STRICT_ACCEPTANCE must be 0 or 1"
 for numeric_name in HOST_CPUS NUM_CUS NUM_GPUS GEM5_TIMEOUT; do
     numeric_value="${!numeric_name}"
     [[ "$numeric_value" =~ ^[1-9][0-9]*$ ]] || error "${numeric_name} must be a positive integer"
 done
-for invocation_value in "$GEM5_BIN" "$GEM5_DEBUG" "$HOST_MEM" "$VRAM_SIZE"; do
+for invocation_value in "$GEM5_BIN" "$QEMU_BIN" "$QEMU_IMG" "$GEM5_DEBUG" \
+    "$HOST_MEM" "$VRAM_SIZE"; do
     [[ "$invocation_value" != *$'\n'* && "$invocation_value" != *$'\r'* && \
        "$invocation_value" != *$'\t'* ]] || \
         error "control whitespace is not allowed in invocation values"
@@ -172,6 +186,19 @@ case "$ARTIFACT_DIR" in
     "${COSIM_DIR}/artifacts/"*) ;;
     *) error "--artifact-dir must be below ${COSIM_DIR}/artifacts" ;;
 esac
+
+if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+    [[ -f "$DISK_IMAGE" && ! -L "$DISK_IMAGE" ]] || \
+        error "strict acceptance requires the canonical non-symlink Guest image"
+    [[ -f "$KERNEL" && ! -L "$KERNEL" ]] || \
+        error "strict acceptance requires the canonical non-symlink Guest kernel"
+    DISK_IMAGE="$(realpath -e -- "$DISK_IMAGE")"
+    KERNEL="$(realpath -e -- "$KERNEL")"
+    [[ "$DISK_IMAGE" == "$CANONICAL_DISK_IMAGE" ]] || \
+        error "strict acceptance requires Guest image ${CANONICAL_DISK_IMAGE}"
+    [[ "$KERNEL" == "$CANONICAL_KERNEL" ]] || \
+        error "strict acceptance requires Guest kernel ${CANONICAL_KERNEL}"
+fi
 
 # Handle --force-clean mode
 if [[ -n "$FORCE_CLEAN" ]]; then
@@ -238,10 +265,25 @@ fi
 
 # ---- Validation ----
 
+mkdir -p "${COSIM_DIR}/.local/cosim"
+exec 9>"${COSIM_DIR}/.local/cosim/build.lock"
+flock -s 9 || error "failed to acquire shared Guest build lock"
+
 [[ -x "$GEM5_BIN" ]]   || error "gem5 not executable: $GEM5_BIN\n  Build: ./scripts/cosim_build.sh gem5"
-[[ -n "$QEMU_BIN" && -x "$QEMU_BIN" ]] || error "qemu-system-x86_64 not found. Install QEMU 10.1+ or pass --qemu-bin."
-[[ -n "$QEMU_IMG" && -x "$QEMU_IMG" ]] || \
+REQUESTED_QEMU_BIN="$QEMU_BIN"
+if [[ -z "$REQUESTED_QEMU_BIN" ]] || \
+   ! QEMU_BIN="$(realpath -e -- "$REQUESTED_QEMU_BIN" 2>/dev/null)"; then
+    error "qemu-system-x86_64 not found. Install QEMU 10.1+ or pass --qemu-bin."
+fi
+[[ -f "$QEMU_BIN" && -x "$QEMU_BIN" && ! -L "$QEMU_BIN" ]] || \
+    error "qemu-system-x86_64 is not a canonical regular executable: ${QEMU_BIN}"
+REQUESTED_QEMU_IMG="$QEMU_IMG"
+if [[ -z "$REQUESTED_QEMU_IMG" ]] || \
+   ! QEMU_IMG="$(realpath -e -- "$REQUESTED_QEMU_IMG" 2>/dev/null)"; then
     error "qemu-img not found beside the selected QEMU or on PATH."
+fi
+[[ -f "$QEMU_IMG" && -x "$QEMU_IMG" && ! -L "$QEMU_IMG" ]] || \
+    error "qemu-img is not a canonical regular executable: ${QEMU_IMG}"
 "$QEMU_BIN" -device help 2>/dev/null | grep 'vfio-user-pci' >/dev/null || \
     error "QEMU does not provide vfio-user-pci. Install QEMU 10.1+ or pass a compatible --qemu-bin."
 [[ -f "$DISK_IMAGE" ]] || error "Disk image not found: $DISK_IMAGE\n  Build: ./scripts/cosim_build.sh guest"
@@ -260,7 +302,6 @@ docker image inspect "$GEM5_DOCKER_IMAGE" >/dev/null 2>&1 || \
 
 # ---- Session and manifest setup ----
 
-mkdir -p "${COSIM_DIR}/.local/cosim"
 exec 8>"${COSIM_DIR}/.local/cosim/runtime.lock"
 flock -n 8 || error "another cosim session owns ${COSIM_DIR}/.local/cosim/runtime.lock"
 
@@ -277,6 +318,56 @@ done
 manifest_add "runtime" "file" "$GUEST_OVERLAY"
 manifest_add "runtime" "directory" "$SESSION_DIR"
 manifest_add "artifact" "directory" "$ARTIFACT_DIR"
+
+# ---- Strict provenance evidence ----
+
+archive_strict_evidence_file() {
+    local source="$1"
+    local destination="$2"
+    local role="$3"
+    local expected_sha="${4:-}"
+    local temporary actual_sha
+
+    [[ -f "$source" && -r "$source" && ! -L "$source" ]] || \
+        error "${role} is missing, unreadable, or symlinked: ${source}"
+    temporary="$(mktemp "${destination}.tmp.XXXXXX")"
+    install -m 0600 -- "$source" "$temporary"
+    if [[ -n "$expected_sha" ]]; then
+        [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || \
+            error "${role} expected SHA-256 is malformed"
+        actual_sha="$(sha256sum -- "$temporary" | awk '{print $1}')"
+        [[ "$actual_sha" == "$expected_sha" ]] || \
+            error "${role} changed after strict preflight"
+    fi
+    mv -- "$temporary" "$destination"
+}
+
+write_guest_base_stat() {
+    local report="$1"
+    local destination="$2"
+    local temporary
+
+    temporary="$(mktemp "${destination}.tmp.XXXXXX")"
+    if ! jq -er '
+        [
+            "schema=cosim-guest-base-stat/v2",
+            "path=\(.image.path)",
+            "image_sha256=\(.image.sha256)",
+            "validation_method=\(.image.validation_method)",
+            "size=\(.image.size)",
+            "device=\(.image.device)",
+            "inode=\(.image.inode)",
+            "mtime_ns=\(.image.mtime_ns)",
+            "ctime_ns=\(.image.ctime_ns)",
+            "guest_build_meta_sha256=\(.guest_build_meta.sha256)",
+            "guest_content_seal_sha256=\(.guest_content_seal.sha256)"
+        ] | .[]
+    ' "$report" > "$temporary"; then
+        error "strict Guest provenance report cannot produce base stat evidence"
+    fi
+    chmod 0600 "$temporary"
+    mv -- "$temporary" "$destination"
+}
 
 # ---- Cleanup handler ----
 
@@ -323,6 +414,19 @@ cleanup() {
         warn "Teardown verification failed: some resources may remain."
     fi
 
+    if [[ "$STRICT_ACCEPTANCE" == "1" && "$GUEST_PROVENANCE_READY" -eq 1 ]]; then
+        if python3 "$GUEST_PROVENANCE_VALIDATOR" post-stat \
+            --run-id "$COSIM_RUN_ID" \
+            --expected "${ARTIFACT_DIR}/guest-provenance.json" \
+            --output "${ARTIFACT_DIR}/guest-base-stat-post.json" >/dev/null; then
+            info "Guest base image post-run stat matches strict preflight."
+        else
+            COSIM_SECONDARY_STATUS="$COSIM_CAT_CLEANUP_FAIL"
+            cleanup_result="FAIL"
+            warn "Guest base image changed during the run."
+        fi
+    fi
+
     {
         echo "result=${cleanup_result}"
         echo "primary_category=${COSIM_FAILURE_CATEGORY}"
@@ -330,6 +434,11 @@ cleanup() {
     } > "${ARTIFACT_DIR}/cleanup-status.txt"
 
     info "Run: $COSIM_RUN_ID | Category: $COSIM_FAILURE_CATEGORY${COSIM_SECONDARY_STATUS:+ | Secondary: $COSIM_SECONDARY_STATUS}"
+    if [[ "$STRICT_ACCEPTANCE" == "1" && "$cleanup_result" != "PASS" && \
+        "$exit_code" -eq 0 ]]; then
+        trap - EXIT
+        exit 1
+    fi
 }
 
 # shellcheck disable=SC2317
@@ -360,8 +469,10 @@ mkdir -p "$ARTIFACT_DIR"
     echo "gem5_config_args=${GEM5_CONFIG_ARGS}"
     echo "gem5_docker_image=${GEM5_DOCKER_IMAGE}"
     echo "qemu_binary=${QEMU_BIN}"
+    echo "qemu_img=${QEMU_IMG}"
     echo "disk_image=${DISK_IMAGE}"
     echo "kernel=${KERNEL}"
+    echo "strict_acceptance=${STRICT_ACCEPTANCE}"
     echo "host_cpus=${HOST_CPUS}"
     echo "gem5_init_timeout=${GEM5_TIMEOUT}"
     echo "cwd=$(pwd -P)"
@@ -373,25 +484,99 @@ mkdir -p "$ARTIFACT_DIR"
 
 PREFLIGHT_DIR="${ARTIFACT_DIR}/preflight"
 mkdir -p "$PREFLIGHT_DIR"
-if ! QEMU_BIN="$QEMU_BIN" GEM5_DOCKER_IMAGE="$GEM5_DOCKER_IMAGE" \
+if ! COSIM_STRICT_ACCEPTANCE="$STRICT_ACCEPTANCE" QEMU_BIN="$QEMU_BIN" \
+    QEMU_IMG="$QEMU_IMG" GEM5_DOCKER_IMAGE="$GEM5_DOCKER_IMAGE" \
     "${SCRIPT_DIR}/cosim_preflight.sh" run --output-dir "$PREFLIGHT_DIR" | \
     tee "${PREFLIGHT_DIR}/preflight.log"; then
     COSIM_FAILURE_CATEGORY="$COSIM_CAT_READINESS_FAIL"
     error "run preflight failed; inspect ${PREFLIGHT_DIR}/preflight.json"
 fi
 
+if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+    qemu_provenance_detail="$(jq -er '
+        [.checks[] | select(.id == "run.qemu_provenance")] |
+        select(
+            (length == 1) and
+            (.[0].status == "PASS") and
+            (.[0].required == true)
+        ) |
+        .[0].detail
+    ' "${PREFLIGHT_DIR}/preflight.json")" || \
+        error "strict preflight lacks one successful required QEMU provenance check"
+    qemu_meta_sha="$(jq -nre --arg detail "$qemu_provenance_detail" '
+        $detail |
+        capture("(^|; )metadata_sha256=(?<sha>[0-9a-f]{64})(; |$)").sha
+    ')" || error "strict QEMU provenance metadata SHA-256 is missing"
+    toolchain_lock_sha="$(jq -nre --arg detail "$qemu_provenance_detail" '
+        $detail |
+        capture("(^|; )toolchain_lock_sha256=(?<sha>[0-9a-f]{64})(; |$)").sha
+    ')" || error "strict QEMU provenance lock SHA-256 is missing"
+    archive_strict_evidence_file "$QEMU_BUILD_META" \
+        "${ARTIFACT_DIR}/qemu-build-meta.txt" "QEMU build metadata" \
+        "$qemu_meta_sha"
+    archive_strict_evidence_file "$TOOLCHAIN_LOCK" \
+        "${ARTIFACT_DIR}/toolchain.lock" "QEMU toolchain lock" \
+        "$toolchain_lock_sha"
+
+    guest_report="${ARTIFACT_DIR}/guest-provenance.json"
+    archive_strict_evidence_file \
+        "${PREFLIGHT_DIR}/guest-provenance.json" "$guest_report" \
+        "Guest provenance report"
+    [[ "$(jq -er '.run_id' "$guest_report")" == "$COSIM_RUN_ID" ]] || \
+        error "Guest provenance report run ID does not match the launcher"
+    guest_meta_sha="$(jq -er '
+        .guest_build_meta.sha256 |
+        select(type == "string" and test("^[0-9a-f]{64}$"))
+    ' "$guest_report")" || error "Guest provenance metadata SHA-256 is missing"
+    guest_seal_sha="$(jq -er '
+        .guest_content_seal.sha256 |
+        select(type == "string" and test("^[0-9a-f]{64}$"))
+    ' "$guest_report")" || error "Guest provenance seal SHA-256 is missing"
+    guest_lock_sha="$(jq -er '
+        .source.guest_lock_sha256 |
+        select(type == "string" and test("^[0-9a-f]{64}$"))
+    ' "$guest_report")" || error "Guest provenance lock SHA-256 is missing"
+    guest_patch_sha="$(jq -er '
+        .source.overlay_patch_sha256 |
+        select(type == "string" and test("^[0-9a-f]{64}$"))
+    ' "$guest_report")" || error "Guest provenance patch SHA-256 is missing"
+    archive_strict_evidence_file "$GUEST_META" \
+        "${ARTIFACT_DIR}/guest-build-meta.txt" "Guest build metadata" \
+        "$guest_meta_sha"
+    archive_strict_evidence_file "$GUEST_SEAL" \
+        "${ARTIFACT_DIR}/guest-content-seal.txt" "Guest content seal" \
+        "$guest_seal_sha"
+    archive_strict_evidence_file "$GUEST_LOCK" \
+        "${ARTIFACT_DIR}/guest.lock" "Guest lock" "$guest_lock_sha"
+    archive_strict_evidence_file "$GUEST_PATCH" \
+        "${ARTIFACT_DIR}/guest-overlay.patch" "Guest overlay patch" \
+        "$guest_patch_sha"
+    python3 "$GUEST_PROVENANCE_VALIDATOR" post-stat \
+        --run-id "$COSIM_RUN_ID" \
+        --expected "$guest_report" \
+        --output "${ARTIFACT_DIR}/guest-base-stat-pre.json" >/dev/null || \
+        error "Guest base image changed after strict preflight"
+    write_guest_base_stat "$guest_report" \
+        "${ARTIFACT_DIR}/guest-base-stat.txt"
+    GUEST_PROVENANCE_READY=1
+fi
+
 "$QEMU_IMG" create -q -f qcow2 -F raw -b "$DISK_IMAGE" "$GUEST_OVERLAY" || \
     error "failed to create run-scoped Guest overlay: $GUEST_OVERLAY"
 "$QEMU_IMG" info --output=json "$GUEST_OVERLAY" > \
     "${ARTIFACT_DIR}/guest-overlay.json"
-{
-    echo "path=${DISK_IMAGE}"
-    stat -c 'size=%s' "$DISK_IMAGE"
-    stat -c 'mtime=%y' "$DISK_IMAGE"
-} > "${ARTIFACT_DIR}/guest-base-stat.txt"
-if [[ -f "${COSIM_DIR}/.local/cosim/build/guest/.cosim-build-meta" ]]; then
-    cp "${COSIM_DIR}/.local/cosim/build/guest/.cosim-build-meta" \
-        "${ARTIFACT_DIR}/guest-build-meta.txt"
+if [[ "$STRICT_ACCEPTANCE" == "0" ]]; then
+    {
+        echo "path=${DISK_IMAGE}"
+        stat -c 'size=%s' "$DISK_IMAGE"
+        stat -c 'device=%d' "$DISK_IMAGE"
+        stat -c 'inode=%i' "$DISK_IMAGE"
+        stat -c 'mtime_ns=%Y000000000' "$DISK_IMAGE"
+        stat -c 'ctime_ns=%Z000000000' "$DISK_IMAGE"
+    } > "${ARTIFACT_DIR}/guest-base-stat.txt"
+    if [[ -f "$GUEST_META" && ! -L "$GUEST_META" ]]; then
+        cp "$GUEST_META" "${ARTIFACT_DIR}/guest-build-meta.txt"
+    fi
 fi
 
 if ! run_preflight_audit | \

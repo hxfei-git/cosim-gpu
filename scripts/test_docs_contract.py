@@ -1877,7 +1877,9 @@ def check_public_commands(contract: Contract) -> None:
         '"runner_invocation": artifact_dir / "runner-invocation.txt"',
         '"launch_invocation": artifact_dir / "launch-invocation.txt"',
         '"guest_script": artifact_dir / "guest-run.sh"',
-        'TEST_TIMEOUT_RE',
+        'render_guest_run_script(',
+        'guest_script_bytes != expected_guest_script_bytes',
+        'expected_test_timeout=expected_test_timeout',
     ):
         contract.require(required in verifier, f"严格 verifier 缺少合同：{required}")
 

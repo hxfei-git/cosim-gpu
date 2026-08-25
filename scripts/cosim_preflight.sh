@@ -6,14 +6,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COSIM_DIR="$(dirname "$SCRIPT_DIR")"
 ARTIFACT_ROOT="${COSIM_DIR}/artifacts"
+TOOLCHAIN_LOCK="${COSIM_DIR}/configs/cosim/toolchain.lock"
 GUEST_LOCK="${COSIM_DIR}/configs/cosim/guest.lock"
+GUEST_PATCH="${SCRIPT_DIR}/patches/0002-guest-core-reproducible.patch"
+GUEST_META="${COSIM_DIR}/.local/cosim/build/guest/.cosim-build-meta"
+GUEST_SEAL="${COSIM_DIR}/.local/cosim/build/guest/.cosim-content-seal"
+GUEST_PROVENANCE_VALIDATOR="${SCRIPT_DIR}/guest_provenance.py"
 GEM5_BASELINE_LOCK="${COSIM_DIR}/configs/cosim/gem5-baseline.lock"
+QEMU_VERSION="10.1.5"
+QEMU_SOURCE_URL="https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz"
+QEMU_SIGNATURE_URL="${QEMU_SOURCE_URL}.sig"
+QEMU_RELEASE_KEY_FINGERPRINT="CEACC9E15534EBABB82D3FA03353C9CEF108B584"
+QEMU_RELEASE_KEY_URL="https://keys.openpgp.org/vks/v1/by-fingerprint/${QEMU_RELEASE_KEY_FINGERPRINT}"
+QEMU_SOURCE_DIR="${COSIM_DIR}/.local/cosim/src/qemu-${QEMU_VERSION}"
+QEMU_BUILD_META="${COSIM_DIR}/.local/cosim/build/qemu-${QEMU_VERSION}/.cosim-build-meta"
+QEMU_BUILD_SCRIPT="${SCRIPT_DIR}/cosim_build.sh"
 
 PROFILE="host"
 JSON_STDOUT=0
 OUTPUT_DIR=""
 GENERATED_AT="$(date -Iseconds)"
 STRICT_ACCEPTANCE="${COSIM_STRICT_ACCEPTANCE:-0}"
+umask 077
 
 declare -a CHECK_IDS=()
 declare -a CHECK_STATUSES=()
@@ -154,6 +168,310 @@ metadata_has_exact_keys() {
     metadata_has_single_keys "$file" "$@" || return 1
     populated_lines="$(awk 'NF {count++} END {print count + 0}' "$file")"
     [[ "$populated_lines" -eq "$#" ]]
+}
+
+metadata_has_exact_assignment_keys() {
+    local file="$1"
+    shift
+    local expected_count="$#"
+
+    metadata_has_single_keys "$file" "$@" || return 1
+    awk -v expected="$expected_count" '
+        /^[[:space:]]*($|#)/ { next }
+        /^[A-Za-z_][A-Za-z0-9_]*=/ { count++; next }
+        { invalid = 1 }
+        END {
+            if (invalid || count != expected) {
+                exit 1
+            }
+        }
+    ' "$file"
+}
+
+is_rfc3339nano() {
+    local value="$1"
+
+    python3 - "$value" <<'PY' >/dev/null 2>&1
+import datetime
+import re
+import sys
+
+match = re.fullmatch(
+    r"(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})T"
+    r"(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})"
+    r"(?:\.(?P<fraction>[0-9]{1,9}))?"
+    r"(?P<zone>Z|[+-][0-9]{2}:[0-9]{2})",
+    sys.argv[1],
+)
+if match is None:
+    raise SystemExit(1)
+zone = match.group("zone")
+if zone != "Z" and (int(zone[1:3]) > 23 or int(zone[4:6]) > 59):
+    raise SystemExit(1)
+try:
+    datetime.datetime(
+        int(match.group("year")),
+        int(match.group("month")),
+        int(match.group("day")),
+        int(match.group("hour")),
+        int(match.group("minute")),
+        int(match.group("second")),
+    )
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
+tracked_head_file_sha256() {
+    local repo_root="$1"
+    local file="$2"
+    local canonical_root canonical_file relative head_sha worktree_sha
+
+    canonical_root="$(realpath -e -- "$repo_root")" || return 1
+    canonical_file="$(realpath -e -- "$file")" || return 1
+    [[ ! -L "$file" ]] || return 1
+    case "$canonical_file" in
+        "${canonical_root}/"*) relative="${canonical_file#"${canonical_root}/"}" ;;
+        *) return 1 ;;
+    esac
+    git -C "$canonical_root" ls-files --error-unmatch -- "$relative" \
+        >/dev/null 2>&1 || return 1
+    worktree_sha="$(sha256sum -- "$canonical_file" | awk '{print $1}')" || return 1
+    head_sha="$(git -C "$canonical_root" show "HEAD:${relative}" | \
+        sha256sum | awk '{print $1}')" || return 1
+    [[ "$head_sha" =~ ^[0-9a-f]{64}$ && "$head_sha" == "$worktree_sha" ]] || \
+        return 1
+    printf '%s' "$head_sha"
+}
+
+qemu_directory_fingerprint() {
+    local build_script="$1"
+    local source_dir="$2"
+
+    bash -c 'source "$1"; directory_fingerprint "$2"' \
+        _ "$build_script" "$source_dir"
+}
+
+qemu_array_fingerprint() {
+    local build_script="$1"
+    shift
+
+    bash -c 'source "$1"; shift; array_fingerprint "$@"' \
+        _ "$build_script" "$@"
+}
+
+validate_qemu_provenance() {
+    local repo_root="$1"
+    local qemu_bin="$2"
+    local qemu_img="$3"
+    local qemu_meta="$4"
+    local toolchain_lock="$5"
+    local source_dir="$6"
+    local build_script="$7"
+    local expected_prefix="${repo_root}/.local/cosim/qemu/${QEMU_VERSION}"
+    local expected_qemu="${expected_prefix}/bin/qemu-system-x86_64"
+    local expected_qemu_img="${expected_prefix}/bin/qemu-img"
+    local expected_meta="${repo_root}/.local/cosim/build/qemu-${QEMU_VERSION}/.cosim-build-meta"
+    local expected_lock="${repo_root}/configs/cosim/toolchain.lock"
+    local expected_source_dir="${repo_root}/.local/cosim/src/qemu-${QEMU_VERSION}"
+    local lock_schema_ok=true meta_schema_ok=true
+    local lock_head_sha="" lock_worktree_sha="" meta_sha=""
+    local lock_version="" lock_source_url="" lock_signature_url=""
+    local lock_signing_key="" lock_signing_key_url="" lock_source_sha=""
+    local lock_source_fingerprint=""
+    local meta_version="" meta_source_url="" meta_source_sha=""
+    local meta_signature_url="" meta_signing_key="" meta_signing_verified=""
+    local meta_initial_source_fingerprint="" meta_source_fingerprint=""
+    local meta_source_pristine="" meta_configure_fingerprint=""
+    local meta_build_fingerprint="" meta_configure_args=""
+    local meta_binary="" meta_binary_sha="" meta_qemu_img=""
+    local meta_qemu_img_sha="" meta_timestamp=""
+    local actual_source_fingerprint="" actual_binary_sha="" actual_qemu_img_sha=""
+    local expected_configure_fingerprint="" expected_build_fingerprint=""
+    local expected_configure_args_display="" quoted_arg="" problem failure_detail=""
+    local -a problems=()
+    local -a lock_keys=(
+        QEMU_VERSION
+        QEMU_SOURCE_URL
+        QEMU_SIGNATURE_URL
+        QEMU_RELEASE_KEY_FINGERPRINT
+        QEMU_RELEASE_KEY_URL
+        QEMU_SOURCE_SHA256
+        QEMU_SOURCE_FINGERPRINT
+    )
+    local -a meta_keys=(
+        version
+        source_url
+        source_sha256
+        signature_url
+        signing_key
+        signing_verified
+        initial_source_fingerprint
+        source_fingerprint
+        source_pristine
+        configure_fingerprint
+        build_fingerprint
+        configure_args
+        binary
+        binary_sha256
+        qemu_img
+        qemu_img_sha256
+        compiler
+        timestamp
+    )
+    local -a configure_args=(
+        "--prefix=${expected_prefix}"
+        "--target-list=x86_64-softmmu"
+        "--disable-download"
+        "--disable-docs"
+        "--disable-gtk"
+        "--disable-sdl"
+        "--disable-werror"
+        "--enable-kvm"
+        "--enable-slirp"
+        "--enable-tools"
+        "--enable-virtfs"
+    )
+
+    [[ "$qemu_meta" == "$expected_meta" && "$toolchain_lock" == "$expected_lock" && \
+       "$source_dir" == "$expected_source_dir" ]] || \
+        problems+=("QEMU provenance 输入不是仓库固定路径")
+
+    if ! metadata_has_exact_assignment_keys "$toolchain_lock" "${lock_keys[@]}"; then
+        lock_schema_ok=false
+        problems+=("toolchain.lock 缺失、符号链接或 assignment schema 不精确")
+    fi
+    if lock_head_sha="$(tracked_head_file_sha256 "$repo_root" "$toolchain_lock")"; then
+        lock_worktree_sha="$(sha256sum -- "$toolchain_lock" | awk '{print $1}')"
+    else
+        problems+=("toolchain.lock 未被 HEAD 跟踪或当前内容不等于 HEAD blob")
+    fi
+    if [[ "$lock_schema_ok" == "true" ]]; then
+        lock_version="$(metadata_value "$toolchain_lock" QEMU_VERSION)"
+        lock_source_url="$(metadata_value "$toolchain_lock" QEMU_SOURCE_URL)"
+        lock_signature_url="$(metadata_value "$toolchain_lock" QEMU_SIGNATURE_URL)"
+        lock_signing_key="$(metadata_value "$toolchain_lock" QEMU_RELEASE_KEY_FINGERPRINT)"
+        lock_signing_key_url="$(metadata_value "$toolchain_lock" QEMU_RELEASE_KEY_URL)"
+        lock_source_sha="$(metadata_value "$toolchain_lock" QEMU_SOURCE_SHA256)"
+        lock_source_fingerprint="$(metadata_value \
+            "$toolchain_lock" QEMU_SOURCE_FINGERPRINT)"
+        [[ "$lock_version" == "$QEMU_VERSION" && \
+           "$lock_source_url" == "$QEMU_SOURCE_URL" && \
+           "$lock_signature_url" == "$QEMU_SIGNATURE_URL" && \
+           "$lock_signing_key" == "$QEMU_RELEASE_KEY_FINGERPRINT" && \
+           "$lock_signing_key_url" == "$QEMU_RELEASE_KEY_URL" && \
+           "$lock_source_sha" =~ ^[0-9a-f]{64}$ && \
+           "$lock_source_fingerprint" =~ ^[0-9a-f]{64}$ ]] || \
+            problems+=("toolchain.lock 的 QEMU 版本、官方 URL、签名密钥、源码 SHA-256 或源码 fingerprint 无效")
+    fi
+
+    if ! metadata_has_exact_keys "$qemu_meta" "${meta_keys[@]}"; then
+        meta_schema_ok=false
+        problems+=("QEMU 构建 metadata 缺失、符号链接或 18 字段 schema 不精确")
+    fi
+    if [[ "$meta_schema_ok" == "true" ]]; then
+        meta_sha="$(sha256sum -- "$qemu_meta" | awk '{print $1}')"
+        meta_version="$(metadata_value "$qemu_meta" version)"
+        meta_source_url="$(metadata_value "$qemu_meta" source_url)"
+        meta_source_sha="$(metadata_value "$qemu_meta" source_sha256)"
+        meta_signature_url="$(metadata_value "$qemu_meta" signature_url)"
+        meta_signing_key="$(metadata_value "$qemu_meta" signing_key)"
+        meta_signing_verified="$(metadata_value "$qemu_meta" signing_verified)"
+        meta_initial_source_fingerprint="$(metadata_value "$qemu_meta" initial_source_fingerprint)"
+        meta_source_fingerprint="$(metadata_value "$qemu_meta" source_fingerprint)"
+        meta_source_pristine="$(metadata_value "$qemu_meta" source_pristine)"
+        meta_configure_fingerprint="$(metadata_value "$qemu_meta" configure_fingerprint)"
+        meta_build_fingerprint="$(metadata_value "$qemu_meta" build_fingerprint)"
+        meta_configure_args="$(metadata_value "$qemu_meta" configure_args)"
+        meta_binary="$(metadata_value "$qemu_meta" binary)"
+        meta_binary_sha="$(metadata_value "$qemu_meta" binary_sha256)"
+        meta_qemu_img="$(metadata_value "$qemu_meta" qemu_img)"
+        meta_qemu_img_sha="$(metadata_value "$qemu_meta" qemu_img_sha256)"
+        meta_timestamp="$(metadata_value "$qemu_meta" timestamp)"
+    fi
+
+    if [[ -x "$qemu_bin" && -f "$qemu_bin" && ! -L "$qemu_bin" && \
+          "$(realpath -e -- "$qemu_bin" 2>/dev/null || true)" == "$expected_qemu" ]]; then
+        actual_binary_sha="$(sha256sum -- "$qemu_bin" | awk '{print $1}')"
+    else
+        problems+=("qemu-system-x86_64 不是仓库固定的普通可执行文件")
+    fi
+    if [[ -x "$qemu_img" && -f "$qemu_img" && ! -L "$qemu_img" && \
+          "$(realpath -e -- "$qemu_img" 2>/dev/null || true)" == "$expected_qemu_img" ]]; then
+        actual_qemu_img_sha="$(sha256sum -- "$qemu_img" | awk '{print $1}')"
+    else
+        problems+=("qemu-img 不是仓库固定的普通可执行文件")
+    fi
+
+    if [[ -d "$source_dir" && ! -L "$source_dir" ]]; then
+        actual_source_fingerprint="$(qemu_directory_fingerprint \
+            "$build_script" "$source_dir" 2>/dev/null || true)"
+    fi
+    [[ "$actual_source_fingerprint" =~ ^[0-9a-f]{64}$ ]] || \
+        problems+=("无法重算 QEMU 源码树 fingerprint")
+    expected_configure_fingerprint="$(qemu_array_fingerprint \
+        "$build_script" "${configure_args[@]}" 2>/dev/null || true)"
+    for problem in "${configure_args[@]}"; do
+        printf -v quoted_arg '%q' "$problem"
+        expected_configure_args_display+="${expected_configure_args_display:+ }${quoted_arg}"
+    done
+    if [[ "$lock_source_sha" =~ ^[0-9a-f]{64}$ && \
+          "$lock_source_fingerprint" =~ ^[0-9a-f]{64}$ && \
+          "$actual_source_fingerprint" == "$lock_source_fingerprint" && \
+          "$expected_configure_fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+        expected_build_fingerprint="$(qemu_array_fingerprint "$build_script" \
+            "$lock_source_sha" "$lock_source_fingerprint" \
+            "$expected_configure_fingerprint" 2>/dev/null || true)"
+    fi
+
+    [[ "$meta_version" == "$lock_version" && \
+       "$meta_source_url" == "$lock_source_url" && \
+       "$meta_source_sha" == "$lock_source_sha" && \
+       "$meta_signature_url" == "$lock_signature_url" && \
+       "$meta_signing_key" == "$lock_signing_key" ]] || \
+        problems+=("QEMU metadata 与 toolchain.lock 的源码及签名身份不一致")
+    [[ "$meta_signing_verified" == "true" ]] || \
+        problems+=("QEMU metadata 未记录 signing_verified=true")
+    [[ "$meta_source_pristine" == "true" && \
+       "$lock_source_fingerprint" =~ ^[0-9a-f]{64}$ && \
+       "$meta_initial_source_fingerprint" == "$lock_source_fingerprint" && \
+       "$meta_source_fingerprint" == "$lock_source_fingerprint" && \
+       "$actual_source_fingerprint" == "$lock_source_fingerprint" ]] || \
+        problems+=("QEMU lock、初始 metadata、当前 metadata 与 live 源码 fingerprint 不一致")
+    [[ "$expected_configure_fingerprint" =~ ^[0-9a-f]{64}$ && \
+       "$meta_configure_fingerprint" == "$expected_configure_fingerprint" && \
+       "$meta_configure_args" == "$expected_configure_args_display" ]] || \
+        problems+=("QEMU configure fingerprint 或参数不等于固定 recipe")
+    [[ "$expected_build_fingerprint" =~ ^[0-9a-f]{64}$ && \
+       "$meta_build_fingerprint" == "$expected_build_fingerprint" ]] || \
+        problems+=("QEMU build fingerprint 不等于锁定 recipe")
+    [[ "$meta_binary" == "$expected_qemu" && \
+       "$meta_binary_sha" =~ ^[0-9a-f]{64}$ && \
+       "$meta_binary_sha" == "$actual_binary_sha" ]] || \
+        problems+=("qemu-system-x86_64 路径或 SHA-256 与 metadata 不一致")
+    [[ "$meta_qemu_img" == "$expected_qemu_img" && \
+       "$meta_qemu_img_sha" =~ ^[0-9a-f]{64}$ && \
+       "$meta_qemu_img_sha" == "$actual_qemu_img_sha" ]] || \
+        problems+=("qemu-img 路径或 SHA-256 与 metadata 不一致")
+    is_rfc3339nano "$meta_timestamp" || \
+        problems+=("QEMU metadata timestamp 不是合法 RFC3339Nano")
+
+    if (( ${#problems[@]} > 0 )); then
+        for problem in "${problems[@]}"; do
+            failure_detail+="${failure_detail:+; }${problem}"
+        done
+        printf '%s' "$failure_detail"
+        return 1
+    fi
+
+    printf '%s' \
+        "metadata=${qemu_meta}; metadata_sha256=${meta_sha}; " \
+        "toolchain_lock=${toolchain_lock}; toolchain_lock_sha256=${lock_worktree_sha}; " \
+        "source_fingerprint=${actual_source_fingerprint}; locked_source_fingerprint=${lock_source_fingerprint}; " \
+        "configure_fingerprint=${expected_configure_fingerprint}; " \
+        "build_fingerprint=${expected_build_fingerprint}; " \
+        "qemu_binary_sha256=${actual_binary_sha}; " \
+        "qemu_img_sha256=${actual_qemu_img_sha}; timestamp=${meta_timestamp}"
 }
 
 check_host_core() {
@@ -480,8 +798,18 @@ select_qemu_binary() {
     fi
 }
 
+select_qemu_img_binary() {
+    local qemu_bin="$1"
+
+    if [[ -n "${QEMU_IMG:-}" ]]; then
+        printf '%s' "$QEMU_IMG"
+    elif [[ -n "$qemu_bin" ]]; then
+        printf '%s/qemu-img' "$(dirname "$qemu_bin")"
+    fi
+}
+
 check_qemu_runtime() {
-    local qemu_bin qemu_dir qemu_img version
+    local qemu_bin qemu_img version qemu_provenance_detail
     qemu_bin="$(select_qemu_binary)"
     if [[ -z "$qemu_bin" || ! -x "$qemu_bin" ]]; then
         add_check run.qemu_binary FAIL true "qemu-system-x86_64 is missing" \
@@ -491,6 +819,9 @@ check_qemu_runtime() {
         add_check run.qemu_q35 UNKNOWN true "QEMU q35 support was not tested"
         add_check run.qemu_kvm UNKNOWN true "QEMU KVM accelerator support was not tested"
         add_check run.qemu_img UNKNOWN true "qemu-img was not tested"
+        add_check run.qemu_provenance FAIL true \
+            "QEMU provenance validation failed" \
+            "qemu-system-x86_64 缺失，无法验证锁文件、构建 metadata 与二进制"
         return
     fi
 
@@ -520,36 +851,73 @@ check_qemu_runtime() {
         add_check run.qemu_kvm FAIL true "QEMU does not provide the KVM accelerator"
     fi
 
-    qemu_dir="$(dirname "$qemu_bin")"
-    qemu_img="${qemu_dir}/qemu-img"
+    qemu_img="$(select_qemu_img_binary "$qemu_bin")"
     if [[ -x "$qemu_img" ]]; then
         add_check run.qemu_img PASS true "qemu-img is installed beside QEMU" "$qemu_img"
     else
         add_check run.qemu_img FAIL true "qemu-img is missing beside QEMU" "$qemu_img"
     fi
 
-    local qemu_meta="${COSIM_DIR}/.local/cosim/build/qemu-10.1.5/.cosim-build-meta"
-    if [[ -r "$qemu_meta" ]]; then
-        local meta_version meta_source_sha meta_binary meta_binary_sha actual_binary_sha
-        meta_version="$(metadata_value "$qemu_meta" version)"
-        meta_source_sha="$(metadata_value "$qemu_meta" source_sha256)"
-        meta_binary="$(metadata_value "$qemu_meta" binary)"
-        meta_binary_sha="$(metadata_value "$qemu_meta" binary_sha256)"
-        actual_binary_sha="$(sha256sum -- "$qemu_bin" 2>/dev/null | awk '{print $1}' || true)"
-        if [[ "$meta_version" == "10.1.5" && \
-              "$meta_source_sha" =~ ^[0-9a-f]{64}$ && \
-              "$meta_binary" == "$qemu_bin" && \
-              "$meta_binary_sha" =~ ^[0-9a-f]{64}$ && \
-              "$meta_binary_sha" == "$actual_binary_sha" ]]; then
-            add_check run.qemu_provenance PASS true \
-                "QEMU provenance matches the selected binary" "$qemu_meta"
-        else
-            add_check run.qemu_provenance FAIL true \
-                "QEMU provenance does not match the selected binary" "$qemu_meta"
-        fi
+    if qemu_provenance_detail="$(validate_qemu_provenance \
+        "$COSIM_DIR" "$qemu_bin" "$qemu_img" "$QEMU_BUILD_META" \
+        "$TOOLCHAIN_LOCK" "$QEMU_SOURCE_DIR" "$QEMU_BUILD_SCRIPT")"; then
+        add_check run.qemu_provenance PASS true \
+            "QEMU lock、源码 recipe、构建 metadata 与两个二进制一致" \
+            "$qemu_provenance_detail"
     else
-        add_check run.qemu_provenance FAIL true "QEMU provenance metadata is missing" "$qemu_meta"
+        add_check run.qemu_provenance FAIL true \
+            "QEMU provenance validation failed" "$qemu_provenance_detail"
     fi
+}
+
+check_guest_provenance() {
+    local resources_dir="$1"
+    local disk_image="$2"
+    local kernel="$3"
+    local m5_binary="$4"
+    local qemu_bin qemu_img run_id detail status required report_path=""
+    local -a command
+
+    qemu_bin="$(select_qemu_binary)"
+    qemu_img="$(select_qemu_img_binary "$qemu_bin")"
+    run_id="${COSIM_RUN_ID:-preflight}"
+    required=false
+    if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+        required=true
+    fi
+    command=(
+        python3 "$GUEST_PROVENANCE_VALIDATOR" verify
+        --repo-root "$COSIM_DIR"
+        --resources-dir "$resources_dir"
+        --metadata "$GUEST_META"
+        --seal "$GUEST_SEAL"
+        --guest-lock "$GUEST_LOCK"
+        --guest-patch "$GUEST_PATCH"
+        --image "$disk_image"
+        --kernel "$kernel"
+        --m5 "$m5_binary"
+        --qemu-bin "$qemu_bin"
+        --qemu-img "$qemu_img"
+        --run-id "$run_id"
+    )
+    if [[ -n "$OUTPUT_DIR" ]]; then
+        report_path="${OUTPUT_DIR}/guest-provenance.json"
+        command+=(--output "$report_path")
+    fi
+
+    if detail="$("${command[@]}" 2>&1)"; then
+        add_check run.guest_provenance PASS "$required" \
+            "Guest metadata, content seal, source recipe, kernel, and m5 agree" \
+            "report=${report_path:-stdout}; image=sealed-stat; kernel=full-sha256; m5=full-sha256"
+        return
+    fi
+
+    status=WARN
+    if [[ "$STRICT_ACCEPTANCE" == "1" ]]; then
+        status=FAIL
+    fi
+    add_check run.guest_provenance "$status" "$required" \
+        "Guest provenance validation failed" "$detail"
 }
 
 check_run_profile() {
@@ -719,6 +1087,7 @@ check_run_profile() {
     # 这里检查的是 Packer source template，而不是安装后的 Guest executable。
     # rocm-install.sh 会先赋予上传副本执行权限，再进行安装。
     check_regular_file run.guest_setup "$guest_setup" 1 false
+    check_guest_provenance "$resources_dir" "$disk_image" "$kernel" "$m5_binary"
 
     local kernel_count
     kernel_count="$(find "${COSIM_DIR}/tests/kernels" -maxdepth 1 -type f -name '*.cpp' \
@@ -830,6 +1199,11 @@ validate_output_dir() {
     esac
     OUTPUT_DIR="$resolved"
 }
+
+# 合同测试只加载纯校验函数；直接执行脚本时才解析参数并运行 profile。
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COSIM_DIR="$(dirname "$SCRIPT_DIR")"
 ARTIFACT_ROOT="${COSIM_DIR}/artifacts"
+GUEST_LOCK="${COSIM_DIR}/configs/cosim/guest.lock"
 
 PROFILE="host"
 JSON_STDOUT=0
@@ -289,7 +290,7 @@ check_network_endpoint() {
     local id="$1"
     local url="$2"
     local accepted_codes="$3"
-    local code
+    local code curl_status=0
 
     if ! command -v curl >/dev/null 2>&1; then
         add_check "$id" UNKNOWN true "network endpoint was not checked because curl is missing"
@@ -300,12 +301,19 @@ check_network_endpoint() {
         return
     fi
 
-    code="$(curl --silent --show-error --location --head \
+    if code="$(curl --silent --show-error --location --head \
         --connect-timeout 5 --max-time 15 \
         --retry 2 --retry-delay 1 --retry-all-errors \
         --output /dev/null \
-        --write-out '%{http_code}' "$url" 2>/dev/null || true)"
-    if [[ "$code" =~ $accepted_codes ]]; then
+        --write-out '%{http_code}' "$url" 2>/dev/null)"; then
+        curl_status=0
+    else
+        curl_status=$?
+    fi
+    if (( curl_status != 0 )); then
+        add_check "$id" FAIL true "HTTPS 端点请求失败" \
+            "curl_exit=${curl_status}; http_status=${code:-unavailable}"
+    elif [[ "$code" =~ $accepted_codes ]]; then
         add_check "$id" PASS true "HTTPS endpoint is reachable" "http_status=${code}"
     elif [[ "$code" == "000" || -z "$code" ]]; then
         add_check "$id" FAIL true "HTTPS endpoint is unreachable" \
@@ -317,10 +325,47 @@ check_network_endpoint() {
 }
 
 check_download_environment() {
+    local packer_url packer_qemu_plugin_url ubuntu_iso_url
+    local guest_kernel_image_deb_url guest_kernel_modules_deb_url
+    local guest_kernel_modules_extra_deb_url guest_kernel_headers_deb_url
+    local guest_kernel_headers_generic_deb_url
+
+    packer_url="$(metadata_value "$GUEST_LOCK" PACKER_URL)"
+    packer_qemu_plugin_url="$(metadata_value "$GUEST_LOCK" PACKER_QEMU_PLUGIN_URL)"
+    ubuntu_iso_url="$(metadata_value "$GUEST_LOCK" UBUNTU_ISO_URL)"
+    guest_kernel_image_deb_url="$(metadata_value "$GUEST_LOCK" GUEST_KERNEL_IMAGE_DEB_URL)"
+    guest_kernel_modules_deb_url="$(metadata_value "$GUEST_LOCK" GUEST_KERNEL_MODULES_DEB_URL)"
+    guest_kernel_modules_extra_deb_url="$(metadata_value "$GUEST_LOCK" GUEST_KERNEL_MODULES_EXTRA_DEB_URL)"
+    guest_kernel_headers_deb_url="$(metadata_value "$GUEST_LOCK" GUEST_KERNEL_HEADERS_DEB_URL)"
+    guest_kernel_headers_generic_deb_url="$(metadata_value "$GUEST_LOCK" GUEST_KERNEL_HEADERS_GENERIC_DEB_URL)"
+
     check_command git true
     check_command curl true
-    check_network_endpoint network.github https://github.com '^(200|301|302)$'
-    check_network_endpoint network.qemu https://download.qemu.org '^(200|301|302)$'
+    # curl 会跟随重定向，因此只接受最终响应状态。
+    check_network_endpoint network.github https://github.com '^200$'
+    check_network_endpoint network.qemu https://download.qemu.org '^200$'
+    check_network_endpoint network.packer "$packer_url" '^(200|206)$'
+    check_network_endpoint network.packer_qemu_plugin "$packer_qemu_plugin_url" \
+        '^(200|206)$'
+    check_network_endpoint network.ubuntu_iso "$ubuntu_iso_url" \
+        '^(200|206)$'
+    check_network_endpoint network.guest_kernel_image_deb \
+        "$guest_kernel_image_deb_url" '^(200|206)$'
+    check_network_endpoint network.guest_kernel_modules_deb \
+        "$guest_kernel_modules_deb_url" '^(200|206)$'
+    check_network_endpoint network.guest_kernel_modules_extra_deb \
+        "$guest_kernel_modules_extra_deb_url" '^(200|206)$'
+    check_network_endpoint network.guest_kernel_headers_deb \
+        "$guest_kernel_headers_deb_url" '^(200|206)$'
+    check_network_endpoint network.guest_kernel_headers_generic_deb \
+        "$guest_kernel_headers_generic_deb_url" \
+        '^(200|206)$'
+    check_network_endpoint network.amdgpu \
+        https://repo.radeon.com/amdgpu/7.0/ubuntu/dists/noble/InRelease \
+        '^200$'
+    check_network_endpoint network.rocm \
+        https://repo.radeon.com/rocm/apt/7.0/dists/noble/InRelease \
+        '^200$'
     # Registry authentication challenges (401) prove the endpoint is reachable.
     check_network_endpoint network.ghcr https://ghcr.io/v2/ '^(200|401|405)$'
 }

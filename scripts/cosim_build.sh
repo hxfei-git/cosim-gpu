@@ -66,6 +66,11 @@ GUEST_KERNEL_DEB_KEYS=(
 )
 GUEST_KERNEL_DEB_FILES=()
 GUEST_RECIPE_VERSION=1
+GUEST_PACKER_INIT_EXIT_CODE="not_run"
+GUEST_PACKER_VALIDATE_EXIT_CODE="not_run"
+GUEST_PACKER_BUILD_EXIT_CODE="not_run"
+GUEST_BUILD_PIPELINE_EXIT_CODE=0
+GUEST_TEE_EXIT_CODE=0
 
 QEMU_BUILD_JOBS="${QEMU_BUILD_JOBS:-4}"
 GEM5_BUILD_JOBS="${GEM5_BUILD_JOBS:-4}"
@@ -1073,6 +1078,276 @@ stage_guest_outputs() {
     mv -- "$built_kernel" "$GUEST_KERNEL_IMAGE"
 }
 
+guest_log_has_repo_network_failure() {
+    local log="$1"
+    local failure_kind="$2"
+
+    [[ -f "$log" ]] || return 1
+    [[ "$failure_kind" == "timeout" || "$failure_kind" == "tls" ]] || \
+        return 2
+    awk -v failure_kind="$failure_kind" '
+        function has_failure(line) {
+            line = tolower(line)
+            if (failure_kind == "timeout") {
+                return line ~ /(connection|operation) timed out/
+            }
+            return line ~ /certificate verification failed/ &&
+                line ~ /(not yet valid|could not handshake)/
+        }
+        function has_repo_failure(line) {
+            return line ~ /repo[.]radeon[.]com/ &&
+                (line ~ /(^|[[:space:]])Err:[0-9]+/ || has_failure(line))
+        }
+        /COSIM_APT_ATTEMPT_BEGIN/ {
+            marker_mode = 1
+            attempt_active = 1
+            attempt_failure = 0
+            terminal_failure = 0
+            previous_repo_failure = 0
+            next
+        }
+        /COSIM_APT_ATTEMPT_SUCCESS/ {
+            marker_mode = 1
+            attempt_active = 0
+            attempt_failure = 0
+            terminal_failure = 0
+            previous_repo_failure = 0
+            next
+        }
+        /COSIM_APT_ATTEMPT_FAILURE/ {
+            marker_mode = 1
+            attempt_active = 0
+            terminal_failure = attempt_failure
+            previous_repo_failure = 0
+            next
+        }
+        {
+            repo_failure = has_repo_failure($0)
+            failure = has_failure($0)
+            correlated = (repo_failure && failure) ||
+                (previous_repo_failure && failure)
+            if (marker_mode) {
+                if (attempt_active && correlated) {
+                    attempt_failure = 1
+                }
+            } else if (correlated) {
+                legacy_failure = 1
+            }
+            previous_repo_failure = repo_failure
+        }
+        END {
+            if (marker_mode) {
+                exit !((attempt_active && attempt_failure) || terminal_failure)
+            }
+            exit !legacy_failure
+        }
+    ' "$log"
+}
+
+guest_network_failure_classification() {
+    local console_log="$1"
+    local packer_log="$2"
+
+    if guest_log_has_repo_network_failure "$console_log" tls ||
+        guest_log_has_repo_network_failure "$packer_log" tls; then
+        printf '%s\n' "guest_network_tls_failure"
+    elif guest_log_has_repo_network_failure "$console_log" timeout ||
+        guest_log_has_repo_network_failure "$packer_log" timeout; then
+        printf '%s\n' "guest_network_timeout"
+    else
+        printf '%s\n' "none"
+    fi
+}
+
+classify_guest_build_failure() {
+    local init_rc="$1"
+    local validate_rc="$2"
+    local packer_build_rc="$3"
+    local build_pipeline_rc="$4"
+    local tee_rc="$5"
+    local installer_log="$6"
+    local console_log="$7"
+    local packer_log="$8"
+    local network_classification
+
+    network_classification="$(guest_network_failure_classification \
+        "$console_log" "$packer_log")"
+    GUEST_FAILURE_SECONDARY_CLASSIFICATION="none"
+
+    if [[ "$packer_build_rc" == "124" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="host_timeout"
+    elif grep -Fq 'Cancelling build after receiving interrupt' "$packer_log" ||
+        [[ "$init_rc" == "130" || "$validate_rc" == "130" ||
+            "$packer_build_rc" == "130" || "$build_pipeline_rc" == "130" ||
+            "$tee_rc" == "130" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="external_interrupt"
+    elif (( tee_rc != 0 )); then
+        GUEST_FAILURE_CLASSIFICATION="artifact_write_failure"
+    elif [[ "$init_rc" == "not_run" || "$init_rc" == "not_recorded" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="packer_stage_status_failure"
+    elif [[ "$init_rc" != "0" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="packer_init_failure"
+    elif [[ "$validate_rc" == "not_run" ||
+        "$validate_rc" == "not_recorded" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="packer_stage_status_failure"
+    elif [[ "$validate_rc" != "0" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="packer_validate_failure"
+    elif [[ "$packer_build_rc" == "not_run" ||
+        "$packer_build_rc" == "not_recorded" ||
+        "$build_pipeline_rc" != "$packer_build_rc" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="packer_stage_status_failure"
+    elif grep -Fq 'COSIM_AUTOINSTALL_ERROR' "$installer_log"; then
+        GUEST_FAILURE_CLASSIFICATION="autoinstall_error"
+    elif ! grep -Fq 'COSIM_AUTOINSTALL_START' "$installer_log"; then
+        GUEST_FAILURE_CLASSIFICATION="boot_or_autoinstall_config_failure"
+    elif ! grep -Fq 'COSIM_AUTOINSTALL_COMPLETE' "$installer_log"; then
+        GUEST_FAILURE_CLASSIFICATION="autoinstall_incomplete"
+    elif [[ "$network_classification" != "none" ]]; then
+        GUEST_FAILURE_CLASSIFICATION="$network_classification"
+    elif grep -Eq 'Connected to SSH|Provisioning with' "$console_log"; then
+        GUEST_FAILURE_CLASSIFICATION="packer_provisioner_failure"
+    else
+        GUEST_FAILURE_CLASSIFICATION="target_boot_or_ssh_failure"
+    fi
+
+    if [[ "$network_classification" != "none" &&
+        "$network_classification" != "$GUEST_FAILURE_CLASSIFICATION" ]]; then
+        GUEST_FAILURE_SECONDARY_CLASSIFICATION="$network_classification"
+    fi
+}
+
+write_guest_packer_stage_status() {
+    local file="$1"
+    local init_rc="$2"
+    local validate_rc="$3"
+    local build_rc="$4"
+
+    write_metadata "$file" \
+        "packer_init_exit_code=${init_rc}" \
+        "packer_validate_exit_code=${validate_rc}" \
+        "packer_build_exit_code=${build_rc}"
+}
+
+run_guest_packer_stages() {
+    local context="$1"
+    local artifact_dir="$2"
+    local stage_status="$3"
+    local qemu_dir init_rc validate_rc build_rc
+
+    init_rc="not_run"
+    validate_rc="not_run"
+    build_rc="not_run"
+    write_guest_packer_stage_status "$stage_status" \
+        "$init_rc" "$validate_rc" "$build_rc" || return 125
+
+    cd "$context" || return 125
+    qemu_dir="$(dirname "$QEMU_BIN")"
+    export PATH="${qemu_dir}:${PATH}"
+    export PACKER_CACHE_DIR
+    export PACKER_PLUGIN_PATH="$PACKER_PLUGIN_ROOT"
+    export PACKER_CONFIG_DIR="$PACKER_CONFIG_ROOT"
+    export CHECKPOINT_DISABLE=1
+    export PACKER_LOG=1
+    export PACKER_LOG_PATH="${artifact_dir}/packer.log"
+
+    if "$PACKER_BIN" init x86-ubuntu-gpu-ml.pkr.hcl; then
+        init_rc=0
+    else
+        init_rc=$?
+    fi
+    write_guest_packer_stage_status "$stage_status" \
+        "$init_rc" "$validate_rc" "$build_rc" || return 125
+    (( init_rc == 0 )) || return "$init_rc"
+
+    if "$PACKER_BIN" validate -var "qemu_path=${QEMU_BIN}" \
+        -var "serial_log=${artifact_dir}/installer-serial.log" \
+        x86-ubuntu-gpu-ml.pkr.hcl; then
+        validate_rc=0
+    else
+        validate_rc=$?
+    fi
+    write_guest_packer_stage_status "$stage_status" \
+        "$init_rc" "$validate_rc" "$build_rc" || return 125
+    (( validate_rc == 0 )) || return "$validate_rc"
+
+    if timeout --signal=INT --kill-after=2m --foreground \
+        "${COSIM_GUEST_BUILD_TIMEOUT:-4h}" \
+        "$PACKER_BIN" build -color=false -var "qemu_path=${QEMU_BIN}" \
+        -var "serial_log=${artifact_dir}/installer-serial.log" \
+        x86-ubuntu-gpu-ml.pkr.hcl; then
+        build_rc=0
+    else
+        build_rc=$?
+    fi
+    write_guest_packer_stage_status "$stage_status" \
+        "$init_rc" "$validate_rc" "$build_rc" || return 125
+    return "$build_rc"
+}
+
+read_guest_packer_stage_value() {
+    local file="$1"
+    local key="$2"
+    local value
+
+    value="$(metadata_value "$file" "$key" || true)"
+    if [[ "$value" == "not_run" ]]; then
+        printf '%s\n' "$value"
+    elif [[ "$value" =~ ^(0|[1-9][0-9]{0,2})$ ]] &&
+        (( 10#$value <= 255 )); then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "not_recorded"
+    fi
+}
+
+run_guest_packer_pipeline() {
+    local context="$1"
+    local artifact_dir="$2"
+    local stage_status="${artifact_dir}/packer-stage-status.txt"
+    local -a pipeline_status
+
+    if run_guest_packer_stages "$context" "$artifact_dir" "$stage_status" \
+        2>&1 | tee "${artifact_dir}/console.log"; then
+        pipeline_status=("${PIPESTATUS[@]}")
+    else
+        pipeline_status=("${PIPESTATUS[@]}")
+    fi
+    GUEST_BUILD_PIPELINE_EXIT_CODE="${pipeline_status[0]}"
+    GUEST_TEE_EXIT_CODE="${pipeline_status[1]}"
+    GUEST_PACKER_INIT_EXIT_CODE="$(read_guest_packer_stage_value \
+        "$stage_status" packer_init_exit_code)"
+    GUEST_PACKER_VALIDATE_EXIT_CODE="$(read_guest_packer_stage_value \
+        "$stage_status" packer_validate_exit_code)"
+    GUEST_PACKER_BUILD_EXIT_CODE="$(read_guest_packer_stage_value \
+        "$stage_status" packer_build_exit_code)"
+
+    [[ "$GUEST_PACKER_INIT_EXIT_CODE" == "0" &&
+        "$GUEST_PACKER_VALIDATE_EXIT_CODE" == "0" &&
+        "$GUEST_PACKER_BUILD_EXIT_CODE" == "0" ]] &&
+        (( GUEST_BUILD_PIPELINE_EXIT_CODE == 0 && GUEST_TEE_EXIT_CODE == 0 ))
+}
+
+write_guest_attempt_status() {
+    local file="$1"
+    local status="$2"
+    local classification="$3"
+    local secondary_classification="$4"
+    local attempt_id="$5"
+
+    write_metadata "$file" \
+        "status=${status}" \
+        "classification=${classification}" \
+        "secondary_classification=${secondary_classification}" \
+        "packer_init_exit_code=${GUEST_PACKER_INIT_EXIT_CODE}" \
+        "packer_validate_exit_code=${GUEST_PACKER_VALIDATE_EXIT_CODE}" \
+        "packer_build_exit_code=${GUEST_PACKER_BUILD_EXIT_CODE}" \
+        "build_pipeline_exit_code=${GUEST_BUILD_PIPELINE_EXIT_CODE}" \
+        "tee_exit_code=${GUEST_TEE_EXIT_CODE}" \
+        "packer_exit_code=${GUEST_BUILD_PIPELINE_EXIT_CODE}" \
+        "attempt=${attempt_id}" \
+        "timestamp=$(date -Iseconds)"
+}
+
 build_guest() {
     [[ -d "${RESOURCES_DIR}/.git" || -f "${RESOURCES_DIR}/.git" ]] || \
         die "gem5-resources submodule is not initialized: ${RESOURCES_DIR}"
@@ -1094,8 +1369,7 @@ build_guest() {
     local resources_commit template_tree patch_sha m5_sha qemu_sha qemu_img_sha
     local lock_sha recipe_fingerprint attempt_id attempt_root context artifact_dir
     local built_image built_kernel image_sha kernel_sha image_size kernel_size
-    local packer_rc tee_rc classification log_name kernel_deb
-    local -a pipeline_status
+    local classification secondary_classification log_name kernel_deb
     resources_commit="$(git -C "$RESOURCES_DIR" rev-parse HEAD)"
     template_tree="$(git -C "$RESOURCES_DIR" rev-parse "${resources_commit}:${GUEST_TEMPLATE_REL}")"
     patch_sha="$(sha256sum "$GUEST_PATCH" | awk '{print $1}')"
@@ -1149,59 +1423,20 @@ build_guest() {
 
     echo "guest build attempt: ${attempt_id}"
     echo "guest build evidence: ${artifact_dir}"
-    set +e
-    (
-        local qemu_dir
-        cd "$context"
-        qemu_dir="$(dirname "$QEMU_BIN")"
-        export PATH="${qemu_dir}:${PATH}"
-        export PACKER_CACHE_DIR
-        export PACKER_PLUGIN_PATH="$PACKER_PLUGIN_ROOT"
-        export PACKER_CONFIG_DIR="$PACKER_CONFIG_ROOT"
-        export CHECKPOINT_DISABLE=1
-        export PACKER_LOG=1
-        export PACKER_LOG_PATH="${artifact_dir}/packer.log"
-        "$PACKER_BIN" init x86-ubuntu-gpu-ml.pkr.hcl
-        "$PACKER_BIN" validate -var "qemu_path=${QEMU_BIN}" \
-            -var "serial_log=${artifact_dir}/installer-serial.log" \
-            x86-ubuntu-gpu-ml.pkr.hcl
-        timeout --signal=INT --kill-after=2m --foreground \
-            "${COSIM_GUEST_BUILD_TIMEOUT:-4h}" \
-            "$PACKER_BIN" build -color=false -var "qemu_path=${QEMU_BIN}" \
-            -var "serial_log=${artifact_dir}/installer-serial.log" \
-            x86-ubuntu-gpu-ml.pkr.hcl
-    ) 2>&1 | tee "${artifact_dir}/console.log"
-    pipeline_status=("${PIPESTATUS[@]}")
-    packer_rc="${pipeline_status[0]}"
-    tee_rc="${pipeline_status[1]}"
-    set -e
-    if (( packer_rc != 0 || tee_rc != 0 )); then
-        if (( tee_rc != 0 )); then
-            classification="artifact_write_failure"
-        elif (( packer_rc == 124 )); then
-            classification="host_timeout"
-        elif grep -Fq 'COSIM_AUTOINSTALL_ERROR' \
-            "${artifact_dir}/installer-serial.log"; then
-            classification="autoinstall_error"
-        elif ! grep -Fq 'COSIM_AUTOINSTALL_START' \
-            "${artifact_dir}/installer-serial.log"; then
-            classification="boot_or_autoinstall_config_failure"
-        elif ! grep -Fq 'COSIM_AUTOINSTALL_COMPLETE' \
-            "${artifact_dir}/installer-serial.log"; then
-            classification="autoinstall_incomplete"
-        elif grep -Eq 'Connected to SSH|Provisioning with' \
-            "${artifact_dir}/console.log"; then
-            classification="packer_provisioner_failure"
-        else
-            classification="target_boot_or_ssh_failure"
-        fi
-        write_metadata "${artifact_dir}/attempt-status.txt" \
-            "status=failed" \
-            "classification=${classification}" \
-            "packer_exit_code=${packer_rc}" \
-            "tee_exit_code=${tee_rc}" \
-            "attempt=${attempt_id}" \
-            "timestamp=$(date -Iseconds)"
+    if ! run_guest_packer_pipeline "$context" "$artifact_dir"; then
+        classify_guest_build_failure \
+            "$GUEST_PACKER_INIT_EXIT_CODE" \
+            "$GUEST_PACKER_VALIDATE_EXIT_CODE" \
+            "$GUEST_PACKER_BUILD_EXIT_CODE" \
+            "$GUEST_BUILD_PIPELINE_EXIT_CODE" \
+            "$GUEST_TEE_EXIT_CODE" \
+            "${artifact_dir}/installer-serial.log" \
+            "${artifact_dir}/console.log" \
+            "${artifact_dir}/packer.log"
+        classification="$GUEST_FAILURE_CLASSIFICATION"
+        secondary_classification="$GUEST_FAILURE_SECONDARY_CLASSIFICATION"
+        write_guest_attempt_status "${artifact_dir}/attempt-status.txt" \
+            failed "$classification" "$secondary_classification" "$attempt_id"
         echo "guest build failed; evidence and context preserved:" >&2
         echo "  classification: ${classification}" >&2
         echo "  ${artifact_dir}" >&2
@@ -1212,26 +1447,16 @@ build_guest() {
     built_image="${context}/disk-image/x86-ubuntu-rocm70"
     built_kernel="${context}/vmlinux-rocm70"
     if ! validate_guest_image "$built_image"; then
-        write_metadata "${artifact_dir}/attempt-status.txt" \
-            "status=failed" \
-            "classification=post_packer_image_validation_failure" \
-            "packer_exit_code=0" \
-            "tee_exit_code=0" \
-            "attempt=${attempt_id}" \
-            "timestamp=$(date -Iseconds)"
+        write_guest_attempt_status "${artifact_dir}/attempt-status.txt" \
+            failed post_packer_image_validation_failure none "$attempt_id"
         echo "guest build failed host-side raw-image validation; evidence preserved:" >&2
         echo "  ${artifact_dir}" >&2
         echo "  ${attempt_root}" >&2
         return 1
     fi
     if ! validate_guest_kernel "$built_kernel"; then
-        write_metadata "${artifact_dir}/attempt-status.txt" \
-            "status=failed" \
-            "classification=post_packer_kernel_validation_failure" \
-            "packer_exit_code=0" \
-            "tee_exit_code=0" \
-            "attempt=${attempt_id}" \
-            "timestamp=$(date -Iseconds)"
+        write_guest_attempt_status "${artifact_dir}/attempt-status.txt" \
+            failed post_packer_kernel_validation_failure none "$attempt_id"
         echo "guest build failed host-side kernel validation; evidence preserved:" >&2
         echo "  ${artifact_dir}" >&2
         echo "  ${attempt_root}" >&2
@@ -1272,13 +1497,8 @@ build_guest() {
         "artifacts=${artifact_dir}" \
         "timestamp=$(date -Iseconds)"
     cp "$GUEST_META" "${artifact_dir}/provenance.txt"
-    write_metadata "${artifact_dir}/attempt-status.txt" \
-        "status=passed" \
-        "classification=guest_build_complete" \
-        "packer_exit_code=0" \
-        "tee_exit_code=0" \
-        "attempt=${attempt_id}" \
-        "timestamp=$(date -Iseconds)"
+    write_guest_attempt_status "${artifact_dir}/attempt-status.txt" \
+        passed guest_build_complete none "$attempt_id"
     echo "guest image built: ${GUEST_IMAGE}"
     echo "guest kernel built: ${GUEST_KERNEL_IMAGE}"
 }

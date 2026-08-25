@@ -1,8 +1,8 @@
 diff --git a/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh b/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh
-index 8a8fd056..67a32034 100755
+index 8a8fd056..759834a1 100755
 --- a/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh
 +++ b/src/x86-ubuntu-gpu-ml/scripts/rocm-install.sh
-@@ -7,18 +7,25 @@
+@@ -7,18 +7,58 @@
  # All rights reserved.
  # SPDX-License-Identifier: BSD 3-Clause
  
@@ -15,17 +15,51 @@ index 8a8fd056..67a32034 100755
 +readonly KERNEL="6.8.0-79-generic"
 +readonly KERNEL_PACKAGE_VERSION="6.8.0-79.79"
 +readonly KERNEL_DEB_DIR="/home/gem5/kernel-debs"
++readonly APT_COMMAND_ATTEMPTS=3
++readonly APT_ACQUIRE_RETRIES=5
++readonly NETWORK_TIMEOUT_SECONDS=30
++readonly NETWORK_RETRY_DELAY_SECONDS=10
++
++apt_get_with_retry() {
++    local attempt command_name
++    local -a apt_options=(
++        -o "Acquire::Retries=${APT_ACQUIRE_RETRIES}"
++        -o "Acquire::http::Timeout=${NETWORK_TIMEOUT_SECONDS}"
++        -o "Acquire::https::Timeout=${NETWORK_TIMEOUT_SECONDS}"
++    )
++    command_name="${1:-unknown}"
++    if [[ "$command_name" == "update" ]]; then
++        apt_options+=(-o "APT::Update::Error-Mode=any")
++    fi
++
++    for ((attempt = 1; attempt <= APT_COMMAND_ATTEMPTS; attempt++)); do
++        echo "COSIM_APT_ATTEMPT_BEGIN command=${command_name} attempt=${attempt}"
++        if apt-get "${apt_options[@]}" "$@"; then
++            echo "COSIM_APT_ATTEMPT_SUCCESS command=${command_name} attempt=${attempt}"
++            return 0
++        fi
++        echo "COSIM_APT_ATTEMPT_FAILURE command=${command_name} attempt=${attempt}" >&2
++        if (( attempt == APT_COMMAND_ATTEMPTS )); then
++            echo "apt-get 在 ${APT_COMMAND_ATTEMPTS} 次尝试后仍失败" >&2
++            return 1
++        fi
++        echo "apt-get 第 ${attempt} 次尝试失败；将在 $((NETWORK_RETRY_DELAY_SECONDS * attempt)) 秒后重试" >&2
++        sleep "$((NETWORK_RETRY_DELAY_SECONDS * attempt))"
++    done
++}
 +
  # Installing the packages in this script instead of the user-data
  # file dueing ubuntu autoinstall. The reason is that sometimes
  # the package install failes. This method is more reliable.
  echo 'installing packages'
- apt-get update
+-apt-get update
 -apt-get install -y scons
 -apt-get install -y git
 -apt-get install -y vim
 -apt-get install -y build-essential
-+apt-get install -y --no-install-recommends scons git vim build-essential ca-certificates gpg wget
++apt_get_with_retry update
++apt_get_with_retry install -y --no-install-recommends \
++    scons git vim build-essential ca-certificates gpg wget
  
  # Remove the motd
 -rm /etc/update-motd.d/*
@@ -33,13 +67,16 @@ index 8a8fd056..67a32034 100755
  
  # Build the m5 util
  if [ -f /home/gem5/m5 ]; then
-@@ -63,8 +69,11 @@ sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+@@ -63,8 +103,14 @@ sudo mkdir --parents --mode=0755 /etc/apt/keyrings
  
  # Download the key, convert the signing-key to a full
  # keyring required by apt and store in the keyring directory
 -wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
 -        gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-+wget https://repo.radeon.com/rocm/rocm.gpg.key -O /tmp/rocm.gpg.key
++wget --https-only --timeout="$NETWORK_TIMEOUT_SECONDS" \
++    --tries="$APT_ACQUIRE_RETRIES" --retry-connrefused \
++    --waitretry="$NETWORK_RETRY_DELAY_SECONDS" \
++    https://repo.radeon.com/rocm/rocm.gpg.key -O /tmp/rocm.gpg.key
 +printf '%s  %s\n' "$ROCM_KEY_SHA256" /tmp/rocm.gpg.key | sha256sum --check --strict
 +gpg --dearmor < /tmp/rocm.gpg.key | \
 +        sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
@@ -47,21 +84,23 @@ index 8a8fd056..67a32034 100755
  
  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/7.0/ubuntu noble main" \
          | sudo tee /etc/apt/sources.list.d/amdgpu.list
-@@ -75,9 +84,11 @@ echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
+@@ -75,9 +121,11 @@ echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
          | sudo tee /etc/apt/preferences.d/rocm-pin-600
- sudo apt update
+-sudo apt update
++apt_get_with_retry update
  
 -sudo apt -y install amdgpu-dkms
 -sudo apt -y install rocm
-+sudo apt -y install "amdgpu-dkms=${AMDGPU_DKMS_VERSION}"
-+sudo apt -y install "rocm=${ROCM_VERSION}"
- sudo apt -y install cmake
++apt_get_with_retry install -y "amdgpu-dkms=${AMDGPU_DKMS_VERSION}"
++apt_get_with_retry install -y "rocm=${ROCM_VERSION}"
+-sudo apt -y install cmake
++apt_get_with_retry install -y cmake
 +test -x /opt/rocm/bin/hipcc
 +modinfo amdgpu >/dev/null
  
  # Make directory for GPU BIOS. These are placed in /root for compatibility with
  # the legacy GPUFS configs.
-@@ -93,10 +105,20 @@ sudo chmod 777 /usr/lib/firmware/amdgpu/ip_discovery.bin
+@@ -93,10 +143,20 @@ sudo chmod 777 /usr/lib/firmware/amdgpu/ip_discovery.bin
  
  # Install a known-working version of Linux as this might change after stable
  # release. Install this after DKMS so they are rebuilt.
@@ -76,7 +115,7 @@ index 8a8fd056..67a32034 100755
 +    echo "Expected exactly five pinned kernel packages in ${KERNEL_DEB_DIR}" >&2
 +    exit 1
 +fi
-+sudo apt-get install -y "${kernel_debs[@]}"
++apt_get_with_retry install -y "${kernel_debs[@]}"
 +test "$(dpkg-query -W -f='${Version}' "linux-image-${KERNEL}")" = \
 +    "$KERNEL_PACKAGE_VERSION"
 +test "$(dpkg-query -W -f='${Version}' "linux-headers-${KERNEL}")" = \
@@ -86,7 +125,7 @@ index 8a8fd056..67a32034 100755
  
  echo "Extracting linux kernel"
  sudo bash -c "/usr/src/linux-headers-${KERNEL}/scripts/extract-vmlinux /boot/vmlinuz-${KERNEL} > /home/gem5/vmlinux-gpu-ml"
-@@ -105,7 +125,7 @@ sudo bash -c "/usr/src/linux-headers-${KERNEL}/scripts/extract-vmlinux /boot/vm
+@@ -103,7 +161,7 @@ sudo bash -c "/usr/src/linux-headers-${KERNEL}/scripts/extract-vmlinux /boot/vm
  
  # Build the gem5 Linux module containing symbols missing due to outdated ACPI support in gem5
  pushd /home/gem5
@@ -95,7 +134,7 @@ index 8a8fd056..67a32034 100755
  if [ ! -f ./gem5_wmi.ko ]; then
      echo "gem5_wmi module did not appear to build correctly. This disk will not be usable."
      echo "Please post an issue at https://github.com/gem5/gem5/issues with this output log."
-@@ -118,25 +138,8 @@ touch /usr/lib/firmware/amdgpu/mi350_discovery
+@@ -118,25 +176,8 @@ touch /usr/lib/firmware/amdgpu/mi350_discovery
  chmod 777 /usr/lib/firmware/amdgpu/mi300_discovery
  chmod 777 /usr/lib/firmware/amdgpu/mi350_discovery
  

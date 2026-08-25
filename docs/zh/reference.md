@@ -1,530 +1,512 @@
 [English](../en/reference.md)
 
-# 协同仿真参考手册
+# 协同仿真速查与 Debug 手册
 
-QEMU + gem5 MI300X 协同仿真系统的综合查阅参考。概念性说明请参阅[架构文档](architecture.md)；分步构建和运行指南请参阅[快速入门](getting-started.md)。
+本文是仓库自带 MI300X 协同仿真流程的操作速查手册，采用 artifact-first 原则：
+如果没有 program identity、simulator log、provenance 与 verified cleanup，console
+中的 PASS 或 build 成功都不能验收。机制说明见 [architecture.md](architecture.md)，
+引导实验见 [labs.md](labs.md)。
 
----
+## 1. 操作规则
 
-## 1. 参数参考
+1. 所有命令从顶层仓库执行。
+2. 使用 `scripts/cosim_build.sh`、`cosim_launch.sh`、
+   `run_cosim_tests.sh`、`cosim_cleanup.sh` 与仓库 evidence tool；不能用临时
+   Docker、SCons、QEMU 或 `/dev/shm` 命令替代。
+3. 每次运行使用唯一且安全的 `COSIM_RUN_ID`，并在 `artifacts/` 下指定全新、
+   空的 artifact directory。
+4. 每个 operator 使用一个全新的 QEMU+gem5 session。launcher 为每次运行创建
+   qcow2 overlay，raw Guest image 只作为 backing image。
+5. 保留第一次失败的 run，先分类再 rebuild 或改源码；修复后重跑相同 target。
+6. `artifacts/` 是本地证据且被 Git 忽略；清理 workspace 前复制唯一证据。
 
-### 1.1 cosim_launch.sh / mi300_cosim.py 选项
+host setup wrapper 永远不会读取或修改 `.wslconfig`、Windows/BIOS 设置、proxy、
+sudoers 或 credential。把用户加入 `docker` 组必须是明确的安全决策，因为该组提供
+root-equivalent host control。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--socket-path` | `/tmp/gem5-mi300x.sock` | QEMU <-> gem5 通信套接字（vfio-user 协议） |
-| `--shmem-path` | `/mi300x-vram` | GPU VRAM 共享内存名称（/dev/shm 下） |
-| `--shmem-host-path` | `/cosim-guest-ram` | Guest RAM 共享内存名称（/dev/shm 下） |
-| `--dgpu-mem-size` | `16GiB` | GPU VRAM 大小 |
-| `--num-compute-units` | `40` | GPU 计算单元数量 |
-| `--mem-size` | `8GiB` | Guest 物理内存大小 |
-| `--gem5-debug` | （无） | gem5 调试标志，例如 `MI300XCosim`、`AMDGPUDevice,PM4PacketProcessor` |
-| `--vram-size` | `32GiB` | 自定义 VRAM 大小（`--dgpu-mem-size` 的别名） |
-| `--num-cus` | `80` | 自定义 CU 数量（`--num-compute-units` 的别名） |
+## 2. Canonical workflow
 
-### 1.2 amdgpu modprobe 参数
+### 2.1 Host 与 build 检查
 
-协同仿真模式下所有参数均为必需。完整命令：
-
-```bash
-modprobe amdgpu ip_block_mask=0x67 ppfeaturemask=0 dpm=0 audio=0 ras_enable=0 discovery=2
-```
-
-| 参数 | 值 | 用途 |
-|------|-----|------|
-| `ip_block_mask` | `0x67` | 二进制 `0110_0111`。启用 common、GMC、IH、GFX、SDMA；禁用 PSP（bit 3）和 SMU（bit 4）。详见[第 3 节](#3-ip-block-mask-参考) |
-| `ppfeaturemask` | `0` | 禁用所有 PowerPlay 特性；cosim 无电源管理硬件 |
-| `dpm` | `0` | 禁用动态电源管理 |
-| `audio` | `0` | 禁用 HDMI/DP 音频；cosim 无音频硬件 |
-| `ras_enable` | `0` | 禁用 RAS（可靠性、可用性、可维护性）。防止 VBIOS 最小化（cosim ROM 仅 3 KB）时 `atom_context` 为 NULL 导致的空指针崩溃 |
-| `discovery` | `2` | 使用磁盘上的固件文件进行 IP discovery，而非从 GPU ROM/寄存器读取 |
-
-> **警告**：使用 `ip_block_mask=0x6f`（启用 bit 3 的 PSP）会导致 PSP 固件加载失败和内核 panic。务必使用 `0x67`。
-
-> **警告**：`ras_enable=0` 为强制参数。缺少时，`amdgpu_ras_init` 会调用 `amdgpu_atom_parse_data_header` 访问 NULL 的 `atom_context`，触发空指针崩溃。
-
-### 1.3 dd 命令参数（VGA ROM）
+只读 host/runtime 检查：
 
 ```bash
-dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128
+./scripts/cosim_host_setup.sh audit --for-user "$(id -un)"
+./scripts/cosim_host_setup.sh verify --for-user "$(id -un)"
+
+PREFLIGHT_ID="preflight-$(date +%Y%m%d-%H%M%S)"
+./scripts/cosim_preflight.sh run --json \
+    --output-dir "artifacts/amd-gpu-learning-env/preflight/${PREFLIGHT_ID}"
 ```
 
-| 参数 | 值 | 含义 |
-|------|-----|------|
-| `if` | `/root/roms/mi300.rom` | ROM 二进制文件（在磁盘镜像中） |
-| `of` | `/dev/mem` | 物理内存设备 |
-| `bs` | `1k` | 块大小 = 1024 字节 |
-| `seek` | `768` | 跳转至 768 x 1024 = `0xC0000`（传统 VGA ROM 区域） |
-| `count` | `128` | 写入 128 x 1024 = 128 KB |
-
-`dd` 步骤将 MI300X VBIOS 写入共享内存（`/dev/shm/cosim-guest-ram`）中的物理地址 `0xC0000`--`0xDFFFF`。gem5 的 `AMDGPUDevice::readROM()` 通过 `system->getPhysMem()` 从该地址读取。此步骤在 `modprobe` 之前**必须**执行 -- amdgpu 驱动的五种 BIOS 发现方法在 cosim 模式下全部失败：
-
-| BIOS 发现方法 | 在 cosim 下失败的原因 |
-|---------------|----------------------|
-| `amdgpu_atrm_get_bios()` | QEMU Q35 无 ACPI ATRM 方法 |
-| `amdgpu_acpi_vfct_bios()` | 无 ACPI VFCT 表 |
-| `amdgpu_read_bios_from_rom()` | 通过 SMU 寄存器读取，但 SMU 被 `ip_block_mask=0x67` 禁用 |
-| `amdgpu_read_platform_bios()` | 无平台提供的 ROM |
-| `amdgpu_read_disabled_bios()` | cosim 下不可用 |
-
-### 1.4 内核命令行
-
-内核必须使用以下命令行启动：
-
-```
-console=ttyS0,115200 root=/dev/vda1 modprobe.blacklist=amdgpu
-```
-
-`modprobe.blacklist=amdgpu` 防止 PCI 子系统在 ROM 写入共享内存之前自动加载驱动。`cosim-gpu-setup.service` 会按正确顺序初始化（dd ROM → modprobe）。
-
----
-
-## 2. 版本矩阵
-
-| 组件 | 版本 |
-|------|------|
-| Guest 操作系统 | Ubuntu 24.04.2 LTS |
-| Guest 内核 | 6.8.0-79-generic |
-| ROCm | 7.0.0 |
-| amdgpu DKMS | 匹配 ROCm 7.0 |
-| gem5 构建目标 | VEGA_X86 |
-| GPU 设备 | MI300X (gfx942, DeviceID 0x74A0) |
-| 一致性协议 | GPU_VIPER |
-| QEMU | 系统安装的 QEMU 10.1+，并提供 `vfio-user-pci` |
-
-### Docker 镜像
-
-| 镜像 | 用途 |
-|------|------|
-| `ghcr.io/gem5/gpu-fs:latest` | gem5 运行时容器的基础镜像（amd64） |
-| `gem5-run:local` | 从 `scripts/Dockerfile.run` 构建的运行时镜像（添加 Python 3.12 支持） |
-| `ghcr.io/gem5/ubuntu-24.04_all-dependencies:v24-0` | gem5 编译用（仅 arm64） |
-
-> 在 amd64 宿主机上，请使用 `ghcr.io/gem5/gpu-fs` 作为编译镜像或原生编译。
-
-### 构建产物
-
-| 产物 | 路径 | 大小 |
-|------|------|------|
-| gem5 二进制 | `build/VEGA_X86/gem5.opt` | 约 1.1 GB |
-| 磁盘镜像 | `../gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` | 约 55 GB |
-| 内核 | `../gem5-resources/src/x86-ubuntu-gpu-ml/vmlinux-rocm70` | 约 64 MB |
-| QEMU 二进制 | 宿主机 `PATH` 中的 `qemu-system-x86_64` | -- |
-
----
-
-## 3. IP Block Mask 参考
-
-### 检测顺序表
-
-`ip_block_mask` 参数使用的是 **检测顺序索引** 作为位位置，而非 `amd_shared.h` 中的 `amd_ip_block_type` 枚举值。枚举值具有误导性 -- 真正起作用的是 IP discovery 过程中各块出现的顺序。
-
-MI300X 检测顺序（ROCm 7.0 DKMS，来自 dmesg）：
-
-| 索引 | IP Block | mask 中的位 | 在 0x67 中是否启用？ |
-|------|----------|-------------|----------------------|
-| 0 | `soc15_common` | `0x01` | 是 |
-| 1 | `gmc_v9_0` | `0x02` | 是 |
-| 2 | `vega20_ih` | `0x04` | 是 |
-| 3 | `psp` | `0x08` | **否**（禁用） |
-| 4 | `smu` | `0x10` | **否**（禁用） |
-| 5 | `gfx_v9_4_3` | `0x20` | 是 |
-| 6 | `sdma_v4_4_2` | `0x40` | 是 |
-| 7 | `vcn_v4_0_3` | `0x80` | 否（非必需） |
-| 8 | `jpeg_v4_0_3` | `0x100` | 否（非必需） |
-
-### 位掩码计算
-
-驱动检查 `(amdgpu_ip_block_mask & (1 << i))`，其中 `i` 是检测顺序索引（`amdgpu_device.c:2807`）。
-
-```
-0x67 = 0110_0111 (binary)
-       ||||_||||
-       |||| |||+-- bit 0: soc15_common  (enabled)
-       |||| ||+--- bit 1: gmc_v9_0      (enabled)
-       |||| |+---- bit 2: vega20_ih     (enabled)
-       |||| +----- bit 3: psp           (DISABLED)
-       |||+------- bit 4: smu           (DISABLED)
-       ||+-------- bit 5: gfx_v9_4_3    (enabled)
-       |+--------- bit 6: sdma_v4_4_2   (enabled)
-       +---------- bit 7: vcn_v4_0_3    (disabled)
-```
-
-### 常见掩码值
-
-| 掩码 | 二进制 | 启用的 IP 块 | 用途 |
-|------|--------|-------------|------|
-| `0x67` | `0110_0111` | common、GMC、IH、GFX、SDMA | **cosim（正确值）** |
-| `0x6f` | `0110_1111` | common、GMC、IH、PSP、GFX、SDMA | **错误 -- PSP 导致内核 panic** |
-| `0xFF` | `1111_1111` | 包含 PSP+SMU 在内的所有块 | 仅限真实硬件 |
-
----
-
-## 4. 已知问题与陷阱
-
-### 4.1 VGA ROM 空指针崩溃
-
-| | |
-|---|---|
-| **症状** | `modprobe amdgpu` 导致内核空指针崩溃，位于 `amdgpu_atom_parse_data_header+0x1b`。调用链：`amdgpu_ras_init` -> `amdgpu_atomfirmware_mem_ecc_supported` -> `amdgpu_atom_parse_data_header`。RAX=0（NULL `atom_context`） |
-| **根因** | amdgpu 驱动的五种 BIOS 发现方法在 cosim 模式下全部失败（详见[第 1.3 节](#13-dd-命令参数vga-rom)）。驱动打印 `"Unable to locate a BIOS ROM"` 后继续执行，但 RAS 初始化路径无条件调用 `amdgpu_atom_parse_data_header()` 而不检查 NULL `atom_context`。驱动通过 SMU 寄存器访问 ROM，而非 PCI ROM BAR |
-| **修复** | 在 `modprobe` **之前**执行 `dd if=/root/roms/mi300.rom of=/dev/mem bs=1k seek=768 count=128`。`cosim-gpu-setup.service` 会自动完成此操作 |
-
-### 4.2 PSP / SMU 固件加载失败
-
-| | |
-|---|---|
-| **症状** | `PSP load tmr failed!`、`hw_init of IP block <psp> failed -22`、`Fatal error during GPU init` |
-| **根因** | `ip_block_mask=0x6f` 启用了 PSP（检测顺序索引 3），但 cosim 不模拟 PSP 硬件。`amd_shared.h` 中的 `amd_ip_block_type` 枚举显示 PSP=4，但 mask 使用的是检测顺序，PSP 的索引为 3 |
-| **修复** | 使用 `ip_block_mask=0x67` 同时禁用 PSP（bit 3）和 SMU（bit 4）。详见[第 3 节](#3-ip-block-mask-参考) |
-
-### 4.3 协同仿真模式下 GART 表未填充
-
-| | |
-|---|---|
-| **症状** | 大量 `GART translation for X not found` 警告。PM4 读到全零内存（opcode 0x0）。KIQ ring test 超时 |
-| **根因** | VRAM 由共享内存（`/dev/shm/mi300x-vram`）支撑。驱动对 VRAM 的写入完全绕过 gem5 的内存系统，因此 `AMDGPUVM::gartTable` 哈希表不会通过 `AMDGPUDevice::writeFrame()` 被填充 |
-| **修复** | `GARTTranslationGen::translate()` 中的协同仿真回退机制：当 `gartTable` 未命中时，直接从共享 VRAM 的 `vramShmemPtr + (gartBase - fbBase) + gart_byte_offset` 处读取 PTE。关键细节：`getGARTAddr()` 已将页索引乘以 8，因此 `bits(vaddr, 63, 12)` 已经是字节偏移 -- 不可再乘以 8 |
-
-### 4.4 GART 未映射页崩溃
-
-| | |
-|---|---|
-| **症状** | `hipMalloc OK` 后，gem5 段错误并伴随重复的 `GART translation for 0x3fff800000000 not found` 警告。无限 DMA 重试导致内存耗尽 |
-| **根因** | GPU PM4/SDMA 引擎尝试 DMA 到驱动尚未映射的 GART 页（PTE=0）。原始代码创建 `GenericPageTableFault`，但 DMA 回调链无限重试同一个失败地址 |
-| **修复** | 未映射的 GART 页被映射到 sink（`paddr=0`）。DMA 读操作返回零，写操作被丢弃，仿真保持存活。这是正常现象：`ptStart` 处的第一页本身就是未映射的 |
-
-### 4.5 SDMA Ring 测试超时
-
-| | |
-|---|---|
-| **症状** | 驱动初始化过程中 SDMA ring 测试返回 `-110`（`-ETIMEDOUT`）。`sdma v4_4_2: ring 0 test failed (-110)` |
-| **根因** | `sdma_engine.hh` 中 `sdma_delay` 默认值为 `1e9` ticks。在 cosim 模式下，对应约 500ms 墙钟时间，超过驱动约 200ms 的超时窗口。流程：驱动写入 SDMA ring 并敲 doorbell → gem5 以 `sdma_delay` ticks 延迟调度 SDMA 事件 → 驱动在 gem5 完成前超时 |
-| **修复** | 将 `sdma_delay` 从 `1e9` 减小到 `1000` ticks。将 `KEEPALIVE_INTERVAL` 增大到 `1e9` 以避免 keepalive 干扰时序 |
-
-### 4.6 VRAM 地址 GART 翻译错误
-
-| | |
-|---|---|
-| **症状** | 地址 `0x1f72fa8000` 产生 861,000 多次 GART 翻译错误，内存耗尽，段错误 |
-| **根因** | SDMA rptr 回写地址和 PM4 RELEASE_MEM 目标地址可能指向 VRAM（地址 < 16 GiB）。这些地址经过 `getGARTAddr()` 处理时页号会被乘以 8，然后 GART 查找失败，因为 VRAM 没有对应的页表项 |
-| **修复** | 三层防护：(1) PM4：`writeData()`、`releaseMem()`、`queryStatus()` 检查 `isVRAMAddress(addr)` 并路由到 `getMemMgr()->writeRequest()`。(2) SDMA：`setGfxRptrLo/Hi()` 和 rptr 回写对 VRAM 地址跳过 `getGARTAddr()`。(3) GART 兜底：检测 VRAM 地址并映射到 sink（`paddr=0`） |
-
-### 4.7 共享内存文件偏移量不匹配
-
-| | |
-|---|---|
-| **症状** | GART 页表项读出全为零。PM4 opcode 0x0（NOP，count 0）无限重复 |
-| **根因** | QEMU Q35 配置 8 GiB RAM 时：`below_4g = 2 GiB`（当 `ram_size >= 0xB0000000` 时硬编码）。gem5 配置为 3 GiB 以下 / 5 GiB 以上。QEMU 将 4G 以上数据放在文件偏移 2 GiB 处；gem5 从偏移 3 GiB 处读取 -- 全为零 |
-| **修复** | `mi300_cosim.py` 复刻了 Q35 的拆分逻辑：`below_4g = min(total_mem, 0x80000000 if total_mem >= 0xB0000000 else 0xB0000000)` |
-
-### 4.8 定时器溢出崩溃
-
-| | |
-|---|---|
-| **症状** | 经过数十亿 tick 后，gem5 因 `curTick()` 整数溢出而崩溃。`schedule()` 断言失败 |
-| **根因** | RTC 和 PIT 定时器持续调度事件，在 cosim 的长期运行模式下导致 tick 计数器溢出 |
-| **修复** | 为 `Cmos` 添加了 `disable_rtc_events` 参数，为 `I8254` 添加了 `disable_timer_events` 参数。在 `mi300_cosim.py` 中均设为禁用。cosim 桥接中的 keepalive 事件防止事件队列变空 |
-
-### 4.9 PM4ReleaseMem.dataSelect Panic
-
-| | |
-|---|---|
-| **症状** | gem5 panic，报错 `Unimplemented PM4ReleaseMem.dataSelect` |
-| **根因** | `pm4_packet_processor.cc` 仅实现了 `dataSelect == 1`（32 位数据写入）。驱动在 GFX 初始化过程中使用其他模式 |
-| **修复** | 添加了所有常见 dataSelect 值：0 = 不写入数据（仅触发事件），1 = 32 位写入（已有），2 = 64 位写入，3 = 64 位 GPU 时钟计数器，其他 = 警告并视为空操作 |
-
-### 4.10 不支持的 PM4 操作码
-
-| | |
-|---|---|
-| **症状** | gem5 在遇到未识别的 PM4 opcode 时崩溃 |
-| **根因** | `ACQUIRE_MEM` (0x58) 和 `SET_RESOURCES` (0xA0) 未被处理 |
-| **修复** | 两者均已添加到 `pm4_defines.hh` 并在 `pm4_packet_processor.cc:decodeHeader()` 中作为跳过并继续（NOP）处理 |
-
-### 4.11 PCI Class Code 不匹配
-
-| | |
-|---|---|
-| **症状** | amdgpu 驱动跳过了 `0xC0000` 处的 legacy VGA ROM 检查 |
-| **根因** | PCI class 为 `PCI_CLASS_DISPLAY_OTHER (0x0380)` 而非 `PCI_CLASS_DISPLAY_VGA (0x0300)` |
-| **修复** | 改为 `PCI_CLASS_DISPLAY_VGA`。内核随即将该地址范围识别为"带有 shadowed ROM 的视频设备" |
-
-### 4.12 QEMU 串口控制台冲突
-
-| | |
-|---|---|
-| **症状** | 同时使用 `-serial unix:/tmp/serial.sock -nographic` 时 guest 无串口输出 |
-| **根因** | `-nographic` 隐含了 `-serial mon:stdio`，创建映射到 stdio 的 serial0。显式的 `-serial unix:...` 变成 serial1（ttyS1），但内核使用的是 `console=ttyS0` |
-| **修复** | 单独使用 `-nographic`。如需程序化访问，在 `screen` 中运行 QEMU |
-
-### 4.13 gem5 链接时内存不足（OOM）
-
-| | |
-|---|---|
-| **症状** | 即使使用 `-j2`，链接器也被 OOM killer 终止 |
-| **根因** | 默认链接器占用内存过多 |
-| **修复** | 使用 `scons build/VEGA_X86/gem5.opt -j1 GOLD_LINKER=True --linker=gold` |
-
-### 4.14 DRM Client 错误 -13（缺少 DKMS 模块）
-
-| | |
-|---|---|
-| **症状** | `Failed to init DRM client: -13` 后内核 panic。`ttm_resource_move_to_lru_tail` 中空指针崩溃 |
-| **根因** | 磁盘镜像缺少 `amddrm_exec.ko.zst` DKMS 模块。缺少此模块时 TTM 内存管理器初始化失败，`drm_dev_enter()` 返回 `-EACCES`（-13） |
-| **修复** | 使用最新的 `gem5-resources`（`origin/stable` 分支）重新构建磁盘镜像。用 `guestfish` 确认 `amddrm_exec.ko.zst` 存在于 `/lib/modules/6.8.0-79-generic/updates/dkms/` 中 |
-
-### 4.15 驱动 hw_init 失败后 rmmod 导致 oops
-
-| | |
-|---|---|
-| **症状** | 驱动 `hw_init` 失败后，`rmmod amdgpu` 导致 kernel oops（`kgd2kfd_device_exit` 中的 page fault）。模块停留在 "busy" 状态 |
-| **根因** | 部分初始化后清理路径不健壮 |
-| **修复** | 无法绕过。需重启整个 cosim 环境（杀掉 QEMU，重启 gem5 Docker 容器，重启 QEMU） |
-
----
-
-## 5. 调试快速参考
-
-### gem5 调试标志
-
-| 标志组合 | 显示内容 |
-|----------|----------|
-| `MI300XCosim` | cosim socket/vfio-user 消息 |
-| `AMDGPUDevice` | MMIO 寄存器读/写 |
-| `PM4PacketProcessor` | PM4 包解码和处理 |
-| `SDMAEngine` | SDMA 操作 |
-| `AMDGPUDevice,PM4PacketProcessor` | MMIO + PM4（组合） |
-| `MI300XCosim,AMDGPUDevice,PM4PacketProcessor` | 完整 cosim 调试 |
-
-用法：
+可复现 build interface：
 
 ```bash
-./scripts/cosim_launch.sh --gem5-debug MI300XCosim
-# 或手动：
-build/VEGA_X86/gem5.opt --debug-flags=MI300XCosim,AMDGPUDevice ...
+./scripts/cosim_build.sh status
+./scripts/cosim_build.sh all
 ```
 
-### 日志检查命令
+focused action 为 `qemu`、`gem5`、`m5` 和 `guest`。普通 wrapper 是 incremental
+且有 hash gate；`--force` 会重跑 action，但不会删除 build tree。cold Guest build
+成本很高，并可能在 locked recipe 内重新解析 package；它保证功能可复现，不保证
+逐字节一致。
+
+### 2.2 单条可验收 HIP 运行
+
+严格 `cosim-matrix-verification/v2` acceptance 必须显式 opt in。先确认 top-level
+与 gem5 source tree 都 clean，再显式设置 `COSIM_STRICT_ACCEPTANCE=1`：
 
 ```bash
-# gem5 容器日志（stderr）
-docker logs gem5-cosim 2>&1 | tee /tmp/gem5.log
-
-# 过滤警告/错误
-docker logs gem5-cosim 2>&1 | grep -E "warn|error|GART"
-
-# Guest dmesg（通过 screen）
-screen -S qemu-cosim -X stuff 'dmesg | tail -20\n'
-
-# Guest 串口输出（独立仿真）
-tail -f m5out/board.pc.com_1.device
+RUN_ID="vector-poll-$(date +%Y%m%d-%H%M%S)"
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh \
+    --boot-timeout 240 \
+    --test-timeout 60 \
+    --guest-run-timeout 1800 \
+    --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo \
+    vector_add
 ```
 
-### 增量重建
+只接受空 prefix、`HSA_ENABLE_INTERRUPT=0` 与 `HSA_ENABLE_INTERRUPT=1`；空值
+表示 `0`。runner 会打印并记录 Guest 中真正生效的值，只有请求的 prefix 不能作为
+证据。
+
+interrupt comparison 必须使用不同 run 与 artifact directory：
 
 ```bash
-# 删除过期的目标文件，然后重建
-docker run --rm -v "$PWD:/gem5" -w /gem5 gem5-run:local \
-    sh -c 'rm -f build/VEGA_X86/dev/amdgpu/<file>.o'
-docker run --rm -v "$PWD:/gem5" -w /gem5 \
-    gem5-run:local scons build/VEGA_X86/gem5.opt -j1
+RUN_ID="vector-irq-$(date +%Y%m%d-%H%M%S)"
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
+    ./scripts/run_cosim_tests.sh \
+    --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
+    --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,AMDGPUDevice,MI300XCosim \
+    vector_add
 ```
 
-### 快速诊断表
+### 2.3 Regression 与重复运行
 
-| 症状 | 首先检查 |
-|------|----------|
-| gem5 容器启动后立即退出 | `docker logs gem5-cosim` |
-| QEMU 连接失败 | gem5 是否就绪？（socket `chmod 777` 了吗？） |
-| `psp_gpu_reset` 空指针崩溃 | `ip_block_mask` 错误（应使用 `0x67`） |
-| GART translation not found | 是否使用了最新编译的 gem5 二进制？ |
-| SDMA ring test -110 | 检查 `sdma_delay` 是否为 `1000` |
-| hipcc "cannot find ROCm device library" | `ls /opt/rocm/lib/`，使用 `--offload-arch=gfx942` |
-| MMIO 读取全部返回零 | gem5 未连接或已崩溃 |
-| `insmod: ERROR: could not load module` | 内核版本不匹配 |
-| `cosim-gpu-setup.service` 失败 | `journalctl -u cosim-gpu-setup` |
-| BAR 布局 probe 错误 -12 | 检查 `MI300XVfioUser` 导出的 BAR 区域描述 |
-
----
-
-## 6. GART 表格式与 PTE 布局
-
-GPU 地址空间和转换流程的概念性说明请参阅[架构文档 §5](architecture.md#gpu-地址转换与-gart)。
-
-### GART PTE 格式
-
-每个 GART 页表项为 8 字节：
-
-| 位域 | 字段 | 描述 |
-|------|-------|------|
-| 0 | Valid | 条目有效 |
-| 1 | System | 1 = 系统内存，0 = 本地 VRAM |
-| 5:2 | Fragment | 页面片段大小 |
-| 47:12 | Physical Page | 物理地址 >> 12 |
-| 51:48 | Block Fragment | 块片段大小 |
-| 63:52 | Flags | MTYPE、PRT 等 |
-
-**物理地址提取**：`paddr = (bits(PTE, 47, 12) << 12) | page_offset`
-
-### Aperture 寄存器
-
-| 寄存器 | gem5 字段 | 格式 | 描述 |
-|--------|-----------|------|------|
-| `MC_VM_FB_LOCATION_BASE` | `vmContext0.fbBase` | `bits[23:0] << 24` | MC 地址空间中 VRAM 的起始地址 |
-| `MC_VM_FB_LOCATION_TOP` | `vmContext0.fbTop` | `bits[23:0] << 24 \| 0xFFFFFF` | VRAM 结束地址 |
-| `MC_VM_FB_OFFSET` | `vmContext0.fbOffset` | `bits[23:0] << 24` | FB 重定位偏移量 |
-| `MC_VM_AGP_BASE` | `vmContext0.agpBase` | `bits[23:0] << 24` | AGP 重映射基地址 |
-| `MC_VM_AGP_BOT` | `vmContext0.agpBot` | `bits[23:0] << 24` | AGP aperture 底部 |
-| `MC_VM_AGP_TOP` | `vmContext0.agpTop` | `bits[23:0] << 24 \| 0xFFFFFF` | AGP aperture 顶部 |
-| `MC_VM_SYSTEM_APERTURE_LOW_ADDR` | `vmContext0.sysAddrL` | `bits[29:0] << 18` | System aperture 低地址 |
-| `MC_VM_SYSTEM_APERTURE_HIGH_ADDR` | `vmContext0.sysAddrH` | `bits[29:0] << 18` | System aperture 高地址 |
-| `VM_CONTEXT0_PAGE_TABLE_BASE_ADDR` | `vmContext0.ptBase` | raw 64-bit | GART 表在 VRAM 中的位置 |
-| `VM_CONTEXT0_PAGE_TABLE_START_ADDR` | `vmContext0.ptStart` | raw 64-bit | GART aperture 起始地址（页号） |
-| `VM_CONTEXT0_PAGE_TABLE_END_ADDR` | `vmContext0.ptEnd` | raw 64-bit | GART aperture 结束地址（页号） |
-
-### 协同仿真中的典型值
-
-```
-ptBase   = 0x3EE600000     GART table at VRAM offset ~15.7 GiB
-ptStart  = 0x7FFF00000     GART covers GPU VAs from 0x7FFF00000000
-ptEnd    = 0x7FFF1FFFF     GART covers ~128K pages (512 MiB)
-fbBase   = 0x8000000000    VRAM starts at MC address 512 GiB
-fbTop    = 0x8400FFFFFF    VRAM ends at ~528 GiB (16 GiB range)
-sysAddrL = 0x0             System aperture start
-sysAddrH = 0x3FFEC0000     System aperture end (~4 TiB)
-```
-
-### GART 表在 VRAM 中的布局
-
-```
-VRAM offset = ptBase (gartBase)
-+-------------------+  ptBase + 0
-| PTE[0]  (8 bytes) |  maps page ptStart
-+-------------------+  ptBase + 8
-| PTE[1]            |  maps page ptStart + 1
-+-------------------+  ptBase + 16
-| PTE[2]            |  maps page ptStart + 2
-| ...               |
-+-------------------+
-| PTE[N]            |  maps page ptStart + N
-+-------------------+  ptBase + (ptEnd - ptStart + 1) * 8
-```
-
-### 协同仿真 PTE 回退查找
-
-在 cosim 模式下，`gartTable` 为空（VRAM 写入绕过 gem5）。回退机制直接从共享 VRAM 读取 PTE：
-
-```cpp
-Addr pte_table_offset = gart_addr - (ptStart * 8);
-Addr pte_vram_offset = gartBase() + pte_table_offset;
-memcpy(&pte, vramShmemPtr + pte_vram_offset, sizeof(pte));
-```
-
-若 PTE 为 0（未映射），则映射到 sink（`paddr=0`）而非产生 fault。
-
----
-
-## 7. 国内镜像配置
-
-在国内构建磁盘镜像时，VM 内的 `apt` 会从 `us.archive.ubuntu.com` 拉包，常因网络波动挂住（Packer 报 `Timeout waiting for SSH`，或 provisioner 在安装 ROCm 时退出）。
-
-### 应用补丁
+固定 operator 集合由 runner 枚举，每个 child 使用 fresh session：
 
 ```bash
-cd gem5-resources
-git apply ../scripts/patches/0001-user-data-cn-mirror.patch
+RUN_ID="regression-$(date +%Y%m%d-%H%M%S)"
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh --all \
+    --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}"
 ```
 
-### 回滚补丁
+检查 nondeterminism 时使用 repeat mode，不能在 Guest 内部临时循环：
 
 ```bash
-cd gem5-resources
-git apply -R ../scripts/patches/0001-user-data-cn-mirror.patch
+RUN_ID="vector-repeat-$(date +%Y%m%d-%H%M%S)"
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh --repeat 3 \
+    --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
+    vector_add
 ```
 
-如需使用其他镜像源，修改 patch 文件中的 URI 后重新 apply。
+### 2.4 Standalone 学习启动与清理
 
----
+interactive launch 适合观察，但因缺少 runner program contract，不能当作 accepted
+operator result：
 
-## 8. 文件参考
+```bash
+RUN_ID="inspect-$(date +%Y%m%d-%H%M%S)"
+COSIM_RUN_ID="$RUN_ID" ./scripts/cosim_launch.sh \
+    --artifact-dir "artifacts/amd-gpu-learning-env/standalone/${RUN_ID}" \
+    --gem5-debug MI300XCosim,AMDGPUDevice
+```
 
-### gem5 源文件（`src/dev/amdgpu/`）
+正常退出会自动执行 manifest-scoped cleanup。该 foreground launch 不会创建
+runner-owned、run-scoped 的 `launcher.pid`；若正常 trap 被绕过，不能只凭 manifest
+清理，必须停止并诊断仍有 ownership 的 session。对于被中断的 runner-owned
+session，应遵循 [run-scoped recovery 流程](getting-started.md#manifest-scoped-cleanup)：
+它通过 `launcher.pid` 校验精确的 `scripts/cosim_launch.sh` process group 与 artifact
+directory，停止该 group 并确认退出，随后才允许 `cosim_cleanup.sh` 使用 exact
+manifest。
 
-| 文件 | 用途 |
-|------|------|
-| `mi300x_vfio_user.{cc,hh}` | vfio-user 服务端 SimObject |
-| `MI300XVfioUser.py` | SimObject Python 封装（vfio-user） |
-| `cosim_bridge.hh` | vfio-user 服务端使用的抽象 CosimBridge 接口 |
-| `amdgpu_device.cc` | GPU 设备模型核心，`readROM()`、`intrPost()`、`writeFrame()` |
-| `amdgpu_vm.{cc,hh}` | 所有转换生成器（GART、AGP、MMHUB、User），cosim VRAM 回退 |
-| `pm4_packet_processor.{cc,hh}` | PM4 包解码、DMA 路由、VRAM 写路由、`isVRAMAddress()` |
-| `pm4_defines.hh` | PM4 操作码，包括 `IT_ACQUIRE_MEM`、`IT_SET_RESOURCES` |
-| `sdma_engine.{cc,hh}` | SDMA 操作、rptr 回写路由、`sdma_delay` 参数 |
-| `interrupt_handler.cc` | IH ring buffer DMA 和 MSI-X 中断发送 |
-| `amdgpu_nbio.cc` | ASIC 初始化完成寄存器 |
+不能猜 PID，也不能按 global name/glob 删除 socket、container、shared memory 或
+session directory。`cosim_launch.sh --force-clean` 刻意只做 dry-run；unscoped
+confirmed deletion 会被拒绝。
 
-### gem5 配置和脚本
+## 3. Wrapper interface 与默认值
 
-| 文件 | 用途 |
-|------|------|
-| `configs/example/gpufs/mi300_cosim.py` | vfio-user cosim 系统配置 |
-| `configs/example/gem5_library/x86-mi300x-gpu.py` | 独立 stdlib 仿真配置 |
-| `configs/example/gpufs/mi300.py` | Legacy 独立仿真配置 |
-| `scripts/cosim_launch.sh` | cosim 编排（Docker + QEMU 启动） |
-| `scripts/run_mi300x_fs.sh` | 构建编排（编译、磁盘镜像、运行） |
-| `scripts/Dockerfile.run` | 运行时 Docker 镜像定义 |
-| `scripts/patches/0001-user-data-cn-mirror.patch` | 磁盘镜像构建的国内镜像补丁 |
+### 3.1 Build 与 preflight
 
-### gem5 修改的基础设施文件
+| Interface | 支持值/含义 |
+|---|---|
+| `cosim_preflight.sh host|build|run` | host inventory；build prerequisite 与 pin；完整 runtime asset |
+| `cosim_build.sh status` | 报告 QEMU、gem5、m5 与 Guest metadata/hash 状态 |
+| `cosim_build.sh qemu|gem5|m5|guest|all` | 仓库自带 incremental build action |
+| `cosim_build.sh ... --force` | 重跑选定 action，但不会删除 build tree |
 
-| 文件 | 变更内容 |
-|------|----------|
-| `src/dev/intel_8254_timer.{cc,hh}` | `disable_timer_events` 参数（cosim 定时器溢出修复） |
-| `src/dev/mc146818.{cc,hh}` | `disable_rtc_events` 参数（cosim 定时器溢出修复） |
+build provenance 位于 `.local/cosim/build/`，并会复制进 runtime artifact。QEMU
+source identity 由 `configs/cosim/toolchain.lock` 固定；Guest recipe/package identity
+位于 `configs/cosim/guest.lock`。
 
-### gem5 Python 组件
+### 3.2 Launcher 默认值
 
-| 文件 | 用途 |
-|------|------|
-| `src/python/gem5/prebuilt/viper/board.py` | ViperBoard：readfile 注入、驱动加载 |
-| `src/python/gem5/components/devices/gpus/amdgpu.py` | MI300X 设备定义 |
+| Option | Default / contract |
+|---|---|
+| QEMU | 若存在则使用 pinned `.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64` |
+| gem5 | `gem5/build/VEGA_X86/gem5.opt`，container image `gem5-run:local` |
+| `--host-mem`、`--host-cpus` | `8G`、`4` |
+| `--vram-size`、`--num-cus` | `16GiB`、每个 modeled GPU 40 个 CU |
+| `--num-gpus` | `1` |
+| `--timeout` | 等待 gem5 listener ready 的 120 秒 |
+| socket | `/tmp/gem5-mi300x-<run-id>.sock`；不符合 run-scoped form 的 custom path 会被拒绝 |
+| Guest disk | raw base 加 `/tmp/cosim-<run-id>.session/guest-overlay.qcow2` |
+| Guest RAM / VRAM | `/dev/shm` 中的 run-scoped file |
+| `--artifact-dir` | resolve 后必须位于仓库 `artifacts/` 下 |
+| `--gem5-debug` | 逗号分隔的 gem5 debug flag |
+| `--qemu-trace` | QEMU trace event expression，例如 `vfio_user_*` |
+| `--share-dir` | 可选 9p host directory；resolved path 必须存在 |
 
-### 外部依赖
+launcher 用 `.local/cosim/runtime.lock` 串行化访问；并发 runtime session 会被明确
+拒绝。
 
-| 路径 | 用途 |
-|------|------|
-| `ext/libvfio-user/` | libvfio-user 库（git 子模块，vfio-user 传输层） |
+### 3.3 Runner 默认值
 
-### Guest 磁盘镜像内容
+| Option / value | Default / constraint |
+|---|---|
+| `--boot-timeout` | 240 秒 |
+| `--test-timeout` | Guest 内 60 秒 |
+| `--guest-run-timeout` | compile 加 test 的 1800 秒 host deadline |
+| `--all` | 全部 `tests/kernels/*.cpp` operator，每个一个 fresh session |
+| `--repeat N` | 同一精确 operator，N 个 fresh session |
+| `--keep-alive` | 只用于诊断；与 repeat mode 不兼容 |
+| operator | 精确 lowercase kernel stem，例如 `vector_add`；不接受 substring match |
+| `COSIM_STRICT_ACCEPTANCE` | `0`/未设置：允许 diagnostic mode 与 dirty replay；`1`：strict v2 acceptance，且两个 source tree 必须 clean |
 
-| 文件（Guest 内部） | 用途 |
-|--------------------|------|
-| `/root/roms/mi300.rom` | VGA BIOS ROM 二进制 |
-| `/usr/lib/firmware/amdgpu/mi300_discovery` | IP discovery 固件 |
-| `/etc/systemd/system/cosim-gpu-setup.service` | 自动加载服务单元 |
-| `/usr/local/bin/cosim-gpu-setup.sh` | 自动加载脚本 |
-| `/lib/modules/$(uname -r)/updates/dkms/amdgpu.ko.zst` | amdgpu 内核模块（ROCm 7.0 DKMS） |
-| `/home/gem5/load_amdgpu.sh` | 驱动加载脚本（独立仿真） |
-| `/sbin/m5` | gem5 伪指令工具 |
+未知 `--name VALUE` option 会传给 `cosim_launch.sh`。每个 output directory 必须
+不存在或为空，也不能是 symlink。Diagnostic mode 仍会归档 dirty provenance，
+不会把 dirty run 静默提升为 strict acceptance。
 
-### PCI BAR 布局
+## 4. Locked 与实测 identity
 
-| BAR | 资源 | 类型 | 大小 |
-|-----|------|------|------|
-| BAR0+1 | VRAM | 64-bit prefetchable | 16 GiB（共享内存） |
-| BAR2+3 | Doorbell | 64-bit | 4 MiB |
-| BAR4 | MSI-X | exclusive | -- |
-| BAR5 | MMIO 寄存器 | 32-bit | 512 KiB（转发到 gem5） |
+以下数值描述 preserved 2026-08-23 baseline，不自动承诺后续 rebuild 相同：
 
-驱动常量：`AMDGPU_VRAM_BAR=0`、`AMDGPU_DOORBELL_BAR=2`、`AMDGPU_MMIO_BAR=5`。
+| Component | Identity |
+|---|---|
+| QEMU source | 10.1.5；archive SHA-256 `1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693` |
+| QEMU binary | SHA-256 `89eccd422cac9ce206171a31ec1f5db963a3c76c2b3d8e8f53d1ebd058a9a5eb` |
+| Guest OS/kernel | Ubuntu 24.04.2 recipe；`6.8.0-79-generic` |
+| ROCm / DKMS | `7.0.0.70000-38~24.04`；`1:6.14.14.30100000-2204008.24.04` |
+| gem5 source | `4c1f90498f89e15a3797cb50e9b534164bc57536` |
+| gem5 binary | SHA-256 `a395b7efdaef1067223bf1e3d82780f0bdde190bee99735b12e10c377e1777a1` |
+| m5 | SHA-256 `1fa0fa253551eea1f1921560c92b2028146d630bef896266664865c5e2b15256` |
+| GPU identity | synthetic `1002:74a0`、`gfx942`；配置 16 GiB VRAM、建模 40 个 CU |
 
-### 资源路由
+Phase 4 trace row 采集于当前 qcow2-overlay hardening 之前。它们仍是对应 source 与
+binary 的有效 dispatch/interrupt mechanism evidence，但不能证明当前 launcher 的
+disk-isolation contract。新的 acceptance run 还必须归档 `guest-overlay.json`、
+`guest-base-stat.txt` 与 `guest-build-meta.txt`，并证明执行前后 raw base image hash
+不变。
 
-| 资源 | 通过 vfio-user？ | 通过共享内存？ |
-|------|------------------------|---------------|
-| MMIO 寄存器（BAR5） | 是 | 否 |
-| VRAM（BAR0，16 GiB） | **否** | 是（`/dev/shm/mi300x-vram`） |
-| Doorbell（BAR2） | 是 | 否 |
+## 5. Artifact 验收 contract
 
-任何通过拦截 VRAM 写入来填充的 gem5 数据结构（如 `gartTable`、页表、ring buffer）在 cosim 模式下都**不会**被填充，需要显式的共享 VRAM 回退机制。
+### 5.1 Per-run 证据
+
+普通 operator artifact 包含：
+
+| Role | Expected file |
+|---|---|
+| 精确 command/environment | `runner-invocation.txt`、`launch-invocation.txt`、`runner-metadata.txt`、`guest-run.sh` |
+| Guest 与 QEMU stream | `qemu.log` |
+| gem5 stream | `gem5.log` |
+| program result | `verdict.json`、`classifier-output.json`、本地 `matrix.tsv` |
+| source identity | `patch/source-snapshot.txt`、repo/gem5 status 与 patch file |
+| binary identity | `patch/binary-provenance.txt` |
+| lifecycle | `runner-category.txt`、`launcher-category.txt`、`cleanup-status.txt` |
+| resource state | process、socket 与 `/dev/shm` snapshot |
+| 新运行的 disk isolation | `guest-overlay.json`、`guest-base-stat.txt`、`guest-build-meta.txt` |
+
+Strict v2 PASS 必须显式设置 `COSIM_STRICT_ACCEPTANCE=1`，且 top-level 与 gem5
+source tree 都 clean；同一个 artifact 还必须证明：精确 program identity、compile
+exit 0、test exit 0、恰好一个 `[PASS] <program>`、无 FAIL marker 或
+timeout/early simulator exit、唯一 effective HSA interrupt value、manifest 与实际
+invocation/timeout 一致、完整 source/binary provenance、完整 QEMU/gem5 evidence 与
+verified cleanup。普通学习或 dirty replay 默认属于 diagnostic mode，不是 strict v2
+PASS；只有记录 `COSIM_STRICT_ACCEPTANCE=1` 的 artifact 才能进入 final v2 matrix。
+
+`scripts/classify_runs.py` 会刻意拒绝只有 PASS marker 的结果。主要 reason 包括
+`program_identity_mismatch`、`compile_failure`、`timeout`、
+`simulator_early_exit`、`nonzero_test_exit`、`fail_marker_present`、
+`invalid_pass_marker_count`、`cleanup_failure` 与 `evidence_incomplete`。
+
+### 5.2 Audit、classify 与 verify
+
+打开大型 log 前先生成 compact index：
+
+```bash
+ARTIFACT="artifacts/amd-gpu-learning-env/tests/<run-id>"
+python3 scripts/cosim_artifact_audit.py \
+    --root "$ARTIFACT" --out "$ARTIFACT/audit" --json
+python3 scripts/classify_runs.py \
+    --artifact-dir "$ARTIFACT" --program vector_add --json
+```
+
+audit 会保留 raw log，并生成带 source attribution 的 `row_status.tsv`、
+`verdicts.tsv`、`provenance.tsv`、`log_availability.tsv`、`signals.tsv`、
+`review_queue.tsv` 与 `raw_read_plan.tsv` 等 table。选择 raw log window 前先读
+`raw_read_plan.tsv`。
+
+对于冻结的 matrix，要验证 accepted manifest row、top-level matrix row、per-row
+verdict、metadata、hash 与可 replay source snapshot 之间严格一一对应：
+
+```bash
+python3 scripts/verify_cosim_matrix.py \
+    --manifest artifacts/amd-gpu-learning-env/tests/run-manifest.tsv \
+    --matrix artifacts/amd-gpu-learning-env/matrix.tsv \
+    --output artifacts/amd-gpu-learning-env/matrix-verification.json
+```
+
+manifest 记录 intent 与 acceptance status，本身不是 runtime evidence。
+当前严格输出 schema 是 `cosim-matrix-verification/v2`；缺少
+`runner-invocation.txt`、`launch-invocation.txt` 或 `guest-run.sh` 的历史 row 不能冒充
+当前验收证据。
+
+### 5.3 实测 dispatch checkpoint
+
+polling vector artifact 记录：
+
+- 精确 source SHA-256
+  `c195ff32bada2bd8acce4f9361a9fb515c4f468fd86116746eb2030a0df17ff5`；
+- flags `HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo`；
+- 唯一匹配的 AQL Task 2、grid 4352、workgroup size 256；
+- workgroup 0–16、HSA completion 与 `Completed kernel 2`；
+- 两次未隐藏的 transient invalidate retry。
+
+interrupt artifact 增加 `AMDGPUDevice,MI300XCosim` flag，并在 gem5 tick
+`783006015986249` 记录 signal 1→0、IH ring/cookie/write-pointer event 和 IRQ
+vector 0。这些是有用的 comparison anchor；line number 与 hash 必须从各自 trace
+verdict 读取，不能复制成新运行的结论。
+
+## 6. Artifact-first 失败路由
+
+### 6.1 第一个失败组件
+
+先读 `verdict.json`、本地 matrix row 与 audit table，再按第一个 durable event
+路由：
+
+| 第一个 durable evidence | Primary owner / 下一步证据 |
+|---|---|
+| preflight 或 `readiness_fail` | 在 Guest 分析前检查 host access、pin、image、socket 或 shared-memory readiness |
+| `gem5_init_timeout` 或 container 早退 | gem5 command/provenance 与 `gem5.log` 首尾 |
+| QEMU 存活时 `boot_timeout` | Guest boot/serial state；此时不能先改 GPU code |
+| workload output 前的 compile/loader error | staged source/binary 与 Guest ROCm environment |
+| gem5 fatal、panic 或 assertion | gem5 是 primary；后续 QEMU EOF/socket error 是 secondary |
+| `User translation fault`、GART PTE 缺失、VMID/PASID mismatch | address、PTE、page-table base、queue/doorbell owner 与最近 passing row |
+| AQL doorbell 后无进展 | queue read/write/dispatch pointer、packet type 与 HSA scheduler |
+| workgroup 推进但 test timeout | throughput/timeout budget 或后续 completion/signal state，不能立即改功能语义 |
+| kernel completion 后 result mismatch | memory domain、copy/SDMA、cache visibility 与精确 output check |
+| signal 已到零但 host 仍等待 | polling 与 mailbox/event、IH ring/write pointer、MSI-X evidence |
+| `cleanup_fail` | 保留 artifact；校验并停止其 run-scoped launcher process group，确认退出，随后且仅随后使用 exact manifest |
+
+如果 QEMU 的 `error_setv`、broken pipe、EOF 或 device-lost 出现在同一 run 更早的
+gem5 fatal 之后，它只是 secondary propagation symptom。在 same-run evidence
+证明 QEMU 先失败前，不能先 patch QEMU。
+
+### 6.2 最小 comparison 记录
+
+改源码前记录：
+
+- failing run ID、精确 operator/source/binary、interrupt value 与 timeout；
+- 第一条 durable failure 及其前方 bounded window；
+- provenance 匹配的最近 passing row，或无法比较的原因；
+- 第一个不同 object：packet/dispatch/queue ID、doorbell offset、signal address、
+  VMID、PASID、GPU virtual address、physical address 或 PTE；
+- progress counter 是否继续变化，以及 diagnostic 是否覆盖最终 object range；
+- 拥有该 transition 的 source function 与完全相同 target 的 rerun。
+
+若 diagnostic 过滤 queue ID、workgroup、packet ID 或 address，必须记录 covered
+与 observed range。filter 外的缺失是 `coverage_insufficient`，不能证明 event 没有
+发生。
+
+<a id="known-issue-playbook"></a>
+
+### 6.3 历史故障签名索引
+
+下表把旧日志的精确可搜索签名映射到当前处置。它不是当前根因断言，也不授权复用
+历史手工修复；source、binary、Guest 或 environment provenance 不匹配时，根因仍为
+unknown。
+
+| 原编号 | 可搜索签名 | 当前处置与验收含义 |
+|---|---|---|
+| 4.1 | `Unable to locate a BIOS ROM`、`amdgpu_atom_parse_data_header` NULL dereference | ROM 注入已由 Guest setup service 接管；复现时判为 setup/provenance 失败，禁止为验收会话手工写 `/dev/mem` |
+| 4.2 | `PSP load tmr failed`、`hw_init of IP block <psp> failed -22` | `ip_block_mask=0x67` 禁用 PSP/SMU 是 cosim policy；不要现场改 mask 或重载 module |
+| 4.3 | 大量 `GART translation ... not found`、PM4 opcode 0、KIQ timeout | 进入 GART/GPUVM playbook；shared-VRAM PTE fallback 只能按当前源码 provenance 解释 |
+| 4.4 | `hipMalloc OK` 后 GART miss、无限 DMA retry 或 gem5 crash | address-zero/`mapped to sink` 表示 semantic loss，不能作为正确性 PASS |
+| 4.5 | `sdma v4_4_2: ring 0 test failed (-110)` | 进入 SDMA playbook；不得先改 delay 或扩大 timeout |
+| 4.6 | VRAM 地址产生大量 GART miss、OOM 或 segfault | 进入 GART/VRAM routing playbook；验证 PM4/SDMA address domain，不把 sink 当修复 |
+| 4.7 | PTE 全零、PM4 opcode 0 持续循环 | 当前配置已实现 Q35 low/high memory split；复现先查 binary provenance 与 shared-memory layout |
+| 4.8 | 长运行后 `curTick()` overflow 或 `schedule()` assertion | 仅保留为历史签名；当前无证据支持旧因果，按新的 panic artifact 重新分类 |
+| 4.9 | `Unimplemented PM4ReleaseMem.dataSelect` | 进入 PM4 playbook；未知模式的 warn/no-op 不是完整语义 |
+| 4.10 | `PM4 packet opcode 0x... not supported` | 进入 PM4 playbook；`ACQUIRE_MEM`/`SET_RESOURCES` 的 skip 语义不是硬件 fidelity 证明 |
+| 4.11 | PCI class `0x0380`、driver 跳过 legacy VGA ROM | 当前模型为 `0x0300`；复现优先判定错误 binary/config provenance |
+| 4.12 | `-serial` 与 `-nographic` 组合后无 `ttyS0` 输出 | launcher/runner 已使用受控 console/FIFO；禁止绕过 wrapper 手写 QEMU 或 `screen` 命令 |
+| 4.13 | gem5 linker 被 OOM killer 终止 | 进入 build-resource playbook；只通过 `cosim_build.sh` 降低并行度 |
+| 4.14 | `Failed to init DRM client: -13`、`ttm_resource_move_to_lru_tail` panic | 进入 Guest/Driver playbook；先验证 lock、image metadata 与 DKMS 内容，不能只凭 `-13` 断言缺少某个 module |
+| 4.15 | 部分 `hw_init` 后 `rmmod amdgpu` 在 `kgd2kfd_device_exit` oops | 保存 artifact，只有确认 owning launcher process group 已停止后才使用 exact manifest，并启动 fresh session；禁止在污染会话内 unload/reload |
+
+### 6.4 问题级 playbook
+
+#### Guest PCI、ROM 与 Driver 初始化失败
+
+- 触发签名：4.1、4.2、4.11、4.14、4.15，或 PCI 存在但 amdgpu/KFD/ROCm 链路不完整。
+- 当前契约：ROM、discovery 与 module 参数属于 Guest build/setup policy；acceptance 必须来自 fresh session。
+- 必须采集：Guest build metadata、setup service log、PCI ID/class/BAR、driver binding、module state、`/dev/kfd`、render node、`rocminfo` 与第一条 kernel failure。
+- 安全处置：保留当前 artifact，分类第一个失败组件，修复固定构建输入或 setup wrapper，然后冷构建仅在 Guest 内容确实变化时执行。
+- 禁止操作：为 PASS 手工写 `/dev/mem`、在部分 `hw_init` 后 `rmmod/modprobe`、临时改 raw image 或跟随移动分支。
+- 完成条件：相同 probe 在 fresh session 中通过，HIP acceptance row 也 PASS，cleanup 已验证。
+
+#### GART、GPUVM 与 VRAM 路由异常
+
+- 触发签名：4.3、4.4、4.6、4.7，或 `User translation fault`、PTE 缺失、VMID/PASID mismatch。
+- 当前契约：VRAM、VMID0 GART 与 user GPUVM 是不同 domain；shared-backstore fallback 是 `[COSIM]` 实现，不是物理 GPU 行为。
+- 必须采集：VA/PA/PTE、GART/page-table/framebuffer base、VMID/PASID、queue/doorbell owner、packet ID 与最近 provenance 相同的 PASS row。
+- 安全处置：用 `AMDGPUDevice,GPUTLB,GPUPTWalker` 缩小第一个错误 translation，并在同一 target 上验证修复。
+- 禁止操作：把 address-zero/`mapped to sink` 当作安全成功、隐藏 miss、无边界转储整张 page table。
+- 完成条件：目标 object 获得非 sink 的正确转换，dispatch、completion 和结果校验均 PASS。
+
+#### SDMA 初始化或 ring timeout
+
+- 触发签名：4.5，或 SDMA doorbell 后 rptr/fence/trap 无进展。
+- 当前契约：当前源码 `sdma_delay=1000`；旧 timing 根因不能自动套用到新 failure。
+- 必须采集：queue 类型、rptr/wptr、doorbell、opcode、源/目标 address domain、fence/trap 与 progress window。
+- 安全处置：使用 `SDMAEngine,SDMAData,AMDGPUDevice` 找到第一个停止对象，先判断功能停滞还是仅 wall-clock budget 不足。
+- 禁止操作：先改 delay/keepalive、无限扩大 timeout 或把 QEMU secondary exit 当 primary。
+- 完成条件：同一 SDMA target 完成、fence/结果正确且 fresh-session row PASS。
+
+#### PM4 unsupported 或部分语义
+
+- 触发签名：4.9、4.10，未知 opcode/dataSelect，或 rptr 在同一 packet 停止。
+- 当前契约：部分 packet 只建模 baseline 所需语义；warn-and-skip/no-op 不能证明真实 AMD 等价行为。
+- 必须采集：opcode、header/count、queue/rptr/wptr、VMID/PASID、目标地址、release/fence/completion 和 caller。
+- 安全处置：从 `PM4PacketProcessor::process`/`decodeHeader` 跟到具体 handler，以最小 packet 行为测试和相同 HIP row 验证。
+- 禁止操作：把未知 packet 全部 NOP、只消除 panic 而不验证结果，或将 cosim workaround 描述为硬件语义。
+- 完成条件：packet 对当前 workload 的必要 side effect、ordering 与 completion 均有证据，最终结果 PASS。
+
+#### gem5 构建资源不足
+
+- 触发签名：4.13、OOM killer 或 linker 退出但源码编译阶段已完成。
+- 当前契约：`scripts/cosim_build.sh` 是唯一构建入口，并保留 incremental tree 与 provenance。
+- 必须采集：build artifact、host memory/swap、失败阶段、wrapper action/fingerprint 和第一个 linker error。
+- 安全处置：先运行 build preflight，再用 `GEM5_BUILD_JOBS=1 ./scripts/cosim_build.sh gem5` 重试相同 action。
+- 禁止操作：裸 SCons、切换未经记录的 linker、删除 build tree 或把失败构建标为 up-to-date。
+- 完成条件：wrapper status PASS，binary hash/provenance 更新，受影响 runtime row 通过。
+
+## 7. Debug flag 导航
+
+选择能填补缺失 evidence dimension 的最小 flag set：
+
+| 问题 | 建议 flags | 观察内容 |
+|---|---|---|
+| vfio-user/BAR/IRQ transport | `MI300XCosim` | listener/client、MMIO/doorbell callback、IRQ raise |
+| device routing、GART、VMID/PASID、IH | `AMDGPUDevice` | aperture setup、doorbell owner、translation、IH cookie/write pointer |
+| PM4 management ring | `PM4PacketProcessor` | `MAP_PROCESS`、`MAP_QUEUES`、runlist、rptr/wptr、release/wait |
+| SDMA | `SDMAEngine` | queue setup、opcode、source/destination classification、fence/trap |
+| AQL queue | `HSAPacketProcessor` | doorbell、read/write/dispatch pointer、packet type 与 completion |
+| kernel setup 与 signal | `GPUCommandProc,GPUKernelInfo` | code object、kernarg、Task ID、signal read/write |
+| workgroup dispatch | `GPUDisp` | launch、CU assignment 与 workgroup completion |
+| GPU virtual translation | `GPUTLB,GPUPTWalker` | VMID、walk level、PTE 与 fault |
+| CU/compute memory pipeline | `GPUMem` | wavefront scalar/global/local memory instruction、lane request、retry 与 completion |
+| AMDGPU device memory manager | `AMDGPUMem` | PM4/SDMA/设备侧分块 read/write request、地址、request ID、retry 与 callback |
+| Ruby DMA 与 backpressure | `RubyDma,RubyResourceStalls` | DMA request、retry/backpressure 与 protocol completion |
+
+`GPUMem` 和 `AMDGPUMem` 不是同一 flag 的两种拼写。前者定义在
+`gem5/src/gpu-compute/`，用于观察 CU 执行产生的 memory pipeline；后者定义在
+`gem5/src/dev/amdgpu/memory_manager.cc`，用于观察 AMDGPU device/packet engine 发起的
+分块 DMA 读写。先按第一个缺失对象选择其一，只有证据跨越两条路径时才同时启用。
+
+示例仍通过 fresh-session runner。该 debug 示例刻意不设置
+`COSIM_STRICT_ACCEPTANCE=1`：它属于 diagnostic run，允许 dirty replay，不要求
+clean HEAD。
+
+```bash
+RUN_ID="gart-debug-$(date +%Y%m%d-%H%M%S)"
+COSIM_RUN_ID="$RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh \
+    --output-dir "artifacts/amd-gpu-learning-env/tests/${RUN_ID}" \
+    --gem5-debug AMDGPUDevice,GPUTLB,GPUPTWalker \
+    vector_add
+```
+
+过宽的 flag 会产生巨大 log，并掩盖第一个不同 object。只有当前 artifact 已指出
+缺失 dimension 时才扩展。
+
+## 8. 子系统 checkpoint
+
+### 8.1 PCI 与 Driver
+
+预期 evidence 为 `1002:74a0`、BAR0 16 GiB、BAR2 2 MiB、BAR4 8 KiB、BAR5
+512 KiB、amdgpu bound、`/dev/kfd`、至少一个 render node、`gfx942` agent 与
+service success。Guest 的 320-CU discovery topology 不是建模的 40-CU 数量。
+missing ROM/discovery 或启用禁止 IP block 是 Guest setup contract 问题，发生顺序
+早于 PM4/HIP 问题。
+
+### 8.2 GART 与 GPUVM
+
+采集 faulting GPU VA、可能的 PA、PTE、GART/page-table/framebuffer base、
+VMID/PASID、queue、doorbell 与最后一个 PM4/SDMA/AQL packet。即使测试最后 PASS，
+`mapped to sink` 或 timing-walk address-zero fallback 仍表示 semantic loss。只有
+source 与 binary provenance 匹配后才能比较 interrupt `0` 和 `1`。
+
+### 8.3 Queue、PM4 与 SDMA
+
+PM4 使用真实入口 `PM4PacketProcessor::process`；AQL 使用
+`HSAPacketProcessor::processPkt`。记录 rptr/wptr/dispatch pointer 与 packet type。
+对 SDMA 则区分 gfx/page/RLC queue、opcode、VMID，以及 raw VRAM 与 translated
+system address。fence 写 completion data；trap 才请求 IH。
+
+### 8.4 Dispatch 与 completion
+
+可信 dispatch chain 应包含唯一 AQL identity、kernel launch、预期 grid/workgroup
+shape、全部 required workgroup 的进展、HSA completion、signal update 与最终结果。
+interrupt mode 还必须有 IH cookie、IH write-pointer update 与 vfio-user MSI-X。
+如果 dispatch/completion counter 在 timeout 前仍推进，应先测量规模再修改语义。
+
+## 9. 静态与文档 gate
+
+script 或文档变化后运行仓库 contract：
+
+```bash
+bash -n scripts/*.sh tests/run_tests.sh tests/test_modprobe_params.sh \
+    tests/scripts/*.sh
+shellcheck scripts/*.sh tests/run_tests.sh tests/test_modprobe_params.sh \
+    tests/scripts/*.sh
+bash tests/scripts/test_guest_disk_overlay_contract.sh
+bash tests/scripts/test_guest_env_contract.sh
+bash tests/scripts/test_runner_contract.sh
+bash tests/scripts/test_cleanup.sh
+python3 -B -m unittest discover -s tests/unit -v
+python3 -B scripts/test_docs_contract.py
+git diff --check
+```
+
+文档合同同时检查中英文配对、首行语言链接、本地 Markdown target、Lab 结构与三层
+边界、历史故障 playbook、公开 wrapper 命令和关键代理路由。Generated build、log
+与 `artifacts/` 不能进入 commit。
+
+## 10. 已知 workaround 与限制
+
+- ROM/discovery service 与 amdgpu module parameter 是 cosim boot policy，不是
+  物理 GPU 指南。
+- PSP、SMU、RAS、DPM、audio 与 media block 被禁用或省略。
+- driver-visible topology（实测 Guest 为 320 CU/八个 partition）不是默认 40-CU
+  gem5 configuration。
+- PM4/SDMA packet coverage、firmware scheduling、IH source、cache maintenance、
+  atomic 与 GPU page-fault recovery 为部分实现。
+- shared-memory PTE read、invalidate ACK shortcut、low-VMID clamp 与
+  address-zero translation fallback 是 cosim-specific；address-zero 路径很危险，
+  不是 safe sink。
+- BAR4 暴露 256 个 MSI-X vector，但当前 bridge 只 post vector 0。
+- device-side `printf`、完整 multi-GPU/xGMI coherence 与 calibrated MI300X
+  performance 超出 accepted baseline。
+- 严格 runner 当前拒绝当前 `gem5/` source tree 之外的 `--gem5-bin`，避免把 alternate
+  worktree binary 与当前树的 Python config/commit 混合；这是明确的 provenance 边界。
+- source、Guest、QEMU、gem5 binary、environment mode 或 launcher contract 任一
+  改变都需要新 artifact，不能把旧 PASS 重新命名为当前 validation。

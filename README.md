@@ -53,9 +53,13 @@ Use `./scripts/run_cosim_tests.sh --all` only after the single-program smoke tes
 | Build and provenance status | `./scripts/cosim_build.sh status` |
 | Interactive co-simulation | `./scripts/cosim_launch.sh` |
 | Fresh-session classified test | `./scripts/run_cosim_tests.sh <program>` |
-| Run-scoped cleanup | `./scripts/cosim_cleanup.sh --run-id <id>` |
+| Run-scoped cleanup inventory (dry-run) | `./scripts/cosim_cleanup.sh --run-id <id>` |
+| Ownership-gated interrupted recovery | [Validate and stop the exact launcher process group before manifest cleanup](docs/en/getting-started.md#manifest-scoped-cleanup) |
 
 Do not replace these entry points with hand-written Docker, SCons, Packer, or QEMU commands. The wrappers enforce pinned inputs, run-scoped names, manifests, provenance, evidence capture, and cleanup checks.
+The cleanup inventory is read-only. It does not authorize cleanup of a live
+run; interrupted recovery must follow the linked `launcher.pid` ownership and
+process-group exit gate before exact-manifest cleanup.
 
 ## Repository map
 
@@ -72,6 +76,18 @@ Do not replace these entry points with hand-written Docker, SCons, Packer, or QE
 - [Learning labs](docs/en/labs.md) — source-guided experiments for PCI/BAR/MMIO, memory translation, queues, PM4, SDMA, interrupts, and HIP dispatch.
 - [Architecture](docs/en/architecture.md) — transport, memory sharing, GPUVM/GART, DMA, and MSI-X data paths.
 - [Reference and debugging](docs/en/reference.md) — parameters, source map, known limitations, and diagnostic signatures.
+
+| Learning topic | 中文 | English |
+|---|---|---|
+| PCI / BAR / MMIO | [中文](docs/zh/labs.md#lab-pci-bar-mmio) | [English](docs/en/labs.md#lab-pci-bar-mmio) |
+| amdgpu / KFD initialization | [中文](docs/zh/labs.md#lab-amdgpu-kfd-init) | [English](docs/en/labs.md#lab-amdgpu-kfd-init) |
+| VRAM / GTT / GART / GPUVM | [中文](docs/zh/labs.md#lab-vram-gtt-gart-gpuvm) | [English](docs/en/labs.md#lab-vram-gtt-gart-gpuvm) |
+| Ring / Queue / Doorbell | [中文](docs/zh/labs.md#lab-ring-queue-doorbell) | [English](docs/en/labs.md#lab-ring-queue-doorbell) |
+| PM4 | [中文](docs/zh/labs.md#lab-pm4) | [English](docs/en/labs.md#lab-pm4) |
+| SDMA | [中文](docs/zh/labs.md#lab-sdma) | [English](docs/en/labs.md#lab-sdma) |
+| Fence / IH / MSI-X | [中文](docs/zh/labs.md#lab-fence-ih-msix) | [English](docs/en/labs.md#lab-fence-ih-msix) |
+| HIP → KFD/amdgpu → GPU dispatch | [中文](docs/zh/labs.md#lab-hip-dispatch) | [English](docs/en/labs.md#lab-hip-dispatch) |
+| gem5 GPU model and debugging | [中文](docs/zh/labs.md#lab-gem5-debug) | [English](docs/en/labs.md#lab-gem5-debug) |
 
 ## Local checkpoint
 

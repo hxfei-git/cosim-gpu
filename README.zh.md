@@ -53,9 +53,13 @@ GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
 | 构建和 provenance 状态 | `./scripts/cosim_build.sh status` |
 | 交互式协同仿真 | `./scripts/cosim_launch.sh` |
 | 全新会话的分类测试 | `./scripts/run_cosim_tests.sh <program>` |
-| 运行范围内的清理 | `./scripts/cosim_cleanup.sh --run-id <id>` |
+| 查看运行范围内的清理清单（dry-run） | `./scripts/cosim_cleanup.sh --run-id <id>` |
+| 有 ownership gate 的中断恢复 | [先校验并停止精确 launcher process group，再执行 manifest cleanup](docs/zh/getting-started.md#manifest-scoped-cleanup) |
 
 不要用手写 Docker、SCons、Packer 或 QEMU 命令替换这些入口。Wrapper 会强制使用锁定输入、运行范围内的资源名和 manifest，并执行 provenance、证据归档与清理检查。
+Cleanup inventory 只读，不授权清理 live run。中断恢复必须遵循链接中的
+`launcher.pid` ownership 与 process-group exit gate，随后才允许 exact-manifest
+cleanup。
 
 ## 仓库结构
 
@@ -72,6 +76,18 @@ GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
 - [学习实验](docs/zh/labs.md) — 面向源码的 PCI/BAR/MMIO、内存转换、队列、PM4、SDMA、中断与 HIP Dispatch 实验。
 - [系统架构](docs/zh/architecture.md) — 传输、内存共享、GPUVM/GART、DMA 和 MSI-X 数据流。
 - [参考与调试](docs/zh/reference.md) — 参数、源码地图、已知限制和诊断特征。
+
+| 学习主题 | 中文 | English |
+|---|---|---|
+| PCI / BAR / MMIO | [中文](docs/zh/labs.md#lab-pci-bar-mmio) | [English](docs/en/labs.md#lab-pci-bar-mmio) |
+| amdgpu / KFD 初始化 | [中文](docs/zh/labs.md#lab-amdgpu-kfd-init) | [English](docs/en/labs.md#lab-amdgpu-kfd-init) |
+| VRAM / GTT / GART / GPUVM | [中文](docs/zh/labs.md#lab-vram-gtt-gart-gpuvm) | [English](docs/en/labs.md#lab-vram-gtt-gart-gpuvm) |
+| Ring / Queue / Doorbell | [中文](docs/zh/labs.md#lab-ring-queue-doorbell) | [English](docs/en/labs.md#lab-ring-queue-doorbell) |
+| PM4 | [中文](docs/zh/labs.md#lab-pm4) | [English](docs/en/labs.md#lab-pm4) |
+| SDMA | [中文](docs/zh/labs.md#lab-sdma) | [English](docs/en/labs.md#lab-sdma) |
+| Fence / IH / MSI-X | [中文](docs/zh/labs.md#lab-fence-ih-msix) | [English](docs/en/labs.md#lab-fence-ih-msix) |
+| HIP → KFD/amdgpu → GPU Dispatch | [中文](docs/zh/labs.md#lab-hip-dispatch) | [English](docs/en/labs.md#lab-hip-dispatch) |
+| gem5 GPU 模型与调试 | [中文](docs/zh/labs.md#lab-gem5-debug) | [English](docs/en/labs.md#lab-gem5-debug) |
 
 ## 本地检查点
 

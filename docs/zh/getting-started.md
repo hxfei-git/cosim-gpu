@@ -1,6 +1,8 @@
+[English](../en/getting-started.md)
+
 # 快速入门
 
-[English](../en/getting-started.md) | [项目 README](../../README.zh.md) | [学习实验](labs.md)
+[项目 README](../../README.zh.md) | [学习实验](labs.md)
 
 本文给出从全新 checkout 到 HIP 程序通过 Guest Linux、amdgpu/KFD/ROCm、QEMU vfio-user 和 gem5 MI300X 模型完成分类验证的公开可复现路径。请只使用这里列出的仓库 wrapper；它们统一管理源码锁、构建 provenance、运行范围内的资源、证据契约和清理规则，而临时命令不具备这些保证。
 
@@ -34,7 +36,7 @@ submodule
 | 虚拟化 | `/dev/kvm` 存在，并且当前进程可读写 |
 | 运行时存储 | `/dev/shm` 与 `/tmp` 存在且可写 |
 | 容器 | Docker daemon 可访问，并报告 amd64/x86_64 |
-| 网络 | 构建 profile 能访问 GitHub、QEMU 下载站点和 GHCR |
+| 网络 | 构建 profile 能访问 lock file 中精确的 GitHub、QEMU、HashiCorp、Ubuntu ISO/snapshot、AMD amdgpu/ROCm 和 GHCR 端点 |
 
 原生 Linux 是最简单的 Host。WSL 必须是 WSL 2，并且需要向 Linux 暴露可用的 `/dev/kvm`。在 BIOS/UEFI 中启用 CPU 虚拟化、启用嵌套虚拟化、重启 Windows 和重启 WSL 都属于 Host 所有者操作，仓库无法执行。本项目不要求也不会自动修改 `.wslconfig`。
 
@@ -91,7 +93,7 @@ Setup wrapper 从不读取凭据，不修改 sudoers、WSL/Windows 配置，也�
 
 ### 网络与代理
 
-Host preflight 只记录常见大小写代理环境变量是否设置，并隐藏其值与凭据。Build preflight 还会探测 GitHub、`download.qemu.org` 和 GHCR。如果必须使用代理，请通过正常 Host 策略配置 shell 与 Docker daemon，然后重新运行 preflight。不要把代理凭据写入仓库文件、示例命令历史或准备共享的 artifact。
+Host preflight 只记录常见大小写代理环境变量是否设置，并隐藏其值与凭据。Build preflight 还会探测 GitHub、QEMU、HashiCorp、锁定的 Ubuntu ISO 与 snapshot 服务、AMD amdgpu/ROCm 软件源和 GHCR。如果必须使用代理，请通过正常 Host 策略配置 shell 与 Docker daemon，然后重新运行 preflight。不要把代理凭据写入仓库文件、示例命令历史或准备共享的 artifact。
 
 ## 初始化锁定源码
 
@@ -189,7 +191,7 @@ Guest 自动登录控制台最终应显示 `cosim-gpu-setup.service` 链路完�
 3. 检查归档的 QEMU console、gem5 log、launcher category 和 cleanup status。
 4. 每次重试都启动全新会话。
 
-`hw_init` 失败后不要反复卸载/加载 amdgpu，也不要把手工修复后的 Guest 当成通过的 baseline。Driver 初始化会改变内核与设备状态，原地重试可能掩盖最初故障。选择调试实验前先阅读[已知问题与陷阱](reference.md#4-已知问题与陷阱)。
+`hw_init` 失败后不要反复卸载/加载 amdgpu，也不要把手工修复后的 Guest 当成通过的 baseline。Driver 初始化会改变内核与设备状态，原地重试可能掩盖最初故障。选择调试实验前先阅读[已知问题处理手册](reference.md#known-issue-playbook)。
 
 ## 运行全新会话 HIP 测试
 
@@ -202,25 +204,32 @@ GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh vector_add
 ```
 
+未设置 `COSIM_STRICT_ACCEPTANCE` 或将其设为 `0` 时，这是默认 diagnostic mode。
+它会记录 top-level 与 gem5 source state，允许普通学习运行或 dirty replay，不要求
+clean HEAD；其结果不能作为严格的 `cosim-matrix-verification/v2` acceptance row。
+
 空的 `GUEST_TEST_PREFIX` 同样表示 `HSA_ENABLE_INTERRUPT=0`。比较 runtime 行为时只能使用以下两个显式值之一：
 
 ```bash
-GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh vector_add
 
-GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
+COSIM_STRICT_ACCEPTANCE=1 GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
     ./scripts/run_cosim_tests.sh vector_add
 ```
 
-必须把两种模式记录为独立实验。模式 1 使用中断支持的 HSA signal，不能与模式 0 baseline 互换。`matrix.tsv` 必须包含从 Guest 观察到的实际值；`unknown` 或与预期不符都会使该行无效。
+这些是 strict v2 acceptance command：只有 top-level 与 gem5 source tree 都 clean
+时才能启动。必须把两种模式记录为独立实验。模式 1 使用中断支持的 HSA signal，
+不能与模式 0 baseline 互换。`matrix.tsv` 必须包含从 Guest 观察到的实际值；
+`unknown` 或与预期不符都会使该行无效。
 
 当前 runner timeout 为：等待 Guest 登录提示 240 秒、Guest 内程序执行 60 秒、Guest 编译加执行的 Host deadline 1,800 秒。只能通过 `run_cosim_tests.sh` 选项覆盖，并应把实际命令与证据一起记录。
 
 Smoke test 通过后执行：
 
 ```bash
-./scripts/run_cosim_tests.sh --repeat 3 vector_add
-./scripts/run_cosim_tests.sh --all
+COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh --repeat 3 vector_add
+COSIM_STRICT_ACCEPTANCE=1 ./scripts/run_cosim_tests.sh --all
 ```
 
 `--repeat` 的每次迭代都会创建全新会话。`--all` 会发现排序后的 `tests/kernels/*.cpp` 集合，并为每个程序创建全新的子会话与 artifact 目录；当前集合为 `gemm`、`histogram`、`multi_gpu_verify`、`prefix_scan`、`reduction`、`transpose` 和 `vector_add`。后续源码变更可能改变该集合，因此目录和归档的 source snapshot 才是权威依据。
@@ -236,33 +245,144 @@ Runner 会打印确切的 artifact 目录。自定义 `--output-dir` 只能位�
 | `verdict.json` | 权威分类结果、主要原因、全部原因、身份检查与证据完整性 |
 | `matrix.tsv` | 程序、实际 HSA 中断值、run/session、结果、退出码、原因和 artifact 路径 |
 | `runner-metadata.txt` | 精确程序/源码/二进制身份、预期环境、编译/测试退出码、标记与清理状态 |
-| `patch/source-snapshot.txt` | 顶层 commit，以及暂存源码、runner、仓库 diff、untracked 文件清单/归档的 hash |
-| `patch/binary-provenance.txt` | gem5 commit/二进制 hash 和精确测试二进制 hash |
+| `runner-invocation.txt`、`launch-invocation.txt` | launch 前冻结的 runner/launcher argv、timeout、Guest bridge 与实际 gem5 配置 |
+| `guest-run.sh` | 实际送入 Guest 的归档脚本和 `TEST_TIMEOUT_SECS` |
+| `patch/source-snapshot.txt` | 顶层 commit，以及暂存源码、runner、launcher、仓库 diff、untracked 文件清单/归档的 hash |
+| `patch/binary-provenance.txt` | gem5 commit/subject/二进制 hash 和精确测试二进制 hash |
 | `patch/repo-status.txt`、`patch/repo.patch` | 该行使用的顶层 tracked 与未提交源码状态 |
 | `patch/gem5-status.txt`、`patch/gem5.patch` | 该行使用的 gem5 submodule 状态 |
 | `qemu.log`、`gem5.log` | 为诊断保留的完整 Guest console 与仿真器证据 |
 | `cleanup-status.txt` | Manifest 范围内的资源清理结果 |
 
-一行只有在以下条件全部满足时才可接受：runner 返回 0；`verdict.json` 为 `PASS` 且原因为 `all_acceptance_gates_passed`；`matrix.tsv` 一致；实际 HSA 值匹配目标模式；精确源码/二进制 provenance 存在；清理已验证。即使 HIP 输出看起来正确，缺少证据也属于失败。
+一行只有在以下条件全部满足时才可接受：命令显式设置
+`COSIM_STRICT_ACCEPTANCE=1`；两个 source tree 都 clean；runner 返回 0；
+`verdict.json` 为 `PASS` 且原因为 `all_acceptance_gates_passed`；`matrix.tsv` 一致；
+实际 HSA 值和三种 timeout 匹配目标模式；`cosim-matrix-verification/v2` 对
+manifest、invocation、Guest script/log、源码/二进制 provenance 的连接验证通过；
+清理已验证。即使 HIP 输出看起来正确，缺少证据也属于失败。Diagnostic mode 会为
+学习和 replay 保留 dirty provenance，但这不会把 dirty row 变成 strict v2 acceptance；
+只有记录 `COSIM_STRICT_ACCEPTANCE=1` 的 artifact 才能进入 final v2 matrix。
 
 `artifacts/` 下生成的构建/测试证据和 `.local/cosim/` 下的本地工具链均被 Git 忽略。评审需要持久证据时，应在 Git 之外保存或归档；不要把生成的镜像、二进制或日志加入源码 commit。
 
+<a id="manifest-scoped-cleanup"></a>
+
 ## Manifest 范围内的清理
 
-Runner 与 launcher 正常退出时会清理本次运行自己的资源。如果进程被中断，使用 wrapper 打印的精确 run ID。先预览其拥有的资源：
+Runner 与 launcher 正常退出时会清理本次运行自己的资源。下面的 fallback 只用于
+wrapper 同时打印了精确 run ID 与 artifact directory 的、被中断的 runner-owned
+session。standalone foreground launch 没有 runner-owned、run-scoped 的
+`launcher.pid`；若其正常 trap 被绕过，必须停止并诊断，不能只凭 manifest 清理。
+
+把下面两个值替换为 wrapper 打印的原值。该流程只接受可信的 artifact
+`launcher.pid`，证明其 process group 正在用相同 `--artifact-dir` 运行
+`scripts/cosim_launch.sh`，停止该精确 process group 并确认退出，然后才预览或
+确认 exact manifest cleanup：
 
 ```bash
-RUN_ID=replace-with-the-printed-run-id
-./scripts/cosim_cleanup.sh --run-id "$RUN_ID"
+(
+set -euo pipefail
+RUN_ID="replace-with-the-printed-run-id"
+ARTIFACT_DIR="replace-with-the-printed-artifact-directory"
+ARTIFACT_DIR="$(realpath -e -- "$ARTIFACT_DIR")"
+REPO_ROOT="$(pwd -P)"
+case "$ARTIFACT_DIR" in
+    "${REPO_ROOT}/artifacts/"*) ;;
+    *) echo "artifact directory is outside this repository" >&2; exit 1 ;;
+esac
+[[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ &&
+   "$RUN_ID" != *..* ]] || {
+    echo "invalid run ID" >&2
+    exit 1
+}
+
+LAUNCH_PID_FILE="${ARTIFACT_DIR}/launcher.pid"
+RUNNER_INVOCATION="${ARTIFACT_DIR}/runner-invocation.txt"
+MANIFEST="/tmp/cosim-${RUN_ID}.session/resources.manifest"
+[[ -f "$RUNNER_INVOCATION" && ! -L "$RUNNER_INVOCATION" ]] &&
+    grep -Fxq "run_id=${RUN_ID}" "$RUNNER_INVOCATION" || {
+        echo "artifact directory does not belong to this run ID" >&2
+        exit 1
+    }
+[[ -f "$LAUNCH_PID_FILE" && ! -L "$LAUNCH_PID_FILE" ]] || {
+    echo "trusted run-scoped launcher.pid is missing" >&2
+    exit 1
+}
+read -r LAUNCH_PID < "$LAUNCH_PID_FILE"
+[[ "$LAUNCH_PID" =~ ^[0-9]+$ ]] || {
+    echo "invalid launcher PID" >&2
+    exit 1
+}
+
+launcher_group_alive() {
+    local group_rows
+    group_rows="$(ps -eo pgid=)" || return 2
+    awk -v wanted="$LAUNCH_PID" '
+        $1 == wanted { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' <<< "$group_rows"
+}
+
+if [[ -d "/proc/${LAUNCH_PID}" ]]; then
+    LAUNCH_PGID="$(ps -o pgid= -p "$LAUNCH_PID" | tr -d ' ')"
+    [[ -r "/proc/${LAUNCH_PID}/cmdline" &&
+       -r "/proc/${LAUNCH_PID}/environ" ]] || {
+        echo "launcher command line or environment is unavailable" >&2
+        exit 1
+    }
+    LAUNCH_CMD="$(tr '\0' ' ' < "/proc/${LAUNCH_PID}/cmdline")"
+    [[ "$LAUNCH_PGID" == "$LAUNCH_PID" &&
+       "$LAUNCH_CMD" == *"scripts/cosim_launch.sh"* &&
+       "$LAUNCH_CMD" == *"--artifact-dir ${ARTIFACT_DIR}"* ]] &&
+        tr '\0' '\n' < "/proc/${LAUNCH_PID}/environ" | \
+            grep -Fxq "COSIM_RUN_ID=${RUN_ID}" || {
+        echo "launcher PID/process group does not own this run" >&2
+        exit 1
+    }
+    kill -TERM -- "-${LAUNCH_PID}"
+    for _ in {1..15}; do
+        launcher_group_alive || break
+        sleep 1
+    done
+    if launcher_group_alive; then
+        kill -KILL -- "-${LAUNCH_PID}" 2>/dev/null || true
+        for _ in {1..5}; do
+            launcher_group_alive || break
+            sleep 1
+        done
+    fi
+fi
+
+if launcher_group_alive; then
+    echo "launcher process group is still live; refusing cleanup" >&2
+    exit 1
+else
+    GROUP_STATE=$?
+    [[ "$GROUP_STATE" -eq 1 ]] || {
+        echo "unable to prove launcher process group exit" >&2
+        exit 1
+    }
+fi
+
+if [[ -f "$MANIFEST" && ! -L "$MANIFEST" ]]; then
+    ./scripts/cosim_cleanup.sh --run-id "$RUN_ID" --manifest "$MANIFEST"
+    ./scripts/cosim_cleanup.sh --run-id "$RUN_ID" \
+        --manifest "$MANIFEST" --confirm
+elif [[ -e "$MANIFEST" || -L "$MANIFEST" ]]; then
+    echo "exact manifest is not a trusted regular file" >&2
+    exit 1
+else
+    grep -qx 'result=PASS' "${ARTIFACT_DIR}/cleanup-status.txt" || {
+        echo "manifest is absent without verified cleanup" >&2
+        exit 1
+    }
+fi
+)
 ```
 
-第一条清理命令只是 dry run。确认 manifest、run ID、路径和 container label 都正确后，再确认相同范围：
-
-```bash
-./scripts/cosim_cleanup.sh --run-id "$RUN_ID" --confirm
-```
-
-Cleanup wrapper 只接受经过验证的 `/tmp/cosim-<run-id>.session/resources.manifest` 所有权模型，并会验证删除结果。绝不能用宽泛的进程 kill、裸 container 删除、通配 socket 删除或递归删除来替代。如果不存在唯一且有效的 manifest，应停止并诊断所有权，不能猜测目标。
+如果 `launcher.pid` 缺失、为 symlink、陈旧或不匹配，必须停止并诊断 ownership。
+绝不能猜 PID、使用宽泛 process kill、删除裸 container、用 wildcard 删除 socket，
+或递归删除 session directory。
 
 ## 学习实验
 
@@ -288,9 +408,9 @@ Cleanup wrapper 只接受经过验证的 `/tmp/cosim-<run-id>.session/resources.
 | QEMU/gem5/m5/Guest 构建失败 | 保留 wrapper 的 build log/provenance，检查 `cosim_build.sh status`，再只重试失败的构建动作 |
 | 模型始终未就绪 | 检查该次运行的 `gem5.log`、launcher category 与 manifest；不要单独启动 QEMU |
 | Guest 未到达登录 | 将 `qemu.log` 与 `gem5.log` 一起检查；保留相同 run ID 以便归属 |
-| PCI 可见但 driver/KFD/ROCm 不完整 | 结束会话、保留证据、按 manifest 清理，并在全新会话重试 |
+| PCI 可见但 driver/KFD/ROCm 不完整 | 结束会话、保留证据、遵循上面的 run-scoped recovery，并在全新会话重试 |
 | HIP timeout、GPUVM、PM4、SDMA、fence 或 IH 失败 | 使用 `verdict.json` 原因和调试参考中的有界原始日志窗口；不能只根据 pass marker 接受结果 |
-| 清理未验证 | 把该行视为失败，并且只用带精确 manifest 的 `cosim_cleanup.sh` |
+| 清理未验证 | 把该行视为失败；只有确认 owning launcher process group 已停止后才能使用 exact manifest |
 
 错误特征与源码位置见[参考与调试](reference.md)。提取较小窗口前应保留完整原始日志；QEMU 退出可能只是 gem5 故障的次生现象。
 

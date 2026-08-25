@@ -39,6 +39,54 @@ already understood.
   transport, launch policy, or a compatibility workaround. It is not evidence
   that physical MI300X hardware behaves the same way.
 
+### Matching the pinned real source
+
+Before following a `[REAL AMD]` source anchor, record the package identities
+from the host lock file:
+
+```bash
+awk -F= '$1 == "AMDGPU_DKMS_VERSION" || $1 == "ROCM_VERSION" {print}' \
+    configs/cosim/guest.lock
+```
+
+Then, in a diagnostic Guest session, record the installed identities and locate
+the DKMS source tree:
+
+```bash
+dkms status
+dpkg-query -W -f='${binary:Package}\t${Version}\n' \
+    amdgpu-dkms rocm 'hsa-rocr*'
+find /usr/src -mindepth 1 -maxdepth 1 -type d -name 'amdgpu-*' -print
+```
+
+Select the single amdgpu tree matching the installed `amdgpu-dkms` entry, then
+record a content fingerprint before reading or changing it:
+
+```bash
+AMDGPU_DKMS_SOURCE_VERSION="$(
+    dkms status | sed -n 's#^amdgpu/\([^,]*\),.*#\1#p' | sort -u
+)"
+test -n "$AMDGPU_DKMS_SOURCE_VERSION"
+test "$(printf '%s\n' "$AMDGPU_DKMS_SOURCE_VERSION" | wc -l)" -eq 1
+AMDGPU_SRC="/usr/src/amdgpu-${AMDGPU_DKMS_SOURCE_VERSION}"
+test -d "$AMDGPU_SRC/drivers/gpu/drm/amd"
+(
+    cd "$AMDGPU_SRC"
+    find drivers/gpu/drm/amd -type f -print0 | sort -z | \
+        xargs -0 sha256sum | sha256sum
+)
+```
+
+Archive the command output with the lab evidence. ROCr source is not installed
+as a repository by the binary package: derive the release from the pinned
+`ROCM_VERSION`, inspect that release's `ROCm/ROCm` `default.xml` manifest, and
+use the exact ROCr component repository and immutable revision recorded there.
+Record the repository URL, revision, and a checkout/archive SHA-256. Never use a
+moving `develop` or `master` branch as evidence for the pinned Guest. Run these
+inspection commands through the repository Guest-console workflow in a
+diagnostic session; do not turn a preserved interactive session into an
+acceptance row.
+
 ### Evidence baseline
 
 The following evidence was recorded on 2026-08-23. Paths are repository-local,
@@ -56,6 +104,9 @@ stage-specific `phase3-verdict.json` is the authoritative verdict for that run.
 The Phase 4 rows are complete operator artifacts and share gem5 source commit
 `4c1f90498f89e15a3797cb50e9b534164bc57536` and binary SHA-256
 `a395b7efdaef1067223bf1e3d82780f0bdde190bee99735b12e10c377e1777a1`.
+They were collected before the current qcow2-overlay hardening. They remain
+valid dispatch and interrupt mechanism evidence for that recorded source and
+binary, but they do not prove the current launcher's disk-isolation contract.
 
 `artifacts/` is ignored by `.gitignore`. These logs and verdicts remain local
 evidence and are not committed to Git. Copy or archive them explicitly before
@@ -85,14 +136,20 @@ Keep these constraints visible in every experiment:
 
 ### Supported command pattern
 
-Every run below uses the repository wrappers. Each output directory must be new
-and empty.
+Every run below uses the repository wrappers. Commands that produce acceptance
+rows explicitly set `COSIM_STRICT_ACCEPTANCE=1` and require clean top-level and
+gem5 source trees. Only artifacts that record that value may enter the final
+`cosim-matrix-verification/v2` matrix. With the variable unset or `0`, the
+runner defaults to diagnostic mode: ordinary learning and dirty replay are
+allowed without a clean HEAD, but their artifacts are not acceptance rows.
+Each output directory must be new and empty.
 
 ```bash
 LAB_RUN_ID="lab-example-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug MI300XCosim vector_add
@@ -100,8 +157,28 @@ COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
 
 Do not replace these wrappers with ad hoc Docker, QEMU, SCons, socket, or
 `/dev/shm` commands. The runner records program identity, effective Guest
-environment, source snapshot, binary provenance, raw logs, verdict, matrix row,
-and scoped cleanup result.
+environment, `runner-invocation.txt`, `launch-invocation.txt`, `guest-run.sh`,
+source snapshot, binary provenance, raw logs, verdict, matrix row, and scoped
+cleanup result.
+
+### Standard acceptance artifacts
+
+Every new accepted lab row must have been launched with
+`COSIM_STRICT_ACCEPTANCE=1` and must preserve `verdict.json`, `matrix.tsv`,
+`runner-invocation.txt`, `launch-invocation.txt`, `guest-run.sh`, complete
+`gem5.log` and `qemu.log`, source and binary provenance, `guest-overlay.json`,
+`guest-base-stat.txt`, `guest-build-meta.txt`, and `cleanup-status.txt`. The
+overlay must be qcow2, its backing file must be the expected raw Guest image,
+and cleanup must be verified; a set of accepted leaf rows must also pass
+`cosim-matrix-verification/v2`.
+
+For a lab or regression group, compute SHA-256 of
+`gem5-resources/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70` before the
+first row and again after the final cleanup. Preserve both hash records and
+require exact equality. A PASS operator result without the per-row overlay
+metadata and this raw-base before/after invariant is not a disk-isolation PASS.
+
+<a id="lab-pci-bar-mmio"></a>
 
 ## Lab 1: PCI / BAR / MMIO
 
@@ -150,7 +227,8 @@ Guest PCI enumeration
 LAB_RUN_ID="lab01-pci-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug MI300XCosim,AMDGPUDevice vector_add
@@ -185,25 +263,23 @@ PASS verdict.
 
 ### Acceptance artifacts
 
-Require `preflight.json`, `verdict.json`, `matrix.tsv`, `gem5.log`, `qemu.log`,
-`patch/source-snapshot.txt`, `patch/binary-provenance.txt`, and
-`cleanup-status.txt`. The reference BAR evidence is
+Require the standard acceptance artifacts above, including `preflight.json`,
+`patch/source-snapshot.txt`, and `patch/binary-provenance.txt`. The reference BAR
+evidence is
 `phase3-driver-002/guest-probe-output.txt:20-23,39-41`; its authoritative result
 is `phase3-driver-002/phase3-verdict.json`.
 
 ### Recovery
 
-The runner normally performs scoped cleanup. If interrupted and the manifest
-still exists, first review the dry run, then confirm the same scope:
+The runner normally performs scoped cleanup. For an interrupted runner, follow
+the [run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition. Never use a broad kill or delete generic sockets, containers,
+or `/dev/shm` names manually.
 
-```bash
-./scripts/cosim_cleanup.sh --run-id "$LAB_RUN_ID" \
-    --manifest "/tmp/cosim-${LAB_RUN_ID}.session/resources.manifest"
-./scripts/cosim_cleanup.sh --run-id "$LAB_RUN_ID" \
-    --manifest "/tmp/cosim-${LAB_RUN_ID}.session/resources.manifest" --confirm
-```
-
-Never delete generic sockets, containers, or `/dev/shm` names manually.
+<a id="lab-amdgpu-kfd-init"></a>
 
 ## Lab 2: amdgpu / KFD initialization
 
@@ -255,7 +331,8 @@ PCI probe -> ROM and IP discovery -> amdgpu_device_init
 LAB_RUN_ID="lab02-driver-init-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug AMDGPUDevice,PM4PacketProcessor,SDMAEngine vector_add
@@ -263,6 +340,224 @@ COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
 
 The operator run deliberately proves more than module load: it requires the
 initialized driver and ROCm stack to execute a HIP kernel correctly.
+
+Use a separate diagnostic session to capture Driver/ROCm details for this run.
+`--keep-alive` is diagnostic only: because cleanup has not yet been verified,
+the runner returns nonzero and its temporary verdict is not an acceptance
+result. Keep `COSIM_STRICT_ACCEPTANCE` unset or `0` for this diagnostic probe;
+it may replay a dirty tree and is never a final v2 matrix row. The normal
+`vector_add` run above remains the operator acceptance row.
+
+```bash
+(
+set -euo pipefail
+PROBE_RUN_ID="${LAB_RUN_ID}-probe"
+PROBE_ARTIFACT="$(realpath -m -- "artifacts/amd-gpu-learning-env/labs/${PROBE_RUN_ID}")"
+SESSION_NAME="qemu-cosim-tests"
+CONTROL_DIR="/tmp/${SESSION_NAME}-${PROBE_RUN_ID}.session"
+CONSOLE_PIPE="${CONTROL_DIR}/console.in"
+CONSOLE_LOG="${PROBE_ARTIFACT}/qemu.log"
+MANIFEST="/tmp/cosim-${PROBE_RUN_ID}.session/resources.manifest"
+LAUNCH_PID_FILE="${CONTROL_DIR}/launcher.pid"
+LAB_CLEANUP_STATUS="${PROBE_ARTIFACT}/lab02-cleanup-status.txt"
+mkdir -p "$PROBE_ARTIFACT"
+
+# shellcheck disable=SC2317  # This function is invoked by the EXIT trap.
+cleanup_lab02_probe() {
+    local original_rc="$1"
+    local cleanup_rc=0
+    local end_line
+    local launcher_pid=""
+    local launcher_pgid=""
+    local launcher_cmd=""
+    local group_state=2
+    local launcher_stopped=0
+    local cleanup_proven=0
+    local fallback_used=0
+
+    trap - EXIT
+    set +e
+    launcher_group_alive() {
+        local group_rows
+        group_rows="$(ps -eo pgid=)" || return 2
+        awk -v wanted="$launcher_pid" '
+            $1 == wanted { found = 1 }
+            END { exit(found ? 0 : 1) }
+        ' <<< "$group_rows"
+    }
+    if [[ -f "$CONSOLE_LOG" && "${START_LINE:-}" =~ ^[0-9]+$ ]]; then
+        end_line="$(wc -l < "$CONSOLE_LOG")"
+        sed -n "$((START_LINE + 1)),${end_line}p" "$CONSOLE_LOG" > \
+            "$PROBE_ARTIFACT/driver-rocm-probe.txt" || cleanup_rc=1
+        if [[ "$original_rc" -eq 0 ]]; then
+            tr -d '\r' < "$PROBE_ARTIFACT/driver-rocm-probe.txt" | \
+                grep -q '^__LAB02_DRIVER_PROBE__:0$' || cleanup_rc=1
+        fi
+    else
+        cleanup_rc=1
+    fi
+
+    if [[ -f "$MANIFEST" && ! -L "$MANIFEST" ]]; then
+        cp -- "$MANIFEST" "$PROBE_ARTIFACT/resources.manifest.snapshot" || \
+            cleanup_rc=1
+    else
+        echo "Lab 2 exact resource manifest is missing; refusing unscoped cleanup" >&2
+        cleanup_rc=1
+    fi
+
+    if [[ -d "$CONTROL_DIR" && ! -L "$CONTROL_DIR" &&
+          -f "$LAUNCH_PID_FILE" && ! -L "$LAUNCH_PID_FILE" ]]; then
+        read -r launcher_pid < "$LAUNCH_PID_FILE" || cleanup_rc=1
+    else
+        echo "Lab 2 has no trusted launcher PID file" >&2
+        cleanup_rc=1
+    fi
+
+    if [[ "$launcher_pid" =~ ^[0-9]+$ ]]; then
+        if [[ -d "/proc/${launcher_pid}" ]]; then
+            launcher_pgid="$(ps -o pgid= -p "$launcher_pid" 2>/dev/null | tr -d ' ')"
+            if [[ -r "/proc/${launcher_pid}/cmdline" ]]; then
+                launcher_cmd="$(tr '\0' ' ' < "/proc/${launcher_pid}/cmdline")"
+            fi
+            if [[ "$launcher_pgid" == "$launcher_pid" &&
+                  "$launcher_cmd" == *"scripts/cosim_launch.sh"* &&
+                  "$launcher_cmd" == *"--artifact-dir ${PROBE_ARTIFACT}"* ]]; then
+                kill -TERM -- "-${launcher_pid}" 2>/dev/null || true
+                for _ in {1..15}; do
+                    launcher_group_alive || break
+                    sleep 1
+                done
+                if launcher_group_alive; then
+                    kill -KILL -- "-${launcher_pid}" 2>/dev/null || true
+                    for _ in {1..5}; do
+                        launcher_group_alive || break
+                        sleep 1
+                    done
+                fi
+            else
+                echo "Lab 2 refuses to stop a process group not proven to own this run" >&2
+                cleanup_rc=1
+            fi
+        fi
+        if launcher_group_alive; then
+            echo "Lab 2 launcher process group is still live; refusing concurrent manifest removal" >&2
+            cleanup_rc=1
+        else
+            group_state=$?
+            if [[ "$group_state" -eq 1 ]]; then
+                launcher_stopped=1
+            else
+                echo "Lab 2 cannot prove launcher process group exit" >&2
+                cleanup_rc=1
+            fi
+        fi
+    else
+        echo "Lab 2 launcher PID is invalid" >&2
+        cleanup_rc=1
+    fi
+
+    if [[ "$launcher_stopped" -eq 1 ]]; then
+        if grep -qx 'result=PASS' \
+                "$PROBE_ARTIFACT/cleanup-status.txt" 2>/dev/null; then
+            cleanup_proven=1
+        elif [[ -f "$MANIFEST" && ! -L "$MANIFEST" ]]; then
+            fallback_used=1
+            if ./scripts/cosim_cleanup.sh --run-id "$PROBE_RUN_ID" \
+                    --manifest "$MANIFEST" --confirm > \
+                    "$PROBE_ARTIFACT/manifest-cleanup.log" 2>&1; then
+                cleanup_proven=1
+            else
+                cleanup_rc=1
+            fi
+        fi
+    fi
+
+    [[ "$cleanup_proven" -eq 1 ]] || cleanup_rc=1
+    [[ ! -e "$MANIFEST" && ! -L "$MANIFEST" ]] || cleanup_rc=1
+
+    if [[ -L "$CONTROL_DIR" ]]; then
+        cleanup_rc=1
+    elif [[ -d "$CONTROL_DIR" ]]; then
+        rm -f -- "$CONSOLE_PIPE" "$LAUNCH_PID_FILE" || cleanup_rc=1
+        rmdir -- "$CONTROL_DIR" || cleanup_rc=1
+    fi
+
+    {
+        if [[ "$cleanup_rc" -eq 0 ]]; then
+            echo 'result=PASS'
+        else
+            echo 'result=FAIL'
+        fi
+        echo "probe_exit_code=${original_rc}"
+        echo "launcher_stopped=${launcher_stopped}"
+        echo "fallback_cleanup=${fallback_used}"
+    } > "$LAB_CLEANUP_STATUS"
+
+    if [[ "$original_rc" -ne 0 ]]; then
+        exit "$original_rc"
+    fi
+    exit "$cleanup_rc"
+}
+trap 'cleanup_lab02_probe $?' EXIT
+
+set +e
+COSIM_RUN_ID="$PROBE_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+    ./scripts/run_cosim_tests.sh --keep-alive \
+    --session-name "$SESSION_NAME" \
+    --output-dir "$PROBE_ARTIFACT" vector_add
+KEEP_ALIVE_RC=$?
+set -e
+printf '%s\n' "$KEEP_ALIVE_RC" > "$PROBE_ARTIFACT/keep-alive-exit.txt"
+test "$KEEP_ALIVE_RC" -ne 0
+test -p "$CONSOLE_PIPE"
+test -f "$CONSOLE_LOG"
+
+START_LINE="$(wc -l < "$CONSOLE_LOG")"
+# shellcheck disable=SC2016  # These variables must expand in the Guest.
+GUEST_PROBE_COMMAND='{
+    lspci -nnk -d 1002:74a0
+    lsmod | grep "^amdgpu "
+    ls -l /dev/kfd /dev/dri/renderD*
+    rocminfo
+    rocm-smi
+    dmesg | grep -iE "amdgpu|kfd" | tail -n 120
+    lspci -nnk -d 1002:74a0 | grep -q "Kernel driver in use: amdgpu" &&
+        lsmod | grep -q "^amdgpu " &&
+        test -c /dev/kfd &&
+        compgen -G "/dev/dri/renderD*" >/dev/null &&
+        rocminfo 2>/dev/null | grep -q gfx942 &&
+        rocm-smi >/dev/null
+}; rc=$?
+echo __LAB02_DRIVER_PROBE__:${rc}'
+printf '%s\n' "$GUEST_PROBE_COMMAND" > "$CONSOLE_PIPE"
+
+DEADLINE=$((SECONDS + 120))
+while ! tail -n +"$((START_LINE + 1))" "$CONSOLE_LOG" | tr -d '\r' | \
+    grep -q '^__LAB02_DRIVER_PROBE__:[0-9][0-9]*$'; do
+    (( SECONDS < DEADLINE )) || {
+        echo "Lab 2 Driver/ROCm probe timed out" >&2
+        exit 1
+    }
+    sleep 2
+done
+tail -n +"$((START_LINE + 1))" "$CONSOLE_LOG" | tr -d '\r' | \
+    grep -q '^__LAB02_DRIVER_PROBE__:0$'
+exit 0
+)
+```
+
+The diagnostic commands enter the Guest through its root console pipe; they do
+not read or store a sudo password. After a timeout, command failure, or normal
+completion, the `EXIT` trap archives the probe window and manifest snapshot,
+validates and stops this run's launcher process group, and permits manifest
+fallback only after that group exits. This avoids concurrent cleanup, and the
+subshell keeps `exit` from closing the caller's interactive shell. The probe
+must end with
+`__LAB02_DRIVER_PROBE__:0` and archive PCI driver binding, the amdgpu module,
+`/dev/kfd`, render nodes, complete `rocminfo`/`rocm-smi` output, and relevant
+kernel logs in `driver-rocm-probe.txt`. It must also preserve
+`resources.manifest.snapshot`, and `lab02-cleanup-status.txt` must contain
+`result=PASS`.
 
 ### Debugging
 
@@ -290,18 +585,26 @@ reports 320 active CUs, while gem5 instantiated 40 CUs for the measured run.
 
 ### Acceptance artifacts
 
-Require the normal runner artifacts plus an unambiguous driver/ROCm probe. The
-reference sources are `phase3-driver-002/guest-probe-output.txt:61-97` for
-binding/nodes, `:407-443` for IP/VRAM/GART, `:453-463` for KFD/topology, and
-`:562` for the stage PASS. Use `phase3-verdict.json`, not the generic operator
-auditor, for the Phase 3 result.
+Keep both the normal runner PASS artifact and the diagnostic session's
+`driver-rocm-probe.txt`, `keep-alive-exit.txt`, `qemu.log`, `gem5.log`,
+`resources.manifest.snapshot`, and `lab02-cleanup-status.txt`. The probe token
+must be zero, cleanup must report PASS, and the output must prove amdgpu binding,
+`/dev/kfd`, at least one render node, a `gfx942` agent, and a successful
+`rocm-smi`. The historical `phase3-driver-002` run is comparison evidence only;
+it cannot replace evidence from the current Lab session.
 
 ### Recovery
 
-Let the runner clean the run-scoped resources. After any partial driver
-initialization, discard the Guest session and start again; do not attempt an
-`rmmod amdgpu` recovery. Use `cosim_cleanup.sh` with the exact run manifest if
-automatic cleanup was interrupted.
+The runner cleans run-scoped resources for the normal acceptance row. After
+any partial driver initialization, discard the Guest session and start again;
+do not attempt an `rmmod amdgpu` recovery. If diagnostic cleanup is interrupted,
+follow the [run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition; never use a broad kill.
+
+<a id="lab-vram-gtt-gart-gpuvm"></a>
 
 ## Lab 3: VRAM / GTT / GART / GPUVM
 
@@ -353,7 +656,8 @@ HIP allocation -> KFD/amdgpu BO and GPUVA mapping
 LAB_RUN_ID="lab03-gpuvm-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug AMDGPUMem,AMDGPUDevice,GPUTLB,GPUCommandProc vector_add
@@ -396,7 +700,14 @@ PASS verdict and correct data, not merely successful allocation or no crash.
 
 Use a new runner session after every translation or coherence failure; stale
 page tables and caches make an in-place retry ambiguous. Preserve the failed
-artifact before running manifest-scoped cleanup.
+artifact. If runner cleanup is interrupted, follow the
+[run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition; never use a broad kill.
+
+<a id="lab-ring-queue-doorbell"></a>
 
 ## Lab 4: Ring / Queue / Doorbell
 
@@ -428,7 +739,7 @@ MI300XVfioUser -> AMDGPUDevice -> HWScheduler -> HSAPacketProcessor fetch
 
 - `[REAL AMD]` `drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c`:
   `amdgpu_ring_init`, `amdgpu_ring_alloc`, and `amdgpu_ring_commit`;
-  `drivers/gpu/drm/amd/amdgpu/amdgpu_doorbell.c`;
+  `drivers/gpu/drm/amd/amdgpu/amdgpu_doorbell_mgr.c`;
   `drivers/gpu/drm/amd/amdkfd/kfd_chardev.c`: `kfd_ioctl_create_queue`;
   `drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c`:
   `pqm_create_queue`.
@@ -436,8 +747,10 @@ MI300XVfioUser -> AMDGPUDevice -> HWScheduler -> HSAPacketProcessor fetch
   `PM4PacketProcessor::mapProcess`, `mapQueues`, and `processMQD`;
   `gem5/src/dev/hsa/hw_scheduler.cc`: `HWScheduler::registerNewQueue` and
   `write`; `hsa_packet_processor.cc`: `setDeviceQueueDesc`.
-- `[COSIM]` `MI300XVfioUser::handleDoorbellAccess` forwards to
-  `AMDGPUDevice::writeDoorbell`, which uses `mapDoorbellToVMID` and queue type.
+- `[COSIM]` `gem5/src/dev/amdgpu/mi300x_vfio_user.cc`:
+  `MI300XVfioUser::handleDoorbellAccess` forwards to
+  `gem5/src/dev/amdgpu/amdgpu_device.cc`: `AMDGPUDevice::writeDoorbell`;
+  queue setup uses `mapDoorbellToVMID` before queue-type routing.
 
 ### How to run
 
@@ -445,7 +758,8 @@ MI300XVfioUser -> AMDGPUDevice -> HWScheduler -> HSAPacketProcessor fetch
 LAB_RUN_ID="lab04-queues-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug MI300XCosim,AMDGPUDevice,PM4PacketProcessor,HSAPacketProcessor vector_add
@@ -484,8 +798,15 @@ at `:1718`, and queue completion at `:3395-3403`.
 ### Recovery
 
 A stuck queue is not safely reusable. Preserve pointer state and the first
-failing packet, end the session, then let the runner or exact-manifest cleanup
-remove only that run's resources.
+failing packet, end the session, and let the runner clean that run. If runner
+cleanup is interrupted, follow the
+[run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition; never use a broad kill.
+
+<a id="lab-pm4"></a>
 
 ## Lab 5: PM4
 
@@ -525,9 +846,9 @@ KFD packet manager -> PM4 ring -> doorbell
   `pm4_packet_processor.cc`: `process`, `decodeHeader`, `mapProcess`,
   `mapQueues`, `runList`, `indirectBuffer`, `writeData`, `waitRegMem`, and
   `releaseMem`.
-- `[COSIM]` Current `IT_ACQUIRE_MEM` and `IT_SET_RESOURCES` handling advances
-  the read pointer without full hardware semantics; unsupported opcodes warn
-  and are skipped.
+- `[COSIM]` `gem5/src/dev/amdgpu/pm4_packet_processor.cc`: current
+  `IT_ACQUIRE_MEM` and `IT_SET_RESOURCES` handling advances the read pointer
+  without full hardware semantics; unsupported opcodes warn and are skipped.
 
 ### How to run
 
@@ -535,7 +856,8 @@ KFD packet manager -> PM4 ring -> doorbell
 LAB_RUN_ID="lab05-pm4-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug PM4PacketProcessor,AMDGPUDevice vector_add
@@ -575,7 +897,15 @@ partial semantics explicitly even when the test passes.
 
 Preserve the first unsupported packet and the surrounding raw log before
 cleanup. Rebuild only through `./scripts/cosim_build.sh gem5`; use a fresh
-runner session for the retry and scoped cleanup for abandoned runs.
+runner session for the retry. If runner cleanup of an abandoned run is
+interrupted, follow the
+[run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition; never use a broad kill.
+
+<a id="lab-sdma"></a>
 
 ## Lab 6: SDMA
 
@@ -620,7 +950,8 @@ hipMemcpy or driver ring test -> SDMA packet ring -> SDMA doorbell
 LAB_RUN_ID="lab06-sdma-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug SDMAEngine,SDMAData,AMDGPUMem vector_add
@@ -661,7 +992,14 @@ PASS verdict are mandatory.
 
 If SDMA stalls, preserve queue pointers, the last decoded packet, and pending
 DMA callback state. End the session and rerun fresh; never reuse a partially
-advanced ring. Clean only with the runner or exact manifest.
+advanced ring. Let the runner clean the run. If runner cleanup is interrupted,
+follow the [run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition; never use a broad kill.
+
+<a id="lab-fence-ih-msix"></a>
 
 ## Lab 7: Fence / IH / MSI-X
 
@@ -704,8 +1042,11 @@ Interrupt (HSA=1): GPU completion -> signal 1->0 -> IH cookie
   `gem5/src/dev/amdgpu/interrupt_handler.cc`:
   `AMDGPUInterruptHandler::prepareInterruptCookie`, `submitInterruptCookie`,
   `submitWritePointer`, and `intrPost`.
-- `[COSIM]` `MI300XVfioUser::sendIrqRaise` forwards the selected vector through
-  vfio-user after `AMDGPUDevice::intrPost`.
+- `[COSIM]` `gem5/src/dev/amdgpu/amdgpu_device.cc`:
+  `AMDGPUDevice::intrPost` routes cosim interrupts to
+  `gem5/src/dev/amdgpu/mi300x_vfio_user.cc`:
+  `MI300XVfioUser::sendIrqRaise`, which forwards the selected vector through
+  vfio-user.
 
 ### How to run
 
@@ -713,13 +1054,15 @@ Run polling and interrupt modes as separate fresh sessions:
 
 ```bash
 POLL_RUN_ID="lab07-poll-$(date +%Y%m%d-%H%M%S)"
-COSIM_RUN_ID="$POLL_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$POLL_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${POLL_RUN_ID}" \
     --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo vector_add
 
 IRQ_RUN_ID="lab07-irq-$(date +%Y%m%d-%H%M%S)"
-COSIM_RUN_ID="$IRQ_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$IRQ_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=1 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${IRQ_RUN_ID}" \
     --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,AMDGPUDevice,MI300XCosim vector_add
@@ -757,14 +1100,23 @@ vector 0. Both runs end with one PASS marker and verified cleanup.
 For both runs require `matrix.tsv` to record the effective HSA value and
 `verdict.json` to PASS. The reference interrupt chain is in
 `phase4-interrupt-vector-add-i1/gem5.log:229167-229179` and summarized by
-`interrupt-verdict.json`; the reference polling mode and PASS marker are in
-`phase4-baseline-vector-add-i0/qemu.log:941,959`.
+`interrupt-verdict.json`. In the preserved polling `qemu.log`, locate the mode
+and PASS marker by the exact patterns `[COSIM_ENV] HSA_ENABLE_INTERRUPT=0` and
+`[PASS] vector_add`; they currently resolve to lines 765 and 783. Prefer these
+stable patterns over hard-coded line numbers when regenerating evidence.
 
 ### Recovery
 
 An interrupt timeout requires a fresh session after preserving signal, IH,
 VMID/PASID, and vfio evidence. Do not switch HSA mode inside one live Guest and
-compare the results. Use the run-specific manifest for any manual cleanup.
+compare the results. If runner cleanup is interrupted, follow the
+[run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition; never use a broad kill.
+
+<a id="lab-hip-dispatch"></a>
 
 ## Lab 8: HIP end-to-end dispatch and gem5 debug
 
@@ -797,6 +1149,22 @@ HIP API -> ROCr -> KFD ioctls and mappings -> PM4 process/queue setup
 
 ### Source and key functions
 
+- `[REAL AMD]` HIP/CLR `clr/hipamd/src/hip_platform.cpp`:
+  `ihipLaunchKernel`; `clr/hipamd/src/hip_module.cpp`:
+  `ihipLaunchKernelCommand` and `ihipModuleLaunchKernel`;
+  `clr/hipamd/src/hip_stream.cpp`: `hipStreamSynchronize_common`;
+  `clr/rocclr/device/rocm/rocvirtual.cpp`: `VirtualGPU::submitKernel`,
+  `submitKernelInternal`, `dispatchAqlPacket`, and `dispatchGenericAqlPacket`.
+- `[REAL AMD]` ROCr
+  `ROCR-Runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp`:
+  `GpuAgent::QueueCreate`; `amd_aql_queue.cpp`:
+  `AqlQueue::AddWriteIndex*`, `StoreRelaxed`, and `StoreRelease`; `hsa.cpp`:
+  `hsa_queue_create`, `hsa_queue_add_write_index_*`,
+  `hsa_signal_store_screlease`, and `hsa_signal_wait_scacquire`. These anchors
+  were checked against CLR `a3e329ad8a92` and ROCr `737ba1dcdfa9` from
+  `rocm-7.0.0`. The Lab must still record the immutable revisions corresponding
+  to the actual Guest packages through the manifest workflow above; a tag name
+  alone is not binary provenance.
 - `[REAL AMD]` `drivers/gpu/drm/amd/amdkfd/kfd_chardev.c`:
   `kfd_ioctl_create_queue`;
   `drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c`:
@@ -822,7 +1190,8 @@ First reproduce the measured polling trace:
 LAB_RUN_ID="lab08-dispatch-$(date +%Y%m%d-%H%M%S)"
 ./scripts/cosim_preflight.sh run \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}-preflight"
-COSIM_RUN_ID="$LAB_RUN_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$LAB_RUN_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${LAB_RUN_ID}" \
     --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo vector_add
@@ -832,11 +1201,14 @@ After a single PASS, run a fresh-session repetition matrix:
 
 ```bash
 REPEAT_ID="lab08-repeat-$(date +%Y%m%d-%H%M%S)"
-COSIM_RUN_ID="$REPEAT_ID" GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
+COSIM_STRICT_ACCEPTANCE=1 COSIM_RUN_ID="$REPEAT_ID" \
+    GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
     ./scripts/run_cosim_tests.sh --repeat 3 \
     --output-dir "artifacts/amd-gpu-learning-env/labs/${REPEAT_ID}" \
     --gem5-debug HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo vector_add
 ```
+
+<a id="lab-gem5-debug"></a>
 
 ### Debugging
 
@@ -888,4 +1260,10 @@ Preserve the complete failing row before cleanup. Route the first failing
 component through the repository debug workflow, make one bounded change,
 rebuild only through `cosim_build.sh`, and retry in a fresh runner session with
 the same acceptance criteria. Stop after a PASS matrix with matching
-provenance; never overwrite the failed artifact directory.
+provenance; never overwrite the failed artifact directory. If runner cleanup is
+interrupted, follow the
+[run-scoped recovery procedure](getting-started.md#manifest-scoped-cleanup):
+validate `launcher.pid`, its `scripts/cosim_launch.sh` process group, and
+`--artifact-dir`; stop that exact group and confirm its exit; only then may
+`cosim_cleanup.sh` use the exact manifest. Missing or mismatched ownership is a
+stop condition; never use a broad kill.

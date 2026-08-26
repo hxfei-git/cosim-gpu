@@ -22,11 +22,11 @@ accepted runtime evidence，也会明确标识。全文始终区分真实 AMD �
 Guest RAM 和 40 个建模 CU。`artifacts/amd-gpu-learning-env/tests/` 中保留的
 runtime 证据已证明：
 
-| 证据 | 已证明现象 |
-|---|---|
-| `phase3-driver-002/phase3-verdict.json` | PCI endpoint 与 BAR、amdgpu 绑定、`/dev/kfd`、DRM render node、ROCm 7.0 和 `gfx942` agent |
-| `phase4-baseline-vector-add-i0/dispatch-verdict.json` | AQL task 2、grid 4352、workgroup size 256、workgroup 0–16 以及 gem5 kernel completion |
-| `phase4-interrupt-vector-add-i1/interrupt-verdict.json` | signal 1→0、IH cookie/write-pointer 更新，以及同一 gem5 tick 的 vfio-user IRQ vector 0 |
+| 证据                                                      | 已证明现象                                                                                    |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `phase3-driver-002/phase3-verdict.json`                 | PCI endpoint 与 BAR、amdgpu 绑定、`/dev/kfd`、DRM render node、ROCm 7.0 和 `gfx942` agent |
+| `phase4-baseline-vector-add-i0/dispatch-verdict.json`   | AQL task 2、grid 4352、workgroup size 256、workgroup 0–16 以及 gem5 kernel completion        |
+| `phase4-interrupt-vector-add-i1/interrupt-verdict.json` | signal 1→0、IH cookie/write-pointer 更新，以及同一 gem5 tick 的 vfio-user IRQ vector 0       |
 
 这些 artifact 只证明对应 configuration 与 binary provenance，不能证明 timing
 精度，也不能证明物理 MI300X 上未经测量的行为。
@@ -67,11 +67,11 @@ QEMU device patch。
 
 ### 2.2 传输通道
 
-| 通道 | 承载内容 | 实现 |
-|---|---|---|
-| vfio-user socket | PCI config、BAR2 doorbell、BAR5 MMIO、reset 与 IRQ protocol | `[COSIM]` `MI300XVfioUser` + libvfio-user ↔ QEMU `vfio-user-pci` |
-| VRAM shared memory | BAR0 字节、page table 和 device-local allocation | `[COSIM]` 每次运行独立的 `/dev/shm/mi300x-vram-<run>`；可 mmap 的 BAR0 与 gem5 VRAM backstore |
-| Guest RAM shared memory | GTT/system page、queue、signal、fence 和 IH buffer | `[COSIM]` 每次运行独立的 `/dev/shm/cosim-guest-ram-<run>`；QEMU `memory-backend-file,share=on` 与 gem5 `system.shared_backstore` |
+| 通道                    | 承载内容                                                    | 实现                                                                                                                                     |
+| ----------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| vfio-user socket        | PCI config、BAR2 doorbell、BAR5 MMIO、reset 与 IRQ protocol | `[COSIM]` `MI300XVfioUser` + libvfio-user ↔ QEMU `vfio-user-pci`                                                                  |
+| VRAM shared memory      | BAR0 字节、page table 和 device-local allocation            | `[COSIM]` 每次运行独立的 `/dev/shm/mi300x-vram-<run>`；可 mmap 的 BAR0 与 gem5 VRAM backstore                                        |
+| Guest RAM shared memory | GTT/system page、queue、signal、fence 和 IH buffer          | `[COSIM]` 每次运行独立的 `/dev/shm/cosim-guest-ram-<run>`；QEMU `memory-backend-file,share=on` 与 gem5 `system.shared_backstore` |
 
 socket 是控制与通知路径，不是 bulk-memory coherence protocol。共享文件提供字节
 可见性，gem5 Ruby hierarchy 建模 GPU 侧 traffic。这一组合适合功能研究，但不等同
@@ -100,12 +100,12 @@ artifact directory 不匹配时必须停止并诊断，不能猜 PID，也不能
 
 Phase 3 Guest probe 实测得到以下精确布局：
 
-| BAR | 大小 | 作用 | Access path |
-|---|---:|---|---|
-| BAR0+1 | 16 GiB | prefetchable VRAM aperture | mmap VRAM shared-memory fd；另有 callback fallback |
-| BAR2+3 | 2 MiB | non-prefetchable doorbell aperture | vfio-user callback → `AMDGPUDevice::writeDoorbell` |
-| BAR4 | 8 KiB | MSI-X table 与 PBA，advertise 256 vectors | 由 libvfio-user/QEMU 处理；当前模型只 raise vector 0 |
-| BAR5 | 512 KiB | GPU MMIO registers | vfio-user callback → `AMDGPUDevice::readMMIO`/`writeMMIO` |
+| BAR    |    大小 | 作用                                      | Access path                                                   |
+| ------ | ------: | ----------------------------------------- | ------------------------------------------------------------- |
+| BAR0+1 |  16 GiB | prefetchable VRAM aperture                | mmap VRAM shared-memory fd；另有 callback fallback            |
+| BAR2+3 |   2 MiB | non-prefetchable doorbell aperture        | vfio-user callback →`AMDGPUDevice::writeDoorbell`          |
+| BAR4   |   8 KiB | MSI-X table 与 PBA，advertise 256 vectors | 由 libvfio-user/QEMU 处理；当前模型只 raise vector 0          |
+| BAR5   | 512 KiB | GPU MMIO registers                        | vfio-user callback →`AMDGPUDevice::readMMIO`/`writeMMIO` |
 
 `[COSIM]` endpoint 将 vendor/device/subsystem ID 设置为 `1002:74a0`，PCI class
 为 `0x030000`，为 BAR0 与 BAR2 设置 64-bit type bits，并提供 expansion ROM
@@ -184,11 +184,11 @@ topology 只证明 ROCm 接受 synthetic device，不能当成建模 CU 数或 p
 
 ### 5.1 这些术语不能互换
 
-| 术语 | 在本环境中的含义 |
-|---|---|
-| VRAM | device-local allocation domain 与 BAR0 aperture；配置为 16 GiB，driver 报告约 16383 MiB usable |
-| GTT | 由 Guest/system RAM 支撑的 driver placement domain；Phase 3 probe 报告约 3970 MiB ready |
-| GART | 将 GPU-visible address 映射到 system page 的 VMID0 aperture/page table；probe 报告 512 MiB PCIe GART |
+| 术语  | 在本环境中的含义                                                                                                 |
+| ----- | ---------------------------------------------------------------------------------------------------------------- |
+| VRAM  | device-local allocation domain 与 BAR0 aperture；配置为 16 GiB，driver 报告约 16383 MiB usable                   |
+| GTT   | 由 Guest/system RAM 支撑的 driver placement domain；Phase 3 probe 报告约 3970 MiB ready                          |
+| GART  | 将 GPU-visible address 映射到 system page 的 VMID0 aperture/page table；probe 报告 512 MiB PCIe GART             |
 | GPUVM | 由 VMID 选择、与 PASID 关联的 per-process GPU virtual address space；user mapping 使用 multilevel GPU page table |
 
 GTT 描述 memory placement；GART 与 GPUVM 描述 address translation。“GTT table”
@@ -244,10 +244,10 @@ cache-coherence 语义。
 
 系统有两个相关但不同的 command plane：
 
-| Plane | Producer 与 payload | 模型 consumer |
-|---|---|---|
-| Kernel/management plane | amdgpu/KFD 在 KIQ/runlist/compute management ring 中写 PM4 packet | `PM4PacketProcessor` |
-| User compute plane | ROCr 向 process queue 写 64-byte AQL packet | `HWScheduler` + `HSAPacketProcessor` |
+| Plane                   | Producer 与 payload                                               | 模型 consumer                            |
+| ----------------------- | ----------------------------------------------------------------- | ---------------------------------------- |
+| Kernel/management plane | amdgpu/KFD 在 KIQ/runlist/compute management ring 中写 PM4 packet | `PM4PacketProcessor`                   |
+| User compute plane      | ROCr 向 process queue 写 64-byte AQL packet                       | `HWScheduler` + `HSAPacketProcessor` |
 
 `[REAL AMD]` KFD 创建 process queue、映射 doorbell page 并配置 MQD。ROCr 更新
 AQL write index 后写 mapped doorbell，正常 dispatch fast path 不会为每个 kernel
@@ -401,21 +401,21 @@ baseline 也没有证明 xGMI coherence、ordering、peer-DMA 或 performance fi
 
 ## 12. 源码导航图
 
-| 主题 | 模型/集成源码 | 关键函数或对象 |
-|---|---|---|
-| Runtime construction | `gem5/configs/example/gpufs/mi300_cosim.py` | `_create_per_gpu_components`、`buildCosimSystem` |
-| vfio-user/PCI/BAR/IRQ | `gem5/src/dev/amdgpu/mi300x_vfio_user.{cc,hh}` | `initVfuContext`、`setupBars`、`setupSharedMemory`、`sendIrqRaise` |
-| Device routing | `gem5/src/dev/amdgpu/amdgpu_device.{cc,hh}` | `writeDoorbell`、`writeMMIO`、`allocateVMID`、`mapDoorbellToVMID`、`intrPost` |
-| GPU virtual memory | `gem5/src/dev/amdgpu/amdgpu_vm.{cc,hh}` | GART、MMHUB 与 user translation generator |
-| Page walk/TLB | `gem5/src/arch/amdgpu/vega/pagetable_walker.cc`、`tlb.cc` | functional/timing PTE walk、PWC 与 TLB |
-| PM4 | `gem5/src/dev/amdgpu/pm4_packet_processor.{cc,hh}` | `process`、`decodeHeader`、`mapProcess`、`mapQueues`、`releaseMem` |
-| SDMA | `gem5/src/dev/amdgpu/sdma_engine.{cc,hh}` | queue registration、decode 与 operation handler |
-| AQL queue | `gem5/src/dev/hsa/hw_scheduler.{cc,hh}`、`hsa_packet_processor.{cc,hh}` | `HWScheduler::write`、`getCommandsFromHost`、`processPkt` |
-| Dispatch | `gem5/src/gpu-compute/gpu_command_processor.cc`、`dispatcher.cc`、`shader.cc` | `submitDispatchPkt`、`dispatchPkt`、`GPUDispatcher::dispatch` |
-| Interrupt | `gem5/src/dev/amdgpu/interrupt_handler.{cc,hh}` | cookie、IH ring、write pointer 与 post |
-| HIP/CLR launch 与同步 | `clr/hipamd/src/hip_platform.cpp`、`hip_module.cpp`、`hip_stream.cpp`、`rocclr/device/rocm/rocvirtual.cpp` | `ihipLaunchKernel`、`ihipModuleLaunchKernel`、`VirtualGPU::submitKernel`、`dispatchAqlPacket`、`hipStreamSynchronize_common` |
-| ROCr queue/doorbell/signal | `ROCR-Runtime/runtime/hsa-runtime/core/runtime/{amd_gpu_agent,amd_aql_queue,hsa}.cpp` | `GpuAgent::QueueCreate`、`AqlQueue::AddWriteIndex*`、`StoreRelease`、`hsa_signal_wait_scacquire` |
-| Launch/evidence | `scripts/cosim_launch.sh`、`run_cosim_tests.sh`、`classify_runs.py` | isolated run、raw evidence、verdict 与 cleanup |
+| 主题                       | 模型/集成源码                                                                                                      | 关键函数或对象                                                                                                                         |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime construction       | `gem5/configs/example/gpufs/mi300_cosim.py`                                                                      | `_create_per_gpu_components`、`buildCosimSystem`                                                                                   |
+| vfio-user/PCI/BAR/IRQ      | `gem5/src/dev/amdgpu/mi300x_vfio_user.{cc,hh}`                                                                   | `initVfuContext`、`setupBars`、`setupSharedMemory`、`sendIrqRaise`                                                             |
+| Device routing             | `gem5/src/dev/amdgpu/amdgpu_device.{cc,hh}`                                                                      | `writeDoorbell`、`writeMMIO`、`allocateVMID`、`mapDoorbellToVMID`、`intrPost`                                                |
+| GPU virtual memory         | `gem5/src/dev/amdgpu/amdgpu_vm.{cc,hh}`                                                                          | GART、MMHUB 与 user translation generator                                                                                              |
+| Page walk/TLB              | `gem5/src/arch/amdgpu/vega/pagetable_walker.cc`、`tlb.cc`                                                      | functional/timing PTE walk、PWC 与 TLB                                                                                                 |
+| PM4                        | `gem5/src/dev/amdgpu/pm4_packet_processor.{cc,hh}`                                                               | `process`、`decodeHeader`、`mapProcess`、`mapQueues`、`releaseMem`                                                           |
+| SDMA                       | `gem5/src/dev/amdgpu/sdma_engine.{cc,hh}`                                                                        | queue registration、decode 与 operation handler                                                                                        |
+| AQL queue                  | `gem5/src/dev/hsa/hw_scheduler.{cc,hh}`、`hsa_packet_processor.{cc,hh}`                                        | `HWScheduler::write`、`getCommandsFromHost`、`processPkt`                                                                        |
+| Dispatch                   | `gem5/src/gpu-compute/gpu_command_processor.cc`、`dispatcher.cc`、`shader.cc`                                | `submitDispatchPkt`、`dispatchPkt`、`GPUDispatcher::dispatch`                                                                    |
+| Interrupt                  | `gem5/src/dev/amdgpu/interrupt_handler.{cc,hh}`                                                                  | cookie、IH ring、write pointer 与 post                                                                                                 |
+| HIP/CLR launch 与同步      | `clr/hipamd/src/hip_platform.cpp`、`hip_module.cpp`、`hip_stream.cpp`、`rocclr/device/rocm/rocvirtual.cpp` | `ihipLaunchKernel`、`ihipModuleLaunchKernel`、`VirtualGPU::submitKernel`、`dispatchAqlPacket`、`hipStreamSynchronize_common` |
+| ROCr queue/doorbell/signal | `ROCR-Runtime/runtime/hsa-runtime/core/runtime/{amd_gpu_agent,amd_aql_queue,hsa}.cpp`                            | `GpuAgent::QueueCreate`、`AqlQueue::AddWriteIndex*`、`StoreRelease`、`hsa_signal_wait_scacquire`                               |
+| Launch/evidence            | `scripts/cosim_launch.sh`、`run_cosim_tests.sh`、`classify_runs.py`                                          | isolated run、raw evidence、verdict 与 cleanup                                                                                         |
 
 `[REAL AMD]` 源码导航可从第 4 节的 driver path 开始，再读 `amdgpu_vm.c`、
 `amdgpu_gart.c`、`amdgpu_ring.c`、`amdgpu_doorbell_mgr.c`、

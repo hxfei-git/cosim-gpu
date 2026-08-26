@@ -260,7 +260,8 @@ Runner 会打印确切的 artifact 目录。自定义 `--output-dir` 只能位�
 | `patch/binary-provenance.txt` | gem5 commit/subject/二进制 hash 和精确测试二进制 hash |
 | `patch/repo-status.txt`、`patch/repo.patch` | 该行使用的顶层 tracked 与未提交源码状态 |
 | `patch/gem5-status.txt`、`patch/gem5.patch` | 该行使用的 gem5 submodule 状态 |
-| `qemu.log`、`gem5.log` | 为诊断保留的完整 Guest console 与仿真器证据 |
+| `qemu.log`、`gem5.log` | 为诊断保留的完整 Guest console 与带时间戳的仿真器 stream；`gem5.log` 还证明实际 command、fatal 与时间戳 contract |
+| `gem5-evidence.tsv` | gem5 独占写入的结构化 GPU 事件：固定 schema、run ID、连续序号、tick、GPU/kernel/WG 身份与流内 `test_begin`/`test_end` 边界 |
 | `guest-provenance.json` 与 `guest-*` 构建/stat 证据 | Guest image、kernel、m5、QEMU、锁文件、overlay patch、submodule 与 recipe 的严格连接；base image 只读运行前后状态 |
 | `docker-inspect.json` | 实际 gem5 container 名称、argv、运行/OOM/restart 状态 |
 | `cleanup-status.txt` | Manifest 范围内的资源清理结果 |
@@ -274,9 +275,23 @@ Docker/root-equivalent 或宿主管理员权限者对全部本地证据进行协
 `COSIM_STRICT_ACCEPTANCE=1`；两个 source tree 都 clean；runner 返回 0；
 `verdict.json` 为 `PASS` 且原因为 `all_acceptance_gates_passed`；`matrix.tsv` 一致；
 实际 HSA 值和三种 timeout 匹配目标模式；`cosim-matrix-verification/v2` 对
-manifest、invocation、Guest script/log、源码/二进制 provenance 的连接验证通过；
-`gem5.log` 在本行测试时间窗内包含 kernel launch、workgroup dispatch、`WgCompl`
-和同 ID kernel completion；清理已验证。即使 HIP 输出看起来正确，缺少证据也属于失败。Diagnostic mode 会为
+manifest、invocation、Guest script/log、源码/二进制 provenance 的连接验证通过；且
+`gem5-evidence.tsv` 的 hash 与 run ID 匹配。Guest 编译 helper 后先输出 run-bound READY
+marker 和 SHA-256；Host 在 BEGIN 前稳定复核并持久化该身份，再通过一次性 9p ack 放行。
+归档的 Guest helper 紧邻目标程序前后分别提交携带 run/program-bound token 的 BEGIN 与
+END vendor-specific AQL packet，并等待各自的 completion signal 和 AQL read index 退休。
+对每个 packet，gem5 必须先 append 对应的 `test_begin` 或 `test_end` 记录并成功完成
+`fdatasync()`，然后才能发出 completion。Strict verifier
+要求所有 producer/verifier join 使用同一个唯一匹配 token、流中恰好各有一个匹配的
+`test_begin` 与 `test_end`、完整因果 GPU 链严格位于两者之间，且 `test_end` 是最终记录；
+完整 Docker/gem5 argv 必须等于 runner 推导的有序命令，`/gem5`、`/tmp`、`/dev/shm` 与
+`/cosim-artifacts` 四个 bind mount 也必须精确匹配且没有 shadow mount，并且清理已验证。
+
+这种边界 packet 与确认机制是 cosim-gpu 特有的 instrumentation protocol/workaround，
+不是实际 AMD GPU packet ABI 或 ROCm ABI 的组成部分，也不代表真实硬件行为。Strict
+PASS 因而还依赖 Guest amdgpu/KFD/HSA 链路，包括 AQL queue 提交、doorbell 与 completion
+signal 送达。普通 `gem5.log` 中看似合法的 warning 或多行续行不能提供这些 GPU 事件。
+即使 HIP 输出看起来正确，缺少证据也属于失败。Diagnostic mode 会为
 学习和 replay 保留 dirty provenance，但这不会把 dirty row 变成 strict v2 acceptance；
 只有记录 `COSIM_STRICT_ACCEPTANCE=1` 的 artifact 才能进入 final v2 matrix。
 

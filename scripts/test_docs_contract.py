@@ -1867,7 +1867,10 @@ def check_public_commands(contract: Contract) -> None:
         'echo "boot_timeout=${BOOT_TIMEOUT_SECS}"',
         'echo "test_timeout=${TEST_TIMEOUT_SECS}"',
         'echo "guest_run_timeout=${GUEST_RUN_TIMEOUT_SECS}"',
-        '--share-dir|--artifact-dir)',
+        '--share-dir|--artifact-dir|--evidence-test-id|--evidence-token)',
+        'evidence-boundaries "$GEM5_EVIDENCE"',
+        'gem5_evidence_test_id=${TEST_NAME}',
+        'gem5_evidence_token=${EVIDENCE_BOUNDARY_TOKEN}',
     ):
         contract.require(required in runner, f"run_cosim_tests.sh 缺少证据合同：{required}")
 

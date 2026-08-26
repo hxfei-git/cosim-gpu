@@ -23,8 +23,15 @@ from scripts.guest_provenance import (  # noqa: E402
     SEAL_KEYS as GUEST_SEAL_KEYS,
     recipe_fingerprint as guest_recipe_fingerprint,
 )
-from scripts.cosim_log_evidence import render_guest_run_script  # noqa: E402
+from scripts.cosim_log_evidence import (  # noqa: E402
+    BOUNDARY_HANDSHAKE_MIN_TIMEOUT_SECONDS,
+    evidence_boundary_token,
+    render_guest_run_script,
+)
 from scripts.verify_cosim_matrix import (  # noqa: E402
+    GEM5_STDIO_WRAPPER_ARGS,
+    GEM5_STDIO_WRAPPER_PATH,
+    PROGRAM_RE,
     RUN_PREFLIGHT_CHECK_IDS,
     RUN_PREFLIGHT_REQUIRED_IDS,
     SCHEMA,
@@ -82,6 +89,8 @@ MATRIX_FIELDS = (
     "gem5_sha256",
     "test_binary",
     "test_binary_sha256",
+    "gem5_evidence_boundary_binary",
+    "gem5_evidence_boundary_binary_sha256",
     "source_fingerprint",
     "strict_acceptance",
     "mode",
@@ -110,13 +119,32 @@ LOCAL_MATRIX_FIELDS = (
     "guest_run_timeout",
 )
 STRICT_DEBUG_FLAGS = "HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo"
+UNIT_BOUNDARY_TOKEN = evidence_boundary_token("unit-vector", "vector_add")
+UNIT_GEM5_CONFIG_ARGS = (
+    "defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
+    f"evidence-test-id=vector_add,evidence-token={UNIT_BOUNDARY_TOKEN};"
+    f"debug-flags={STRICT_DEBUG_FLAGS}"
+)
+GEM5_DOCKER_ARGS = (
+    f"--debug-flags={STRICT_DEBUG_FLAGS}",
+    "--listener-mode=on",
+    "/gem5/configs/example/gpufs/mi300_cosim.py",
+    "--socket-path=/tmp/gem5-mi300x-unit-vector.sock",
+    "--shmem-path=/mi300x-vram-unit-vector",
+    "--shmem-host-path=/cosim-guest-ram-unit-vector",
+    "--evidence-path=/cosim-artifacts/gem5-evidence.tsv",
+    "--evidence-run-id=unit-vector",
+    "--dgpu-mem-size=16GiB",
+    "--num-compute-units=40",
+    "--mem-size=8G",
+    "--num-gpus=1",
+    "--evidence-test-id=vector_add",
+    f"--evidence-token={UNIT_BOUNDARY_TOKEN}",
+)
 GEM5_LOG_TEXT = (
     "2026-01-01T00:00:00.100000000Z command line: "
-    "/gem5/build/VEGA_X86/gem5.opt "
-    f"--debug-flags={STRICT_DEBUG_FLAGS} "
-    "--socket-path=/tmp/gem5-mi300x-unit-vector.sock "
-    "--shmem-path=/mi300x-vram-unit-vector "
-    "--shmem-host-path=/cosim-guest-ram-unit-vector\n"
+    + " ".join(("/gem5/build/VEGA_X86/gem5.opt", *GEM5_DOCKER_ARGS))
+    + "\n"
     "2026-01-01T00:00:00.200000000Z src/dev/amdgpu/mi300x_vfio_user.cc:312: "
     "info: MI300XVfioUser: client connected (vfio-user)\n"
     "2026-01-01T00:00:01.100000000Z 10: "
@@ -128,24 +156,38 @@ GEM5_LOG_TEXT = (
     "2026-01-01T00:00:01.400000000Z 13: dispatcher: Completed kernel 0\n"
 )
 GEM5_LOG_SHA256 = hashlib.sha256(GEM5_LOG_TEXT.encode()).hexdigest()
-GEM5_DOCKER_ARGS = (
-    f"--debug-flags={STRICT_DEBUG_FLAGS}",
-    "--socket-path=/tmp/gem5-mi300x-unit-vector.sock",
-    "--shmem-path=/mi300x-vram-unit-vector",
-    "--shmem-host-path=/cosim-guest-ram-unit-vector",
+GEM5_EVIDENCE_TEXT = (
+    "schema\trun_id\tseq\ttick\tevent\tgpu\tdispatch\twg\tcu\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t0\t0\tsession_start\t-1\t-1\t-1\t-1\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t1\t1\tclient_connected\t0\t-1\t-1\t-1\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t2\t2\ttest_begin\t0\t-1\t-1\t-1\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t3\t10\tkernel_launch\t0\t0\t-1\t-1\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t4\t11\tworkgroup_dispatch\t0\t0\t0\t0\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t5\t12\tworkgroup_complete\t0\t0\t0\t-1\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t6\t13\tkernel_complete\t0\t0\t-1\t-1\n"
+    "COSIM_GPU_EVIDENCE_V1\tunit-vector\t7\t14\ttest_end\t0\t-1\t-1\t-1\n"
 )
+GEM5_EVIDENCE_SHA256 = hashlib.sha256(GEM5_EVIDENCE_TEXT.encode()).hexdigest()
 QEMU_SIGTERM_LINE = (
     "\x1b[?2004hroot@gem5:~# qemu-system-x86_64: "
     "terminating on signal 15 from pid 1 (/bin/bash)"
 )
 UNIT_RUN_SHA256 = hashlib.sha256(b"unit-vector").hexdigest()
 UNIT_COMPILE_TOKEN = f"COSIM_COMPILE_DONE_vector_add_{UNIT_RUN_SHA256}"
+UNIT_BOUNDARY_READY_TOKEN = (
+    f"COSIM_BOUNDARY_READY_vector_add_{UNIT_RUN_SHA256}"
+)
 UNIT_TEST_TOKEN = f"COSIM_TEST_DONE_vector_add_{UNIT_RUN_SHA256}"
+UNIT_BOUNDARY_BINARY_BYTES = b"synthetic evidence boundary helper\n"
+UNIT_BOUNDARY_BINARY_SHA256 = hashlib.sha256(
+    UNIT_BOUNDARY_BINARY_BYTES
+).hexdigest()
 QEMU_LOG_TEXT = (
     "  Run-ID:     unit-vector\n"
     "[COSIM_ENV] HSA_ENABLE_INTERRUPT=0\n"
     "[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=30\n"
     f"__{UNIT_COMPILE_TOKEN}__:0\n"
+    f"__{UNIT_BOUNDARY_READY_TOKEN}__:{UNIT_BOUNDARY_BINARY_SHA256}\n"
     "[PASS] vector_add\n"
     f"__{UNIT_TEST_TOKEN}__:0\n"
     f"{QEMU_SIGTERM_LINE}\n"
@@ -168,7 +210,7 @@ def staging_fingerprint(root: Path) -> str:
             path
             for path in root.rglob("*")
             if path.is_file()
-            and path.relative_to(root).parts[0] != "build"
+            and path.relative_to(root).parts[0] not in {"build", "tools-build"}
             and not path.name.startswith(".cosim_guest_run.")
         ),
         key=lambda path: path.relative_to(root).as_posix(),
@@ -213,6 +255,54 @@ def replace_key_value(path: Path, key: str, value: str) -> None:
     if not replaced:
         raise AssertionError(f"missing fixture key {key} in {path}")
     path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+class ProgramIdentityContractTests(unittest.TestCase):
+    def test_program_identity_accepts_128_and_rejects_129_ascii_bytes(self) -> None:
+        accepted = "a" * 128
+        rejected = accepted + "a"
+
+        self.assertIsNotNone(PROGRAM_RE.fullmatch(accepted))
+        self.assertIsNone(PROGRAM_RE.fullmatch(rejected))
+        self.assertRegex(
+            evidence_boundary_token("unit-id-boundary", accepted),
+            r"^[0-9a-f]{32}$",
+        )
+        with self.assertRaises(ValueError):
+            evidence_boundary_token("unit-id-boundary", rejected)
+        with self.assertRaises(ValueError):
+            render_guest_run_script(
+                program=rejected,
+                run_id="unit-id-boundary",
+                hsa_enable_interrupt="0",
+                test_timeout="1",
+            )
+
+    def test_minimum_workload_timeout_keeps_independent_ack_budget(self) -> None:
+        script = render_guest_run_script(
+            program="vector_add",
+            run_id="unit-ack-timeout",
+            hsa_enable_interrupt="0",
+            test_timeout="1",
+        )
+
+        self.assertGreaterEqual(BOUNDARY_HANDSHAKE_MIN_TIMEOUT_SECONDS, 30)
+        self.assertIn("[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=1", script)
+        self.assertIn(
+            "boundary_handshake_timeout_secs="
+            f"{BOUNDARY_HANDSHAKE_MIN_TIMEOUT_SECONDS}",
+            script,
+        )
+        self.assertIn(
+            "boundary_wait<boundary_handshake_timeout_secs",
+            script,
+        )
+        self.assertEqual(
+            2,
+            script.count(
+                'timeout --signal=TERM "${boundary_handshake_timeout_secs}s"'
+            ),
+        )
 
 
 class HashCacheTests(unittest.TestCase):
@@ -265,6 +355,9 @@ class MatrixFixture:
         self.staging = self.artifact / "staging"
         self.source = root / "tests" / "kernels" / "vector_add.cpp"
         self.test_binary = self.staging / "build" / "vector_add"
+        self.boundary_binary = (
+            self.staging / "tools-build" / "cosim_evidence_boundary"
+        )
         self.gem5_binary = root / "gem5" / "build" / "VEGA_X86" / "gem5.opt"
         self.resources = root / "gem5-resources"
         self.guest_template = self.resources / "src/x86-ubuntu-gpu-ml"
@@ -627,11 +720,14 @@ class MatrixFixture:
         self.patch.mkdir(parents=True)
         (self.staging / "kernels").mkdir(parents=True)
         (self.staging / "build").mkdir(parents=True)
+        self.boundary_binary.parent.mkdir(parents=True)
         (self.staging / "kernels" / "vector_add.cpp").write_bytes(
             self.source.read_bytes()
         )
         self.test_binary.write_bytes(synthetic_hip_executable())
         self.test_binary.chmod(0o755)
+        self.boundary_binary.write_bytes(UNIT_BOUNDARY_BINARY_BYTES)
+        self.boundary_binary.chmod(0o755)
 
         self.guest_template.mkdir(parents=True)
         (self.guest_template / "files").mkdir()
@@ -898,6 +994,10 @@ class MatrixFixture:
                     f"gem5_docker_image=sha256:{'e' * 64}",
                     f"test_binary={self.test_binary}",
                     f"test_binary_sha256={sha256(self.test_binary)}",
+                    "gem5_evidence_boundary_binary="
+                    f"{self.boundary_binary}",
+                    "gem5_evidence_boundary_binary_sha256="
+                    f"{sha256(self.boundary_binary)}",
                     "",
                 )
             ),
@@ -925,8 +1025,13 @@ class MatrixFixture:
                     f"gem5_binary={self.gem5_binary}",
                     "gem5_docker_image_name=gem5-run:local",
                     f"gem5_docker_image=sha256:{'e' * 64}",
-                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
-                    f"debug-flags={STRICT_DEBUG_FLAGS}",
+                    f"gem5_config_args={UNIT_GEM5_CONFIG_ARGS}",
+                    "gem5_evidence_test_id=vector_add",
+                    f"gem5_evidence_token={UNIT_BOUNDARY_TOKEN}",
+                    "gem5_evidence_boundary_binary="
+                    f"{self.boundary_binary}",
+                    "gem5_evidence_boundary_binary_sha256="
+                    f"{sha256(self.boundary_binary)}",
                     f"output_dir={self.artifact}",
                     f"artifact_dir={self.artifact}",
                     "artifact_dir_pattern=-",
@@ -956,8 +1061,11 @@ class MatrixFixture:
                     f"share_dir={self.staging}",
                     f"gem5_binary={self.gem5_binary}",
                     "gem5_container_binary=/gem5/build/VEGA_X86/gem5.opt",
-                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
-                    f"debug-flags={STRICT_DEBUG_FLAGS}",
+                    f"gem5_evidence={self.artifact / 'gem5-evidence.tsv'}",
+                    "gem5_container_evidence=/cosim-artifacts/gem5-evidence.tsv",
+                    "gem5_evidence_test_id=vector_add",
+                    f"gem5_evidence_token={UNIT_BOUNDARY_TOKEN}",
+                    f"gem5_config_args={UNIT_GEM5_CONFIG_ARGS}",
                     "gem5_docker_image=gem5-run:local",
                     "qemu_binary="
                     f"{self.root / '.local/cosim/qemu/10.1.5/bin/qemu-system-x86_64'}",
@@ -973,6 +1081,8 @@ class MatrixFixture:
                     f"argv0={self.root / 'scripts' / 'cosim_launch.sh'}",
                     f"argv=--share-dir {self.staging} "
                     f"--artifact-dir {self.artifact} "
+                    "--evidence-test-id vector_add "
+                    f"--evidence-token {UNIT_BOUNDARY_TOKEN} "
                     f"--gem5-debug {STRICT_DEBUG_FLAGS}",
                     "",
                 )
@@ -1011,8 +1121,7 @@ class MatrixFixture:
                     f"gem5_binary={self.gem5_binary}",
                     "gem5_docker_image_name=gem5-run:local",
                     f"gem5_docker_image=sha256:{'e' * 64}",
-                    "gem5_config_args=defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
-                    f"debug-flags={STRICT_DEBUG_FLAGS}",
+                    f"gem5_config_args={UNIT_GEM5_CONFIG_ARGS}",
                     "artifact_dir_pattern=-",
                     "guest_bridge_policy=artifact-local",
                     f"guest_bridge_host={self.staging}",
@@ -1024,8 +1133,17 @@ class MatrixFixture:
                     "fail_count=0",
                     "guest_test_started_at=2026-01-01T00:00:01.000000000Z",
                     "guest_test_finished_at=2026-01-01T00:00:02.000000000Z",
+                    "gem5_evidence_start_seq=2",
+                    "gem5_evidence_end_seq=7",
+                    "gem5_evidence_test_id=vector_add",
+                    f"gem5_evidence_token={UNIT_BOUNDARY_TOKEN}",
+                    "gem5_evidence_boundary_binary="
+                    f"{self.boundary_binary}",
+                    "gem5_evidence_boundary_binary_sha256="
+                    f"{sha256(self.boundary_binary)}",
                     f"qemu_log_sha256={QEMU_LOG_SHA256}",
                     f"gem5_log_sha256={GEM5_LOG_SHA256}",
+                    f"gem5_evidence_sha256={GEM5_EVIDENCE_SHA256}",
                     f"source_snapshot={self.patch / 'source-snapshot.txt'}",
                     f"gem5_baseline_lock={gem5_baseline_lock}",
                     f"gem5_baseline_lock_sha256={sha256(gem5_baseline_lock)}",
@@ -1046,6 +1164,10 @@ class MatrixFixture:
         (self.artifact / "gem5.log").write_text(
             GEM5_LOG_TEXT, encoding="utf-8"
         )
+        (self.artifact / "gem5-evidence.tsv").write_text(
+            GEM5_EVIDENCE_TEXT, encoding="ascii"
+        )
+        (self.artifact / "gem5-evidence.tsv").chmod(0o600)
         (self.artifact / "cleanup-status.txt").write_text(
             "result=PASS\nprimary_category=test_pass\nsecondary_category=none\n",
             encoding="utf-8",
@@ -1057,8 +1179,38 @@ class MatrixFixture:
                         "Name": "/gem5-cosim-unit-vector",
                         "Image": f"sha256:{'e' * 64}",
                         "Config": {"Image": "gem5-run:local"},
-                        "Path": "/gem5/build/VEGA_X86/gem5.opt",
-                        "Args": list(GEM5_DOCKER_ARGS),
+                        "Path": GEM5_STDIO_WRAPPER_PATH,
+                        "Args": [
+                            *GEM5_STDIO_WRAPPER_ARGS,
+                            "/gem5/build/VEGA_X86/gem5.opt",
+                            *GEM5_DOCKER_ARGS,
+                        ],
+                        "Mounts": [
+                            {
+                                "Type": "bind",
+                                "Source": str(self.root / "gem5"),
+                                "Destination": "/gem5",
+                                "RW": True,
+                            },
+                            {
+                                "Type": "bind",
+                                "Source": "/tmp",
+                                "Destination": "/tmp",
+                                "RW": True,
+                            },
+                            {
+                                "Type": "bind",
+                                "Source": "/dev/shm",
+                                "Destination": "/dev/shm",
+                                "RW": True,
+                            },
+                            {
+                                "Type": "bind",
+                                "Source": str(self.artifact),
+                                "Destination": "/cosim-artifacts",
+                                "RW": True,
+                            }
+                        ],
                         "State": {
                             "Status": "running",
                             "Running": True,
@@ -1139,6 +1291,11 @@ class MatrixFixture:
             "artifact_dir": str(self.artifact),
             "checks": {
                 "binary_provenance": {"ok": True},
+                "evidence_boundary_helper": {
+                    "ok": True,
+                    "path": str(self.boundary_binary),
+                    "sha256": sha256(self.boundary_binary),
+                },
                 "cleanup": {"exit_code": 0, "ok": True, "status": "verified"},
                 "compile": {"exit_code": 0, "ok": True},
                 "effective_environment": {
@@ -1171,10 +1328,14 @@ class MatrixFixture:
             },
             "evidence": {
                 "binary_provenance": str(self.patch / "binary-provenance.txt"),
+                "gem5_evidence": str(self.artifact / "gem5-evidence.tsv"),
                 "gem5_log": str(self.artifact / "gem5.log"),
                 "guest_log": str(self.artifact / "qemu.log"),
                 "metadata": str(self.artifact / "runner-metadata.txt"),
                 "qemu_log": str(self.artifact / "qemu.log"),
+                "runner_invocation": str(
+                    self.artifact / "runner-invocation.txt"
+                ),
                 "source_snapshot": str(self.patch / "source-snapshot.txt"),
             },
             "exit_code": 0,
@@ -1184,6 +1345,11 @@ class MatrixFixture:
                 "gem5_binary": str(self.gem5_binary),
                 "gem5_sha256": sha256(self.gem5_binary),
                 "gem5_source_commit": self.gem5_commit,
+                "gem5_evidence_boundary_binary": str(self.boundary_binary),
+                "gem5_evidence_boundary_binary_sha256": sha256(
+                    self.boundary_binary
+                ),
+                "gem5_evidence_sha256": GEM5_EVIDENCE_SHA256,
                 "gem5_log_sha256": GEM5_LOG_SHA256,
                 "qemu_log_sha256": QEMU_LOG_SHA256,
             },
@@ -1231,8 +1397,7 @@ class MatrixFixture:
             "guest_test_prefix": "HSA_ENABLE_INTERRUPT=0",
             "expected_hsa_interrupt": "0",
             "gem5_binary": str(self.gem5_binary),
-            "gem5_config_args": "defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
-            f"debug-flags={STRICT_DEBUG_FLAGS}",
+            "gem5_config_args": UNIT_GEM5_CONFIG_ARGS,
             "output_dir": str(self.artifact),
             "artifact_dir": str(self.artifact),
             "artifact_dir_pattern": "-",
@@ -1278,6 +1443,10 @@ class MatrixFixture:
             "gem5_sha256": sha256(self.gem5_binary),
             "test_binary": str(self.test_binary),
             "test_binary_sha256": sha256(self.test_binary),
+            "gem5_evidence_boundary_binary": str(self.boundary_binary),
+            "gem5_evidence_boundary_binary_sha256": sha256(
+                self.boundary_binary
+            ),
             "source_fingerprint": snapshot["source_fingerprint"],
             "strict_acceptance": "1",
             "mode": "pure_test",
@@ -1287,8 +1456,7 @@ class MatrixFixture:
             "test_timeout": "30",
             "guest_run_timeout": "1800",
             "guest_test_prefix": "HSA_ENABLE_INTERRUPT=0",
-            "gem5_config_args": "defaults:num-gpus=1,num-cus=40,host-mem=8G,vram-size=16GiB;"
-            f"debug-flags={STRICT_DEBUG_FLAGS}",
+            "gem5_config_args": UNIT_GEM5_CONFIG_ARGS,
             "artifact_dir_pattern": "-",
             "guest_bridge_policy": "artifact-local",
         }
@@ -1345,6 +1513,20 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         verdict_path = self.fixture.artifact / "verdict.json"
         verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
         verdict["provenance"]["gem5_log_sha256"] = digest
+        verdict_path.write_text(
+            json.dumps(verdict, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return digest
+
+    def synchronize_gem5_evidence_hash(self, end_seq: str = "7") -> str:
+        digest = sha256(self.fixture.artifact / "gem5-evidence.tsv")
+        metadata_path = self.fixture.artifact / "runner-metadata.txt"
+        replace_key_value(metadata_path, "gem5_evidence_sha256", digest)
+        replace_key_value(metadata_path, "gem5_evidence_end_seq", end_seq)
+        verdict_path = self.fixture.artifact / "verdict.json"
+        verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+        verdict["provenance"]["gem5_evidence_sha256"] = digest
         verdict_path.write_text(
             json.dumps(verdict, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -1492,12 +1674,28 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(
                 f"--artifact-dir {self.fixture.artifact} "
+                "--evidence-test-id vector_add "
+                f"--evidence-token {UNIT_BOUNDARY_TOKEN} "
                 f"--gem5-debug {STRICT_DEBUG_FLAGS}",
-                f"--artifact-dir {self.fixture.artifact} {option} {value} "
+                f"--artifact-dir {self.fixture.artifact} "
+                "--evidence-test-id vector_add "
+                f"--evidence-token {UNIT_BOUNDARY_TOKEN} {option} {value} "
                 f"--gem5-debug {STRICT_DEBUG_FLAGS}",
             ),
             encoding="utf-8",
         )
+
+    def replace_runtime_gem5_arg(self, old: str, new: str) -> None:
+        def replace_docker_arg(container) -> None:
+            self.assertEqual(1, container["Args"].count(old))
+            container["Args"][container["Args"].index(old)] = new
+
+        self.mutate_docker_inspect(replace_docker_arg)
+        gem5_log = self.fixture.artifact / "gem5.log"
+        text = gem5_log.read_text(encoding="utf-8")
+        self.assertEqual(1, text.count(old))
+        gem5_log.write_text(text.replace(old, new), encoding="utf-8")
+        self.synchronize_gem5_log_hash()
 
     def test_raw_gem5_config_override_without_structured_update_fails(self) -> None:
         self.set_raw_passthrough("--num-cus", "2")
@@ -1692,6 +1890,74 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("binary_not_executable", error_codes(result))
 
+    def test_replaced_boundary_helper_with_only_binary_provenance_update_fails(
+        self,
+    ) -> None:
+        self.fixture.boundary_binary.write_bytes(b"replaced executable helper\n")
+        self.fixture.boundary_binary.chmod(0o755)
+        replace_key_value(
+            self.fixture.patch / "binary-provenance.txt",
+            "gem5_evidence_boundary_binary_sha256",
+            sha256(self.fixture.boundary_binary),
+        )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("hash_mismatch", error_codes(result))
+
+    def test_duplicate_boundary_ready_marker_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        marker = (
+            f"__{UNIT_BOUNDARY_READY_TOKEN}__:"
+            f"{UNIT_BOUNDARY_BINARY_SHA256}\n"
+        )
+        qemu_log.write_text(
+            qemu_log.read_text(encoding="utf-8").replace(marker, marker * 2),
+            encoding="utf-8",
+        )
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_qemu_sequence", error_codes(result))
+
+    def test_boundary_ready_marker_after_pass_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        marker = (
+            f"__{UNIT_BOUNDARY_READY_TOKEN}__:"
+            f"{UNIT_BOUNDARY_BINARY_SHA256}\n"
+        )
+        text = qemu_log.read_text(encoding="utf-8")
+        qemu_log.write_text(
+            text.replace(f"{marker}[PASS] vector_add\n", "")
+            .replace(
+                f"__{UNIT_TEST_TOKEN}__:0\n",
+                f"[PASS] vector_add\n{marker}__{UNIT_TEST_TOKEN}__:0\n",
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_qemu_sequence", error_codes(result))
+
+    def test_boundary_ready_marker_hash_mismatch_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        qemu_log.write_text(
+            qemu_log.read_text(encoding="utf-8").replace(
+                f"__{UNIT_BOUNDARY_READY_TOKEN}__:"
+                f"{UNIT_BOUNDARY_BINARY_SHA256}",
+                f"__{UNIT_BOUNDARY_READY_TOKEN}__:{'f' * 64}",
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_qemu_sequence", error_codes(result))
+
     def test_guest_script_preceding_exit_fails(self) -> None:
         guest_script = self.fixture.artifact / "guest-run.sh"
         guest_script.write_text(
@@ -1760,7 +2026,11 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.set_raw_passthrough("--num-cus", "2")
         self.set_structured_gem5_config(
             "defaults:num-gpus=1,num-cus=2,host-mem=8G,vram-size=16GiB;"
+            f"evidence-test-id=vector_add,evidence-token={UNIT_BOUNDARY_TOKEN};"
             f"debug-flags={STRICT_DEBUG_FLAGS}"
+        )
+        self.replace_runtime_gem5_arg(
+            "--num-compute-units=40", "--num-compute-units=2"
         )
 
         result = self.verify()
@@ -1813,62 +2083,65 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertIn("gem5_log_hash_mismatch", error_codes(result))
 
     def test_verifier_rescan_rejects_log_without_workgroup_dispatch(self) -> None:
-        gem5_log = self.fixture.artifact / "gem5.log"
-        gem5_log.write_text(
-            "\n".join(
-                line
-                for line in gem5_log.read_text(encoding="utf-8").splitlines()
-                if "Dispatching a workgroup" not in line
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        self.synchronize_gem5_log_hash()
+        evidence = self.fixture.artifact / "gem5-evidence.tsv"
+        text = "\n".join(
+            line
+            for line in evidence.read_text(encoding="ascii").splitlines()
+            if "workgroup_dispatch" not in line
+        ) + "\n"
+        text = text.replace("\t5\t12\tworkgroup_complete", "\t4\t12\tworkgroup_complete")
+        text = text.replace("\t6\t13\tkernel_complete", "\t5\t13\tkernel_complete")
+        text = text.replace("\t7\t14\ttest_end", "\t6\t14\ttest_end")
+        evidence.write_text(text, encoding="ascii")
+        self.synchronize_gem5_evidence_hash("6")
 
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
 
     def test_verifier_rejects_missing_kernel_completion(self) -> None:
-        gem5_log = self.fixture.artifact / "gem5.log"
-        gem5_log.write_text(
+        evidence = self.fixture.artifact / "gem5-evidence.tsv"
+        evidence.write_text(
             "\n".join(
                 line
-                for line in gem5_log.read_text(encoding="utf-8").splitlines()
-                if "Completed kernel" not in line
+                for line in evidence.read_text(encoding="ascii").splitlines()
+                if "kernel_complete" not in line
             )
+            .replace("\t7\t14\ttest_end", "\t6\t14\ttest_end")
             + "\n",
-            encoding="utf-8",
+            encoding="ascii",
         )
-        self.synchronize_gem5_log_hash()
+        self.synchronize_gem5_evidence_hash("6")
 
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
 
     def test_verifier_rejects_wrong_kernel_completion_id(self) -> None:
-        gem5_log = self.fixture.artifact / "gem5.log"
-        gem5_log.write_text(
-            gem5_log.read_text(encoding="utf-8").replace(
-                "Completed kernel 0", "Completed kernel 1"
+        evidence = self.fixture.artifact / "gem5-evidence.tsv"
+        evidence.write_text(
+            evidence.read_text(encoding="ascii").replace(
+                "kernel_complete\t0\t0\t-1\t-1",
+                "kernel_complete\t0\t1\t-1\t-1",
             ),
-            encoding="utf-8",
+            encoding="ascii",
         )
-        self.synchronize_gem5_log_hash()
+        self.synchronize_gem5_evidence_hash()
 
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
 
     def test_verifier_rejects_wrong_workgroup_completion_id(self) -> None:
-        gem5_log = self.fixture.artifact / "gem5.log"
-        gem5_log.write_text(
-            gem5_log.read_text(encoding="utf-8").replace(
-                "notify WgCompl 0", "notify WgCompl 99"
+        evidence = self.fixture.artifact / "gem5-evidence.tsv"
+        evidence.write_text(
+            evidence.read_text(encoding="ascii").replace(
+                "workgroup_complete\t0\t0\t0\t-1",
+                "workgroup_complete\t0\t0\t99\t-1",
             ),
-            encoding="utf-8",
+            encoding="ascii",
         )
-        self.synchronize_gem5_log_hash()
+        self.synchronize_gem5_evidence_hash()
 
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
@@ -1877,25 +2150,43 @@ class VerifyCosimMatrixTests(unittest.TestCase):
     def test_verifier_rejects_kernel_completion_before_workgroup_completion(
         self,
     ) -> None:
-        gem5_log = self.fixture.artifact / "gem5.log"
-        gem5_log.write_text(
-            gem5_log.read_text(encoding="utf-8").replace(
-                "2026-01-01T00:00:01.300000000Z 12: "
-                "dispatcher: notify WgCompl 0\n"
-                "2026-01-01T00:00:01.400000000Z 13: "
-                "dispatcher: Completed kernel 0\n",
-                "2026-01-01T00:00:01.300000000Z 12: "
-                "dispatcher: Completed kernel 0\n"
-                "2026-01-01T00:00:01.400000000Z 13: "
-                "dispatcher: notify WgCompl 0\n",
-            ),
-            encoding="utf-8",
+        evidence = self.fixture.artifact / "gem5-evidence.tsv"
+        lines = evidence.read_text(encoding="ascii").splitlines()
+        completion = lines[6].replace("\t5\t12\t", "\t6\t13\t")
+        kernel_completion = lines[7].replace("\t6\t13\t", "\t5\t12\t")
+        evidence.write_text(
+            "\n".join(
+                (*lines[:6], kernel_completion, completion, *lines[8:])
+            )
+            + "\n",
+            encoding="ascii",
         )
-        self.synchronize_gem5_log_hash()
+        self.synchronize_gem5_evidence_hash()
 
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
+
+    def test_verifier_rejects_complete_gpu_chain_appended_after_test_end(
+        self,
+    ) -> None:
+        evidence = self.fixture.artifact / "gem5-evidence.tsv"
+        with evidence.open("a", encoding="ascii") as handle:
+            handle.write(
+                "COSIM_GPU_EVIDENCE_V1\tunit-vector\t8\t15\t"
+                "kernel_launch\t0\t1\t-1\t-1\n"
+                "COSIM_GPU_EVIDENCE_V1\tunit-vector\t9\t16\t"
+                "workgroup_dispatch\t0\t1\t0\t0\n"
+                "COSIM_GPU_EVIDENCE_V1\tunit-vector\t10\t17\t"
+                "workgroup_complete\t0\t1\t0\t-1\n"
+                "COSIM_GPU_EVIDENCE_V1\tunit-vector\t11\t18\t"
+                "kernel_complete\t0\t1\t-1\t-1\n"
+            )
+        self.synchronize_gem5_evidence_hash("11")
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_gem5_evidence_window", error_codes(result))
 
     def test_verifier_rejects_swapped_run_scoped_gem5_log(self) -> None:
         gem5_log = self.fixture.artifact / "gem5.log"
@@ -1913,6 +2204,42 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         result = self.verify()
         self.assertEqual("PASS", result["outcome"])
         self.assertNotIn("simulator_fatal", error_codes(result))
+
+    def test_readline_prefix_on_hsa_marker_is_accepted(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        qemu_log.write_text(
+            qemu_log.read_text(encoding="utf-8").replace(
+                "[COSIM_ENV] HSA_ENABLE_INTERRUPT=0",
+                "\x1b[?2004l\r[COSIM_ENV] HSA_ENABLE_INTERRUPT=0",
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("PASS", result["outcome"])
+
+    def test_readline_prefix_cannot_hide_native_fatal(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        with qemu_log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "\x1b[?2004l\rSegmentation fault (core dumped)\n"
+            )
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("simulator_fatal", error_codes(result))
+
+    def test_invalid_qemu_encoding_is_rejected(self) -> None:
+        qemu_log = self.fixture.artifact / "qemu.log"
+        with qemu_log.open("ab") as handle:
+            handle.write(b"\xff\n")
+        self.synchronize_qemu_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("qemu_completion_unproven", error_codes(result))
 
     def test_qemu_signal_9_or_11_after_completion_is_rejected(self) -> None:
         qemu_log = self.fixture.artifact / "qemu.log"
@@ -1990,21 +2317,300 @@ class VerifyCosimMatrixTests(unittest.TestCase):
             )
         )
 
+    def test_nested_gem5_evidence_mount_is_rejected(self) -> None:
+        def add_nested_mount(container) -> None:
+            container["Mounts"].append(
+                {
+                    "Type": "bind",
+                    "Source": str(self.fixture.root / "forged-evidence.tsv"),
+                    "Destination": "/cosim-artifacts/gem5-evidence.tsv",
+                    "RW": True,
+                }
+            )
+
+        self.mutate_docker_inspect(add_nested_mount)
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_gem5_evidence_mount", error_codes(result))
+
+    def test_each_required_gem5_mount_is_mandatory(self) -> None:
+        inspect_path = self.fixture.artifact / "docker-inspect.json"
+        baseline = inspect_path.read_text(encoding="utf-8")
+        for destination in ("/gem5", "/tmp", "/dev/shm", "/cosim-artifacts"):
+            with self.subTest(destination=destination):
+                inspect_path.write_text(baseline, encoding="utf-8")
+
+                def remove_mount(container) -> None:
+                    container["Mounts"] = [
+                        mount
+                        for mount in container["Mounts"]
+                        if mount["Destination"] != destination
+                    ]
+
+                self.mutate_docker_inspect(remove_mount)
+                result = self.verify()
+                self.assertEqual("FAIL", result["outcome"])
+                self.assertIn("invalid_gem5_mount_set", error_codes(result))
+
+    def test_each_required_gem5_mount_rejects_wrong_source(self) -> None:
+        inspect_path = self.fixture.artifact / "docker-inspect.json"
+        baseline = inspect_path.read_text(encoding="utf-8")
+        for destination in ("/gem5", "/tmp", "/dev/shm", "/cosim-artifacts"):
+            with self.subTest(destination=destination):
+                inspect_path.write_text(baseline, encoding="utf-8")
+
+                def replace_source(container) -> None:
+                    mount = next(
+                        item
+                        for item in container["Mounts"]
+                        if item["Destination"] == destination
+                    )
+                    mount["Source"] = str(self.fixture.root / "forged-mount")
+
+                self.mutate_docker_inspect(replace_source)
+                result = self.verify()
+                self.assertEqual("FAIL", result["outcome"])
+                expected_code = (
+                    "invalid_gem5_evidence_mount"
+                    if destination == "/cosim-artifacts"
+                    else "invalid_gem5_mount"
+                )
+                self.assertIn(expected_code, error_codes(result))
+
+    def test_each_required_gem5_mount_rejects_duplicate_target(self) -> None:
+        inspect_path = self.fixture.artifact / "docker-inspect.json"
+        baseline = inspect_path.read_text(encoding="utf-8")
+        for destination in ("/gem5", "/tmp", "/dev/shm", "/cosim-artifacts"):
+            with self.subTest(destination=destination):
+                inspect_path.write_text(baseline, encoding="utf-8")
+
+                def duplicate_mount(container) -> None:
+                    mount = next(
+                        item
+                        for item in container["Mounts"]
+                        if item["Destination"] == destination
+                    )
+                    container["Mounts"].append(dict(mount))
+
+                self.mutate_docker_inspect(duplicate_mount)
+                result = self.verify()
+                self.assertEqual("FAIL", result["outcome"])
+                self.assertIn("invalid_gem5_mount_set", error_codes(result))
+
+    def test_gem5_mount_type_and_rw_are_exact(self) -> None:
+        inspect_path = self.fixture.artifact / "docker-inspect.json"
+        baseline = inspect_path.read_text(encoding="utf-8")
+        for field, forged in (("Type", "volume"), ("RW", False)):
+            with self.subTest(field=field):
+                inspect_path.write_text(baseline, encoding="utf-8")
+
+                def replace_attribute(container) -> None:
+                    mount = next(
+                        item
+                        for item in container["Mounts"]
+                        if item["Destination"] == "/gem5"
+                    )
+                    mount[field] = forged
+
+                self.mutate_docker_inspect(replace_attribute)
+                result = self.verify()
+                self.assertEqual("FAIL", result["outcome"])
+                self.assertIn("invalid_gem5_mount", error_codes(result))
+
+    def test_each_protected_gem5_mount_rejects_nested_shadow(self) -> None:
+        inspect_path = self.fixture.artifact / "docker-inspect.json"
+        baseline = inspect_path.read_text(encoding="utf-8")
+        for destination in ("/gem5", "/tmp", "/dev/shm", "/cosim-artifacts"):
+            with self.subTest(destination=destination):
+                inspect_path.write_text(baseline, encoding="utf-8")
+
+                def add_shadow(container) -> None:
+                    container["Mounts"].append(
+                        {
+                            "Type": "bind",
+                            "Source": str(self.fixture.root / "shadow"),
+                            "Destination": f"{destination}/shadow",
+                            "RW": True,
+                        }
+                    )
+
+                self.mutate_docker_inspect(add_shadow)
+                result = self.verify()
+                self.assertEqual("FAIL", result["outcome"])
+                expected_code = (
+                    "invalid_gem5_evidence_mount"
+                    if destination == "/cosim-artifacts"
+                    else "invalid_gem5_mount"
+                )
+                self.assertIn(expected_code, error_codes(result))
+
     def test_swapped_docker_args_are_rejected(self) -> None:
         def swap_args(container) -> None:
-            container["Args"][1] = (
+            socket_index = next(
+                index
+                for index, value in enumerate(container["Args"])
+                if value.startswith("--socket-path=")
+            )
+            container["Args"][socket_index] = (
                 "--socket-path=/tmp/gem5-mi300x-other-row.sock"
             )
 
         self.mutate_docker_inspect(swap_args)
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
-        self.assertTrue(
-            any(
-                "docker_inspect.command" in detail
-                for detail in error_details(result)
-            )
+        self.assertIn("docker_gem5_argv_mismatch", error_codes(result))
+
+    def test_coordinated_runtime_gem5_value_drift_is_rejected(self) -> None:
+        self.replace_runtime_gem5_arg(
+            "--num-compute-units=40", "--num-compute-units=2"
         )
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("docker_gem5_argv_mismatch", error_codes(result))
+        self.assertIn("gem5_reported_argv_mismatch", error_codes(result))
+
+    def test_coordinated_missing_gem5_arg_is_rejected(self) -> None:
+        missing = "--listener-mode=on"
+
+        def remove_arg(container) -> None:
+            container["Args"].remove(missing)
+
+        self.mutate_docker_inspect(remove_arg)
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(f" {missing}", ""),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("docker_gem5_argv_mismatch", error_codes(result))
+        self.assertIn("gem5_reported_argv_mismatch", error_codes(result))
+
+    def test_coordinated_extra_gem5_arg_is_rejected(self) -> None:
+        extra = "--forged-option=1"
+
+        def add_arg(container) -> None:
+            container["Args"].append(extra)
+
+        self.mutate_docker_inspect(add_arg)
+        gem5_log = self.fixture.artifact / "gem5.log"
+        token = f"--evidence-token={UNIT_BOUNDARY_TOKEN}"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                f"{token}\n", f"{token} {extra}\n"
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("docker_gem5_argv_mismatch", error_codes(result))
+        self.assertIn("gem5_reported_argv_mismatch", error_codes(result))
+
+    def test_coordinated_duplicate_gem5_arg_is_rejected(self) -> None:
+        duplicate = "--num-gpus=1"
+
+        def duplicate_arg(container) -> None:
+            index = container["Args"].index(duplicate)
+            container["Args"].insert(index + 1, duplicate)
+
+        self.mutate_docker_inspect(duplicate_arg)
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                f" {duplicate} ", f" {duplicate} {duplicate} "
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("docker_gem5_argv_mismatch", error_codes(result))
+        self.assertIn("gem5_reported_argv_mismatch", error_codes(result))
+
+    def test_coordinated_misordered_gem5_args_are_rejected(self) -> None:
+        first = "--mem-size=8G"
+        second = "--num-gpus=1"
+
+        def swap_order(container) -> None:
+            first_index = container["Args"].index(first)
+            second_index = container["Args"].index(second)
+            container["Args"][first_index], container["Args"][second_index] = (
+                container["Args"][second_index],
+                container["Args"][first_index],
+            )
+
+        self.mutate_docker_inspect(swap_order)
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                f"{first} {second}", f"{second} {first}"
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("docker_gem5_argv_mismatch", error_codes(result))
+        self.assertIn("gem5_reported_argv_mismatch", error_codes(result))
+
+    def test_duplicate_docker_evidence_option_is_rejected(self) -> None:
+        duplicate = "--evidence-run-id=unit-vector"
+
+        def duplicate_arg(container) -> None:
+            container["Args"].append(duplicate)
+
+        self.mutate_docker_inspect(duplicate_arg)
+        gem5_log = self.fixture.artifact / "gem5.log"
+        gem5_log.write_text(
+            gem5_log.read_text(encoding="utf-8").replace(
+                "--evidence-run-id=unit-vector ",
+                f"--evidence-run-id=unit-vector {duplicate} ",
+            ),
+            encoding="utf-8",
+        )
+        self.synchronize_gem5_log_hash()
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_command_identity_mismatch", error_codes(result))
+
+    def test_launcher_uses_verified_gem5_stdio_wrapper(self) -> None:
+        launcher = (REPO_ROOT / "scripts/cosim_launch.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "    /bin/sh\n"
+            "    -c\n"
+            "    'exec \"$@\" 2>&1'\n"
+            "    cosim-gem5\n"
+            "    \"$C_GEM5_BIN\"\n",
+            launcher,
+        )
+
+    def test_missing_gem5_stdio_wrapper_is_rejected(self) -> None:
+        def remove_wrapper(container) -> None:
+            container["Path"] = "/gem5/build/VEGA_X86/gem5.opt"
+            container["Args"] = list(GEM5_DOCKER_ARGS)
+
+        self.mutate_docker_inspect(remove_wrapper)
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_gem5_stdio_wrapper", error_codes(result))
+
+    def test_modified_gem5_stdio_wrapper_is_rejected(self) -> None:
+        def modify_wrapper(container) -> None:
+            container["Args"][1] = 'exec "$@"'
+
+        self.mutate_docker_inspect(modify_wrapper)
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_gem5_stdio_wrapper", error_codes(result))
 
     def test_empty_manifest_and_matrix_fail_closed(self) -> None:
         write_tsv(self.fixture.manifest, MANIFEST_FIELDS, [])
@@ -2519,6 +3125,57 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         result = self.verify()
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("noncanonical_program_identity", error_codes(result))
+
+    def test_matching_legacy_runner_argument_is_accepted(self) -> None:
+        metadata = self.fixture.artifact / "runner-metadata.txt"
+        with metadata.open("a", encoding="utf-8") as handle:
+            handle.write("runner_arg=vector_add\n")
+
+        result = self.verify()
+
+        self.assertEqual("PASS", result["outcome"])
+
+    def test_duplicate_runner_identity_keeps_generic_duplicate_gate(self) -> None:
+        metadata = self.fixture.artifact / "runner-metadata.txt"
+        with metadata.open("a", encoding="utf-8") as handle:
+            handle.write("runner_argument=vector_add\n")
+
+        result = self.verify()
+
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("duplicate_key", error_codes(result))
+        self.assertIn(
+            "runner_metadata:runner_argument",
+            error_details(result),
+        )
+
+    def test_legacy_runner_argument_fails_closed(self) -> None:
+        metadata = self.fixture.artifact / "runner-metadata.txt"
+        original = metadata.read_text(encoding="utf-8")
+        for runner_arg in (
+            "",
+            " vector_add",
+            "vector_add ",
+            "\tvector_add",
+            "vector_add\t",
+            "reduction",
+        ):
+            with self.subTest(runner_arg=runner_arg):
+                metadata.write_text(
+                    original + f"runner_arg={runner_arg}\n",
+                    encoding="utf-8",
+                )
+
+                result = self.verify()
+
+                self.assertEqual("FAIL", result["outcome"])
+                self.assertIn("value_mismatch", error_codes(result))
+                self.assertTrue(
+                    any(
+                        "metadata.runner_arg" in detail
+                        for detail in error_details(result)
+                    )
+                )
 
     def test_program_must_be_strict_basename(self) -> None:
         self.fixture.manifest_rows[0]["program"] = "nested/vector_add"
@@ -3175,6 +3832,59 @@ class VerifyCosimMatrixTests(unittest.TestCase):
         self.assertEqual("FAIL", result["outcome"])
         self.assertIn("gem5_causal_chain_unproven", error_codes(result))
 
+    def test_warning_text_cannot_supply_gpu_acceptance_events(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        text = gem5_log.read_text(encoding="utf-8")
+        replacements = (
+            (
+                "src/dev/amdgpu/mi300x_vfio_user.cc:312: info: "
+                "MI300XVfioUser: client connected (vfio-user)",
+                "src/a.cc:1: warn: MI300XVfioUser: client connected "
+                "(vfio-user)",
+            ),
+            (
+                "10: system.Shader.gpu_cmd_proc.dispatcher: launching "
+                "kernel: Some kernel, dispatch ID: 0",
+                "src/a.cc:2: warn: dispatcher: launching kernel: quoted, "
+                "dispatch ID: 0",
+            ),
+            (
+                "11: system.Shader: Dispatching a workgroup to CU 0: WG 0",
+                "src/a.cc:3: warn: Dispatching a workgroup to CU 0: WG 0",
+            ),
+            (
+                "12: dispatcher: notify WgCompl 0",
+                "src/a.cc:4: warn: dispatcher: notify WgCompl 0",
+            ),
+            (
+                "13: dispatcher: Completed kernel 0",
+                "src/a.cc:5: warn: dispatcher: Completed kernel 0",
+            ),
+        )
+        for original, quoted in replacements:
+            self.assertIn(original, text)
+            text = text.replace(original, quoted)
+        gem5_log.write_text(text, encoding="utf-8")
+        self.synchronize_gem5_log_hash()
+        evidence = self.fixture.artifact / "gem5-evidence.tsv"
+        evidence.write_text(
+            "schema\trun_id\tseq\ttick\tevent\tgpu\tdispatch\twg\tcu\n"
+            "COSIM_GPU_EVIDENCE_V1\tunit-vector\t0\t0\t"
+            "session_start\t-1\t-1\t-1\t-1\n",
+            encoding="ascii",
+        )
+        replace_key_value(
+            self.fixture.artifact / "runner-metadata.txt",
+            "gem5_evidence_start_seq",
+            "0",
+        )
+        self.synchronize_gem5_evidence_hash("0")
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("gem5_client_not_connected", error_codes(result))
+        self.assertIn("gem5_gpu_execution_unproven", error_codes(result))
+
     def test_gem5_timestamp_regression_is_rejected(self) -> None:
         gem5_log = self.fixture.artifact / "gem5.log"
         gem5_log.write_text(
@@ -3184,6 +3894,20 @@ class VerifyCosimMatrixTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.synchronize_gem5_log_hash()
+
+        result = self.verify()
+        self.assertEqual("FAIL", result["outcome"])
+        self.assertIn("invalid_gem5_timestamp", error_codes(result))
+
+    def test_warning_timestamp_regression_is_rejected(self) -> None:
+        gem5_log = self.fixture.artifact / "gem5.log"
+        with gem5_log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "2026-01-01T00:00:01.350000000Z "
+                "src/gpu-compute/gpu_command_processor.cc:799: "
+                "warn: Ignoring vendor packet\n"
+            )
         self.synchronize_gem5_log_hash()
 
         result = self.verify()

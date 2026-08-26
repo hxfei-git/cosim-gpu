@@ -31,6 +31,7 @@ KEEP_ALIVE_ON_SUCCESS=0
 RUN_ALL=0
 REPEAT_COUNT=0
 FILTER=""
+FILTER_SET=0
 PASSTHROUGH_ARGS=()
 SCREEN_LOG_SET=0
 OUTPUT_DIR=""
@@ -62,6 +63,11 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
+
+valid_test_id() (
+    export LC_ALL=C
+    [[ "${1:-}" =~ ^[a-z0-9_]{1,128}$ ]]
+)
 
 load_gem5_build_metadata() {
     local metadata_file="$1"
@@ -164,17 +170,27 @@ while [[ $# -gt 0 ]]; do
         --guest-run-timeout) GUEST_RUN_TIMEOUT_SECS="$2"; shift 2 ;;
         --output-dir)       OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help)          usage ;;
-        --share-dir|--artifact-dir)
-            error "$1 is runner-owned and cannot be passed through"
+        --share-dir|--artifact-dir|--evidence-test-id|--evidence-token)
+            error "$1 由 runner 内部管理，不能透传"
             ;;
         --*)
             [[ $# -ge 2 ]] || error "missing value for option: $1"
             PASSTHROUGH_ARGS+=("$1" "$2")
             shift 2
             ;;
-        *)                  FILTER="$1"; shift ;;
+        *)
+            [[ "$FILTER_SET" -eq 0 ]] || \
+                error "only one operator name may be supplied"
+            FILTER="$1"
+            FILTER_SET=1
+            shift
+            ;;
     esac
 done
+
+if [[ "$FILTER_SET" -eq 1 ]]; then
+    valid_test_id "$FILTER" || error "invalid operator name: $FILTER"
+fi
 
 [[ "$OUTPUT_DIR" != *$'\n'* && "$OUTPUT_DIR" != *$'\r'* && \
    "$OUTPUT_DIR" != *$'\t'* ]] || \
@@ -230,9 +246,6 @@ fi
 [[ "$EFFECTIVE_GEM5_BIN" == "$CANONICAL_GEM5_REALPATH" ]] || \
     error "--gem5-bin must resolve to ${CANONICAL_GEM5_BIN}"
 GEM5_CONFIG_ARGS="defaults:num-gpus=${EFFECTIVE_NUM_GPUS},num-cus=${EFFECTIVE_NUM_CUS},host-mem=${EFFECTIVE_HOST_MEM},vram-size=${EFFECTIVE_VRAM_SIZE}"
-if [[ -n "$EFFECTIVE_GEM5_DEBUG" ]]; then
-    GEM5_CONFIG_ARGS+=";debug-flags=${EFFECTIVE_GEM5_DEBUG}"
-fi
 RUNNER_MODE="pure_test"
 if [[ "$KEEP_ALIVE_ON_SUCCESS" -eq 1 ]]; then
     RUNNER_MODE="keep_alive_diagnostic"
@@ -266,9 +279,10 @@ SESSION_FIFO="${SESSION_DIR}/console.in"
 # ---- Repeat mode: run same operator N times with fresh sessions ----
 
 if [[ "$REPEAT_COUNT" -gt 0 && "$RUN_ALL" -eq 0 ]]; then
-    [[ -n "$FILTER" ]] || { echo "Usage: $0 --repeat N <operator>"; exit 1; }
+    [[ "$FILTER_SET" -eq 1 ]] || \
+        { echo "Usage: $0 --repeat N <operator>"; exit 1; }
 
-    [[ "$FILTER" =~ ^[a-z0-9_]+$ ]] || error "invalid operator name: $FILTER"
+    valid_test_id "$FILTER" || error "invalid operator name: $FILTER"
     [[ -f "${KERNELS_DIR}/${FILTER}.cpp" ]] || error "No operator named '${FILTER}'"
     REPEAT_OPERATOR="$FILTER"
 
@@ -369,7 +383,10 @@ if [[ "$RUN_ALL" -eq 1 ]]; then
     FAILED=0
 
     for test_name in "${ALL_TESTS[@]}"; do
-        sub_session="${SESSION_NAME}-${test_name}"
+        valid_test_id "$test_name" || \
+            error "invalid operator name discovered under ${KERNELS_DIR}: $test_name"
+        test_name_sha256="$(printf '%s' "$test_name" | sha256sum | awk '{print $1}')"
+        sub_session="${SESSION_NAME:0:40}-all-${test_name_sha256:0:16}"
         child_run_id="$(generate_run_id)"
         if [[ -n "$OUTPUT_DIR" ]]; then
             child_output_dir="${OUTPUT_DIR%/}/${test_name}-${child_run_id}"
@@ -405,7 +422,7 @@ if [[ "$RUN_ALL" -eq 1 ]]; then
     exit 0
 fi
 
-[[ -n "$FILTER" ]] || usage
+[[ "$FILTER_SET" -eq 1 ]] || usage
 
 cleanup_session() {
     local launcher_was_started=0
@@ -503,6 +520,9 @@ on_interrupt() {
 # shellcheck disable=SC2317
 on_exit() {
     local rc=$?
+    if [[ -n "${EVIDENCE_BOUNDARY_ACK:-}" ]]; then
+        rm -f -- "$EVIDENCE_BOUNDARY_ACK"
+    fi
     if [[ $rc -ne 0 && "$KEEP_ALIVE_ON_SUCCESS" -eq 0 ]]; then
         cleanup_session
     fi
@@ -512,18 +532,30 @@ trap on_interrupt INT TERM
 trap on_exit EXIT
 
 match_test() {
-    [[ "$FILTER" =~ ^[a-z0-9_]+$ ]] || error "invalid operator name: $FILTER"
+    valid_test_id "$FILTER" || error "invalid operator name: $FILTER"
     [[ -f "${KERNELS_DIR}/${FILTER}.cpp" ]] || error "No operator named '${FILTER}'"
     printf '%s\n' "$FILTER"
 }
 
 TEST_NAME="$(match_test)"
 GUEST_SCRIPT=".cosim_guest_run.${COSIM_RUN_ID}.${TEST_NAME}.sh"
+if ! EVIDENCE_BOUNDARY_TOKEN="$(python3 -B \
+        "${SCRIPT_DIR}/cosim_log_evidence.py" boundary-token \
+        --run-id "$COSIM_RUN_ID" --program "$TEST_NAME")"; then
+    error "无法生成证据边界 token"
+fi
+[[ "$EVIDENCE_BOUNDARY_TOKEN" =~ ^[0-9a-f]{32}$ ]] || \
+    error "无效的证据边界 token"
+GEM5_CONFIG_ARGS+=";evidence-test-id=${TEST_NAME},evidence-token=${EVIDENCE_BOUNDARY_TOKEN}"
+if [[ -n "$EFFECTIVE_GEM5_DEBUG" ]]; then
+    GEM5_CONFIG_ARGS+=";debug-flags=${EFFECTIVE_GEM5_DEBUG}"
+fi
 TOKEN_RUN_SHA256="$(printf '%s' "$COSIM_RUN_ID" | sha256sum | awk '{print $1}')"
 [[ "$TOKEN_RUN_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
     error "failed to derive completion token identity from COSIM_RUN_ID"
 TOKEN="COSIM_TEST_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"
 COMPILE_TOKEN="COSIM_COMPILE_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"
+BOUNDARY_READY_TOKEN="COSIM_BOUNDARY_READY_${TEST_NAME}_${TOKEN_RUN_SHA256}"
 
 if [[ -n "$OUTPUT_DIR" ]]; then
     RUNNER_ARTIFACT_DIR="$(realpath -m -- "$OUTPUT_DIR")"
@@ -553,10 +585,18 @@ fi
 STAGING_DIR="${RUNNER_ARTIFACT_DIR}/staging"
 [[ ! -e "$STAGING_DIR" && ! -L "$STAGING_DIR" ]] || error "staging path already exists"
 mkdir -p "$STAGING_DIR"
-rsync -a --exclude build/ --exclude '.cosim_guest_run.*' \
+rsync -a --exclude build/ --exclude tools-build/ \
+    --exclude '.cosim_guest_run.*' \
     "${TESTS_DIR}/" "${STAGING_DIR}/"
 GUEST_SCRIPT_HOST="${STAGING_DIR}/${GUEST_SCRIPT}"
 GUEST_SCRIPT_ARCHIVE="${RUNNER_ARTIFACT_DIR}/guest-run.sh"
+GEM5_EVIDENCE="${RUNNER_ARTIFACT_DIR}/gem5-evidence.tsv"
+EVIDENCE_BOUNDARY_BINARY="${STAGING_DIR}/tools-build/cosim_evidence_boundary"
+EVIDENCE_BOUNDARY_ACK="${STAGING_DIR}/.cosim_evidence_boundary_ack.${TOKEN_RUN_SHA256}"
+EVIDENCE_BOUNDARY_BINARY_CANONICAL=""
+EVIDENCE_BOUNDARY_SHA256=""
+[[ ! -e "$EVIDENCE_BOUNDARY_ACK" && ! -L "$EVIDENCE_BOUNDARY_ACK" ]] || \
+    error "证据边界 ack 路径已存在或为符号链接：${EVIDENCE_BOUNDARY_ACK}"
 
 PATCH_DIR="${RUNNER_ARTIFACT_DIR}/patch"
 mkdir -p "$PATCH_DIR"
@@ -748,6 +788,8 @@ fi
     echo "gem5_docker_image_name=${EFFECTIVE_GEM5_DOCKER_IMAGE}"
     echo "gem5_docker_image=${GEM5_CURRENT_DOCKER_IMAGE_ID}"
     echo "gem5_config_args=${GEM5_CONFIG_ARGS}"
+    echo "gem5_evidence_test_id=${TEST_NAME}"
+    echo "gem5_evidence_token=${EVIDENCE_BOUNDARY_TOKEN}"
     echo "strict_acceptance=${STRICT_ACCEPTANCE}"
     echo "output_dir=${RUNNER_ARTIFACT_DIR}"
     echo "artifact_dir=${RUNNER_ARTIFACT_DIR}"
@@ -788,6 +830,8 @@ step "[${TEST_NAME}] Starting detached QEMU + gem5 session..."
 setsid stdbuf -oL -eL "$LAUNCH_SCRIPT" \
     --share-dir "$STAGING_DIR" \
     --artifact-dir "$RUNNER_ARTIFACT_DIR" \
+    --evidence-test-id "$TEST_NAME" \
+    --evidence-token "$EVIDENCE_BOUNDARY_TOKEN" \
     "${PASSTHROUGH_ARGS[@]}" \
     <&$CONTROL_FD >"$SCREEN_LOG" 2>&1 &
 LAUNCH_PID=$!
@@ -820,11 +864,79 @@ if [[ -f "$SCREEN_LOG" ]]; then
 fi
 
 step "[${TEST_NAME}] Running test inside guest..."
+capture_evidence_boundaries() {
+    local max_attempts="${1:-10}"
+    local boundaries retry=0
+
+    while (( retry < max_attempts )); do
+        if boundaries="$(python3 -B "${SCRIPT_DIR}/cosim_log_evidence.py" \
+                evidence-boundaries "$GEM5_EVIDENCE" \
+                --run-id "$COSIM_RUN_ID" 2>/dev/null)"; then
+            [[ "$boundaries" =~ ^[0-9]+$'\t'[0-9]+$ ]] || return 1
+            printf '%s\n' "$boundaries"
+            return 0
+        fi
+        retry=$((retry + 1))
+        if (( retry < max_attempts )); then
+            sleep 1
+        fi
+    done
+    return 1
+}
+
+anchor_evidence_boundary_helper() {
+    local reported_sha256="$1"
+    local canonical_path current_sha256 ack_tmp
+
+    [[ "$reported_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+        error "[${TEST_NAME}] Guest 报告了无效的证据边界 helper SHA-256"
+    [[ -f "$EVIDENCE_BOUNDARY_BINARY" && \
+       ! -L "$EVIDENCE_BOUNDARY_BINARY" && \
+       -x "$EVIDENCE_BOUNDARY_BINARY" ]] || \
+        error "[${TEST_NAME}] 证据边界 helper 缺失、不可执行或为符号链接"
+    canonical_path="$(realpath -e -- "$EVIDENCE_BOUNDARY_BINARY")" || \
+        error "[${TEST_NAME}] 无法解析证据边界 helper 的规范路径"
+    [[ "$canonical_path" == "$EVIDENCE_BOUNDARY_BINARY" ]] || \
+        error "[${TEST_NAME}] 证据边界 helper 逃逸规范 staging 路径"
+    current_sha256="$(python3 -B "${SCRIPT_DIR}/cosim_log_evidence.py" \
+        stable-sha256 "$canonical_path")" || \
+        error "[${TEST_NAME}] 无法稳定哈希证据边界 helper"
+    [[ "$current_sha256" =~ ^[0-9a-f]{64}$ && \
+       "$current_sha256" == "$reported_sha256" ]] || \
+        error "[${TEST_NAME}] Host 与 Guest 的证据边界 helper 哈希不一致"
+    if grep -Eq '^gem5_evidence_boundary_binary(_sha256)?=' \
+            "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"; then
+        error "[${TEST_NAME}] runner invocation 已含重复的证据边界 helper 锚点"
+    fi
+    {
+        echo "gem5_evidence_boundary_binary=${canonical_path}"
+        echo "gem5_evidence_boundary_binary_sha256=${current_sha256}"
+    } >> "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"
+    sync -f "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"
+
+    [[ ! -e "$EVIDENCE_BOUNDARY_ACK" && ! -L "$EVIDENCE_BOUNDARY_ACK" ]] || \
+        error "[${TEST_NAME}] 证据边界 ack 路径在握手前已被占用"
+    ack_tmp="$(mktemp "${EVIDENCE_BOUNDARY_ACK}.tmp.XXXXXX")" || \
+        error "[${TEST_NAME}] 无法创建证据边界 ack 临时文件"
+    chmod 600 "$ack_tmp"
+    printf '%s\n' "$current_sha256" > "$ack_tmp"
+    sync -f "$ack_tmp"
+    if ! ln -- "$ack_tmp" "$EVIDENCE_BOUNDARY_ACK"; then
+        rm -f -- "$ack_tmp"
+        error "[${TEST_NAME}] 证据边界 ack 路径被并发占用"
+    fi
+    rm -f -- "$ack_tmp"
+
+    EVIDENCE_BOUNDARY_BINARY_CANONICAL="$canonical_path"
+    EVIDENCE_BOUNDARY_SHA256="$current_sha256"
+}
+
 GUEST_TEST_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%S.%9NZ')"
 send_guest "if ! mountpoint -q /mnt; then mount -t 9p -o trans=virtio,version=9p2000.L cosim_share /mnt; fi; bash /mnt/${GUEST_SCRIPT}"
 
 last_printed=$((start_line - 1))
 result_rc=""
+boundary_anchor_written=0
 guest_run_start=$(date +%s)
 while true; do
     if [[ -f "$SCREEN_LOG" ]]; then
@@ -833,8 +945,23 @@ while true; do
             sed -n "$((last_printed + 1)),${current_lines}p" "$SCREEN_LOG"
             last_printed=$current_lines
         fi
+        boundary_ready_lines="$(tr -d '\r' < "$SCREEN_LOG" | \
+            grep -a "^__${BOUNDARY_READY_TOKEN}__:[0-9a-f][0-9a-f]*$" || true)"
+        boundary_ready_count="$(grep -c . <<<"$boundary_ready_lines" || true)"
+        if [[ "$boundary_ready_count" -gt 1 ]]; then
+            error "[${TEST_NAME}] 检测到重复的证据边界 READY marker"
+        fi
+        if [[ "$boundary_ready_count" -eq 1 && \
+              "$boundary_anchor_written" -eq 0 ]]; then
+            reported_boundary_sha256="${boundary_ready_lines##*:}"
+            anchor_evidence_boundary_helper "$reported_boundary_sha256"
+            boundary_anchor_written=1
+        fi
         if tr -d '\r' < "$SCREEN_LOG" | grep -a -q "^__${TOKEN}__:[0-9][0-9]*$"; then
             result_rc="$(tr -d '\r' < "$SCREEN_LOG" | grep -a "^__${TOKEN}__:[0-9][0-9]*$" | tail -1 | sed 's/.*://')"
+            if [[ "$result_rc" -eq 0 && "$boundary_anchor_written" -ne 1 ]]; then
+                error "[${TEST_NAME}] 测试成功但缺少 BEGIN 前 helper 锚点"
+            fi
             break
         fi
     fi
@@ -856,6 +983,30 @@ if ! session_alive; then
     record_category "$COSIM_CAT_QEMU_EXIT" "true"
     error "[${TEST_NAME}] detached session exited after emitting the test completion token. Log tail:\n$(tail -n 80 "$SCREEN_LOG" 2>/dev/null)"
 fi
+GEM5_EVIDENCE_BOUNDARIES=""
+GEM5_EVIDENCE_START_SEQ=""
+GEM5_EVIDENCE_END_SEQ=""
+boundary_capture_attempts=1
+if [[ "$result_rc" -eq 0 ]]; then
+    boundary_capture_attempts=10
+fi
+if GEM5_EVIDENCE_BOUNDARIES="$(
+        capture_evidence_boundaries "$boundary_capture_attempts"
+    )"; then
+    IFS=$'\t' read -r GEM5_EVIDENCE_START_SEQ GEM5_EVIDENCE_END_SEQ <<< \
+        "$GEM5_EVIDENCE_BOUNDARIES"
+    if [[ ! "$GEM5_EVIDENCE_START_SEQ" =~ ^[0-9]+$ || \
+          ! "$GEM5_EVIDENCE_END_SEQ" =~ ^[0-9]+$ || \
+          "$GEM5_EVIDENCE_END_SEQ" -le "$GEM5_EVIDENCE_START_SEQ" ]]; then
+        GEM5_EVIDENCE_START_SEQ=""
+        GEM5_EVIDENCE_END_SEQ=""
+        if [[ "$result_rc" -eq 0 ]]; then
+            error "[${TEST_NAME}] gem5 证据流内边界无效"
+        fi
+    fi
+elif [[ "$result_rc" -eq 0 ]]; then
+    error "[${TEST_NAME}] 无法确认 gem5 证据流内已闭合的边界"
+fi
 GUEST_TEST_FINISHED_AT="$(date -u +'%Y-%m-%dT%H:%M:%S.%9NZ')"
 
 rm -f "$GUEST_SCRIPT_HOST"
@@ -872,10 +1023,35 @@ if [[ "$compile_rc" -eq 0 && ! -x "$TEST_BINARY" ]]; then
     record_category "$COSIM_CAT_TEST_FAIL"
     error "[${TEST_NAME}] compile succeeded but exact binary is missing: $TEST_BINARY"
 fi
+if [[ "$result_rc" -eq 0 && ! -x "$EVIDENCE_BOUNDARY_BINARY" ]]; then
+    record_category "$COSIM_CAT_TEST_FAIL"
+    error "[${TEST_NAME}] 编译成功但缺少证据边界 helper：${EVIDENCE_BOUNDARY_BINARY}"
+fi
+if [[ "$result_rc" -eq 0 ]]; then
+    [[ "$boundary_anchor_written" -eq 1 && \
+       -n "$EVIDENCE_BOUNDARY_BINARY_CANONICAL" && \
+       "$EVIDENCE_BOUNDARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+        error "[${TEST_NAME}] 缺少 BEGIN 前证据边界 helper 锚点"
+    [[ ! -e "$EVIDENCE_BOUNDARY_ACK" && ! -L "$EVIDENCE_BOUNDARY_ACK" ]] || \
+        error "[${TEST_NAME}] Guest 未清理证据边界 ack"
+    EVIDENCE_BOUNDARY_FINAL_SHA256="$(python3 -B \
+        "${SCRIPT_DIR}/cosim_log_evidence.py" stable-sha256 \
+        "$EVIDENCE_BOUNDARY_BINARY_CANONICAL")" || \
+        error "[${TEST_NAME}] 无法完成证据边界 helper 最终稳定哈希"
+    [[ "$EVIDENCE_BOUNDARY_FINAL_SHA256" == \
+       "$EVIDENCE_BOUNDARY_SHA256" ]] || \
+        error "[${TEST_NAME}] 证据边界 helper 在 BEGIN 前锚定后发生变化"
+fi
 if [[ -f "$TEST_BINARY" ]]; then
     {
         echo "test_binary=${TEST_BINARY}"
         echo "test_binary_sha256=$(sha256sum "$TEST_BINARY" | awk '{print $1}')"
+    } >> "${PATCH_DIR}/binary-provenance.txt"
+fi
+if [[ -n "$EVIDENCE_BOUNDARY_BINARY_CANONICAL" ]]; then
+    {
+        echo "gem5_evidence_boundary_binary=${EVIDENCE_BOUNDARY_BINARY_CANONICAL}"
+        echo "gem5_evidence_boundary_binary_sha256=${EVIDENCE_BOUNDARY_SHA256}"
     } >> "${PATCH_DIR}/binary-provenance.txt"
 fi
 
@@ -934,6 +1110,12 @@ docker inspect "$cname" > "${RUNNER_ARTIFACT_DIR}/docker-inspect.json" 2>&1 || t
     echo "fail_count=${fail_count}"
     echo "guest_test_started_at=${GUEST_TEST_STARTED_AT}"
     echo "guest_test_finished_at=${GUEST_TEST_FINISHED_AT}"
+    echo "gem5_evidence_start_seq=${GEM5_EVIDENCE_START_SEQ}"
+    echo "gem5_evidence_end_seq=${GEM5_EVIDENCE_END_SEQ}"
+    echo "gem5_evidence_test_id=${TEST_NAME}"
+    echo "gem5_evidence_token=${EVIDENCE_BOUNDARY_TOKEN}"
+    echo "gem5_evidence_boundary_binary=${EVIDENCE_BOUNDARY_BINARY_CANONICAL}"
+    echo "gem5_evidence_boundary_binary_sha256=${EVIDENCE_BOUNDARY_SHA256}"
     echo "source_snapshot=${PATCH_DIR}/source-snapshot.txt"
     echo "gem5_baseline_lock=${GEM5_BASELINE_LOCK_ARCHIVE}"
     echo "gem5_baseline_lock_sha256=${GEM5_BASELINE_LOCK_SHA256}"
@@ -989,9 +1171,19 @@ if ! GEM5_LOG_SHA256="$(python3 -B "${SCRIPT_DIR}/cosim_log_evidence.py" \
 fi
 [[ "$GEM5_LOG_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
     error "canonical gem5 log produced an invalid SHA-256: ${GEM5_LOG}"
+[[ -f "$GEM5_EVIDENCE" && ! -L "$GEM5_EVIDENCE" ]] || \
+    error "canonical gem5 证据缺失或为符号链接：${GEM5_EVIDENCE}"
+if ! GEM5_EVIDENCE_SHA256="$(python3 -B \
+        "${SCRIPT_DIR}/cosim_log_evidence.py" \
+        stable-sha256 "$GEM5_EVIDENCE")"; then
+    error "canonical gem5 证据无法完成稳定快照哈希：${GEM5_EVIDENCE}"
+fi
+[[ "$GEM5_EVIDENCE_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+    error "canonical gem5 证据生成了无效 SHA-256"
 {
     echo "qemu_log_sha256=${QEMU_LOG_SHA256}"
     echo "gem5_log_sha256=${GEM5_LOG_SHA256}"
+    echo "gem5_evidence_sha256=${GEM5_EVIDENCE_SHA256}"
 } >> "${RUNNER_ARTIFACT_DIR}/runner-metadata.txt"
 
 classifier_rc=0

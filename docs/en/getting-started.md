@@ -263,7 +263,8 @@ The runner prints the exact artifact directory. A custom `--output-dir` is allow
 | `patch/binary-provenance.txt` | gem5 commit/subject/binary hash and exact test binary hash |
 | `patch/repo-status.txt`, `patch/repo.patch` | Top-level tracked and uncommitted source state used by the row |
 | `patch/gem5-status.txt`, `patch/gem5.patch` | gem5 submodule state used by the row |
-| `qemu.log`, `gem5.log` | Full guest console and simulator evidence retained for diagnosis |
+| `qemu.log`, `gem5.log` | Full Guest console and timestamped simulator streams retained for diagnosis; `gem5.log` also proves the effective command, fatal scan, and timestamp contract |
+| `gem5-evidence.tsv` | Structured GPU events written exclusively by gem5, with a fixed schema, run ID, contiguous sequence, tick, GPU/kernel/WG identity, and in-stream `test_begin`/`test_end` boundaries |
 | `guest-provenance.json` and `guest-*` build/stat evidence | Strict join across the Guest image, kernel, m5, QEMU, locks, overlay patch, submodule, recipe, and pre/post read-only base-image state |
 | `docker-inspect.json` | Effective gem5 container name, argv, running/OOM/restart state |
 | `cleanup-status.txt` | Manifest-scoped resource cleanup result |
@@ -280,9 +281,28 @@ A row is accepted only when its command explicitly sets
 `verdict.json` says `PASS` with `all_acceptance_gates_passed`, `matrix.tsv`
 agrees, the effective HSA value and all three timeouts match the intended mode,
 the `cosim-matrix-verification/v2` join across the manifest, invocations, Guest
-script/log, and source/binary provenance passes; `gem5.log` contains an
-in-window kernel launch, workgroup dispatch, `WgCompl`, and same-ID kernel
-completion; and cleanup is verified.
+script/log, and source/binary provenance passes; and the `gem5-evidence.tsv`
+hash and run ID match. After compiling the helper, the Guest first emits a
+run-bound READY marker and SHA-256; before BEGIN, the host stably verifies and
+persists that identity, then releases a one-shot 9p acknowledgement. Immediately
+before and after the target program, the archived Guest helper submits BEGIN and
+END vendor-specific AQL packets carrying the run/program-bound token and waits
+for each completion signal and AQL read-index retirement. For each packet, gem5
+appends the corresponding `test_begin` or `test_end` record and
+successfully completes `fdatasync()` before signaling completion. Strict
+verification requires the same unique token at every producer/verifier join,
+exactly one matching `test_begin` and `test_end`, the complete causal GPU chain
+strictly between them, and `test_end` as the final record. The complete
+Docker/gem5 argv must equal the ordered command derived from the runner; the
+`/gem5`, `/tmp`, `/dev/shm`, and `/cosim-artifacts` bind mounts must match exactly
+without shadow mounts, and cleanup must be verified.
+
+This boundary packet and acknowledgement scheme is a cosim-gpu-specific
+instrumentation protocol and workaround, not part of the real AMD GPU packet
+ABI or ROCm ABI and not a claim about native hardware behavior. A strict PASS
+therefore also depends on the Guest amdgpu/KFD/HSA path, including AQL queue
+submission, the doorbell, and completion-signal delivery. Warning text or
+multiline continuations in ordinary `gem5.log` cannot supply these GPU events.
 Missing evidence is a failure, even if the HIP output looks correct. Diagnostic
 mode deliberately preserves dirty provenance for learning and replay, but that
 does not turn a dirty row into strict v2 acceptance. Only artifacts recording

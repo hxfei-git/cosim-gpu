@@ -228,6 +228,7 @@ clean HEAD 锚定，最终 verifier 会重新完整计算 Guest image 和 kernel
 | 精确 command/environment | `runner-invocation.txt`、`launch-invocation.txt`、`runner-metadata.txt`、`guest-run.sh` |
 | Guest 与 QEMU stream | `qemu.log` |
 | gem5 stream | `gem5.log` |
+| gem5 结构化 GPU 事件与流内测试边界 | `gem5-evidence.tsv` |
 | program result | `verdict.json`、`classifier-output.json`、本地 `matrix.tsv` |
 | source identity | `patch/source-snapshot.txt`、repo/gem5 status 与 patch file |
 | binary identity | `patch/binary-provenance.txt` |
@@ -241,9 +242,26 @@ source tree 都 clean；同一个 artifact 还必须证明：精确 program iden
 exit 0、test exit 0、恰好一个 `[PASS] <program>`、无 FAIL marker 或
 timeout/early simulator exit、唯一 effective HSA interrupt value、manifest 与实际
 invocation/timeout 一致、完整 source/binary provenance、完整 QEMU/gem5 evidence 与
-verified cleanup。`gem5.log` 还必须在该行测试时间窗内给出同一 kernel ID 的
-launch → workgroup dispatch → `WgCompl` → kernel completion，并与
-`docker-inspect.json` 的实际 argv 一致。普通学习或 dirty replay 默认属于 diagnostic mode，不是 strict v2
+verified cleanup。`gem5.log` 负责 command identity、fatal scan 与有序时间戳；
+GPU acceptance 事件只取自 gem5 以 `O_EXCL` 创建的 `gem5-evidence.tsv`。该文件必须
+匹配 run ID 与 hash，并使用连续 seq 和非递减 tick。Guest 编译 helper 后先输出
+run-bound READY marker 与 SHA-256；Host 在 BEGIN 前稳定复核、持久化，并用一次性 9p ack
+放行。归档的 Guest helper 紧邻目标程序前后分别提交携带 run/program-bound token 的
+BEGIN 与 END vendor-specific AQL packet，并等待各自的 completion signal 及 AQL read
+index 退休。gem5 必须先 append 并 `fdatasync()` 对应的
+`test_begin` 或 `test_end` 记录，然后才发出该 packet 的 completion。Strict verifier
+要求 runner、launcher、gem5 configuration、metadata 与 verifier 使用同一个唯一匹配
+token，流中恰好存在一对匹配边界，且完整的同 GPU/kernel/WG 因果链——kernel launch、
+每个 workgroup dispatch/completion 与同 ID kernel completion——严格位于边界内；
+`test_end` 必须是最终记录；`docker-inspect.json` 与 gem5 自报 argv 都必须精确等于 runner
+推导的完整有序命令，且 `/gem5`、`/tmp`、`/dev/shm`、`/cosim-artifacts` 必须是唯一、
+无 shadow 的精确 bind mount。
+
+这种边界 packet 与确认机制是 cosim-gpu 特有的 instrumentation protocol/workaround，
+不是实际 AMD GPU packet ABI 或 ROCm ABI 的组成部分，不能解释为真实硬件行为。Strict
+PASS 除 workload GPU 链外，还依赖 Guest amdgpu/KFD/HSA 链路成功完成 AQL queue 提交、
+doorbell 通知与 completion signal。普通日志文本不能补足缺失事件。普通学习或 dirty
+replay 默认属于 diagnostic mode，不是 strict v2
 PASS；只有记录 `COSIM_STRICT_ACCEPTANCE=1` 的 artifact 才能进入 final v2 matrix。
 
 `scripts/classify_runs.py` 会刻意拒绝只有 PASS marker 的结果。主要 reason 包括

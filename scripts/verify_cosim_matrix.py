@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -29,7 +30,9 @@ try:
     from scripts.cosim_log_evidence import (
         REQUIRED_STRICT_DEBUG_FLAGS,
         analyze_gem5_log,
+        analyze_gpu_evidence,
         analyze_qemu_log,
+        evidence_boundary_token,
         parse_rfc3339nano,
         render_guest_run_script,
     )
@@ -37,7 +40,9 @@ except ModuleNotFoundError:  # 允许直接执行 scripts/verify_cosim_matrix.py
     from cosim_log_evidence import (  # type: ignore[no-redef]
         REQUIRED_STRICT_DEBUG_FLAGS,
         analyze_gem5_log,
+        analyze_gpu_evidence,
         analyze_qemu_log,
+        evidence_boundary_token,
         parse_rfc3339nano,
         render_guest_run_script,
     )
@@ -94,9 +99,26 @@ QEMU_BUILD_META_KEYS = {
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 PREFIX_HSA_RE = re.compile(r"(?:^|\s)HSA_ENABLE_INTERRUPT=([01])(?:\s|$)")
-PROGRAM_RE = re.compile(r"^[a-z0-9_]+$")
+PROGRAM_RE = re.compile(r"^[a-z0-9_]{1,128}$")
+PROGRAM_ID_FIELDS = {"program", "runner_argument"}
+PROGRAM_ID_METADATA_KEYS = {
+    "expected_program",
+    "gem5_evidence_test_id",
+    "program",
+    "runner_arg",
+    "runner_argument",
+    "test",
+}
 MEMORY_SIZE_RE = re.compile(r"^[1-9][0-9]*(?:[KMGTPE]i?B?)?$")
 DEBUG_FLAGS_RE = re.compile(r"^[A-Za-z0-9_,]+$")
+GEM5_STDIO_WRAPPER_PATH = "/bin/sh"
+GEM5_STDIO_WRAPPER_ARGS = ("-c", 'exec "$@" 2>&1', "cosim-gem5")
+GEM5_EVIDENCE_CONTAINER_PATH = "/cosim-artifacts/gem5-evidence.tsv"
+GEM5_EVIDENCE_MOUNT_PATH = "/cosim-artifacts"
+GEM5_SOURCE_MOUNT_PATH = "/gem5"
+GEM5_TMP_MOUNT_PATH = "/tmp"
+GEM5_SHM_MOUNT_PATH = "/dev/shm"
+GEM5_CONFIG_CONTAINER_PATH = "/gem5/configs/example/gpufs/mi300_cosim.py"
 RUN_PREFLIGHT_CHECK_IDS = {
     "command.docker",
     "command.rsync",
@@ -195,6 +217,8 @@ TOP_MATRIX_COLUMNS = {
     "gem5_sha256",
     "test_binary",
     "test_binary_sha256",
+    "gem5_evidence_boundary_binary",
+    "gem5_evidence_boundary_binary_sha256",
     "source_fingerprint",
     "strict_acceptance",
     "mode",
@@ -270,7 +294,10 @@ def _load_tsv(path: Path, required: set[str]) -> List[Dict[str, str]]:
             if None in row:
                 raise ValueError(f"extra TSV fields at {path}:{line_number}")
             normalized = {
-                key: (value or "").strip() for key, value in row.items()
+                key: (value or "")
+                if key in PROGRAM_ID_FIELDS
+                else (value or "").strip()
+                for key, value in row.items()
             }
             if not any(normalized.values()):
                 continue
@@ -305,7 +332,9 @@ def _read_key_values(path: Path, errors: List[Error], role: str) -> Dict[str, st
                     continue
                 if key in values:
                     _add_error(errors, "duplicate_key", f"{role}:{key}")
-                values[key] = value.strip()
+                values[key] = (
+                    value if key in PROGRAM_ID_METADATA_KEYS else value.strip()
+                )
     except (OSError, UnicodeError) as error:
         _add_error(errors, "file_read_error", f"{role}:{error}")
     return values
@@ -500,7 +529,7 @@ def _staging_fingerprint(root: Path, cache: HashCache) -> str:
             for path in root.rglob("*")
             if path.is_file()
             and not path.is_symlink()
-            and path.relative_to(root).parts[0] != "build"
+            and path.relative_to(root).parts[0] not in {"build", "tools-build"}
             and not path.name.startswith(".cosim_guest_run.")
         ),
         key=lambda path: path.relative_to(root).as_posix(),
@@ -688,7 +717,9 @@ def _effective_gem5_invocation(
     passthrough_words: Sequence[str],
     runner_cwd: Path,
     repo_root: Path,
-) -> tuple[Path, str]:
+    run_id: str,
+    program: str,
+) -> tuple[Path, str, List[str]]:
     """从 runner 原始 argv 反推 gem5 选择与配置。"""
 
     values = {
@@ -705,7 +736,7 @@ def _effective_gem5_invocation(
             "invalid_invocation_passthrough",
             f"odd word count:{passthrough_words!r}",
         )
-        return binary.resolve(), ""
+        return binary.resolve(), "", []
     for index in range(0, len(passthrough_words), 2):
         option = passthrough_words[index]
         value = passthrough_words[index + 1]
@@ -786,9 +817,42 @@ def _effective_gem5_invocation(
         f"host-mem={values['--host-mem']},"
         f"vram-size={values['--vram-size']}"
     )
+    try:
+        boundary_token = evidence_boundary_token(run_id, program)
+    except ValueError as error:
+        _add_error(errors, "invalid_evidence_boundary_identity", str(error))
+        boundary_token = ""
+    config += (
+        f";evidence-test-id={program},evidence-token={boundary_token}"
+    )
     if values["--gem5-debug"]:
         config += f";debug-flags={values['--gem5-debug']}"
-    return binary.resolve(), config
+    try:
+        binary_relative = binary.resolve().relative_to((repo_root / "gem5").resolve())
+        container_binary = f"/gem5/{binary_relative.as_posix()}"
+    except ValueError:
+        container_binary = "/gem5/build/VEGA_X86/gem5.opt"
+    expected_command = [container_binary]
+    if values["--gem5-debug"]:
+        expected_command.append(f"--debug-flags={values['--gem5-debug']}")
+    expected_command.extend(
+        (
+            "--listener-mode=on",
+            GEM5_CONFIG_CONTAINER_PATH,
+            f"--socket-path=/tmp/gem5-mi300x-{run_id}.sock",
+            f"--shmem-path=/mi300x-vram-{run_id}",
+            f"--shmem-host-path=/cosim-guest-ram-{run_id}",
+            f"--evidence-path={GEM5_EVIDENCE_CONTAINER_PATH}",
+            f"--evidence-run-id={run_id}",
+            f"--dgpu-mem-size={values['--vram-size']}",
+            f"--num-compute-units={values['--num-cus']}",
+            f"--mem-size={values['--host-mem']}",
+            f"--num-gpus={values['--num-gpus']}",
+            f"--evidence-test-id={program}",
+            f"--evidence-token={boundary_token}",
+        )
+    )
+    return binary.resolve(), config, expected_command
 
 
 def _validate_sha(
@@ -2498,6 +2562,7 @@ def _validate_row(
         "preflight_resources": artifact_dir / "preflight-resources.log",
         "qemu_log": artifact_dir / "qemu.log",
         "gem5_log": artifact_dir / "gem5.log",
+        "gem5_evidence": artifact_dir / "gem5-evidence.tsv",
         "cleanup": artifact_dir / "cleanup-status.txt",
     }
     present = {
@@ -2676,7 +2741,7 @@ def _validate_row(
     _expect_value(
         errors,
         "docker_inspect.path",
-        "/gem5/build/VEGA_X86/gem5.opt",
+        GEM5_STDIO_WRAPPER_PATH,
         docker_container.get("Path", ""),
     )
     docker_args = docker_container.get("Args")
@@ -2685,6 +2750,113 @@ def _validate_row(
     ):
         _add_error(errors, "invalid_docker_inspect", "Args must be string list")
         docker_args = []
+    if tuple(docker_args[: len(GEM5_STDIO_WRAPPER_ARGS)]) != \
+            GEM5_STDIO_WRAPPER_ARGS:
+        _add_error(
+            errors,
+            "invalid_gem5_stdio_wrapper",
+            repr(docker_args[: len(GEM5_STDIO_WRAPPER_ARGS)]),
+        )
+        docker_gem5_args: List[str] = []
+    else:
+        docker_gem5_args = docker_args[len(GEM5_STDIO_WRAPPER_ARGS):]
+    docker_mounts = docker_container.get("Mounts")
+    expected_mounts: Mapping[str, Mapping[str, object]] = {
+        GEM5_SOURCE_MOUNT_PATH: {
+            "Type": "bind",
+            "Source": str((repo_root / "gem5").resolve()),
+            "Destination": GEM5_SOURCE_MOUNT_PATH,
+            "RW": True,
+        },
+        GEM5_TMP_MOUNT_PATH: {
+            "Type": "bind",
+            "Source": GEM5_TMP_MOUNT_PATH,
+            "Destination": GEM5_TMP_MOUNT_PATH,
+            "RW": True,
+        },
+        GEM5_SHM_MOUNT_PATH: {
+            "Type": "bind",
+            "Source": GEM5_SHM_MOUNT_PATH,
+            "Destination": GEM5_SHM_MOUNT_PATH,
+            "RW": True,
+        },
+        GEM5_EVIDENCE_MOUNT_PATH: {
+            "Type": "bind",
+            "Source": str(artifact_dir),
+            "Destination": GEM5_EVIDENCE_MOUNT_PATH,
+            "RW": True,
+        },
+    }
+    mounts_by_destination: Dict[str, List[Mapping[str, object]]] = {}
+    if not isinstance(docker_mounts, list):
+        _add_error(errors, "invalid_docker_inspect", "Mounts must be a list")
+        docker_mounts = []
+    for index, mount in enumerate(docker_mounts):
+        if not isinstance(mount, Mapping):
+            _add_error(
+                errors, "invalid_gem5_mount", f"index={index}:not an object"
+            )
+            continue
+        destination = mount.get("Destination")
+        if not isinstance(destination, str) or not destination.startswith("/"):
+            _add_error(
+                errors,
+                "invalid_gem5_mount",
+                f"index={index}:destination={destination!r}",
+            )
+            continue
+        normalized_destination = posixpath.normpath(destination)
+        if normalized_destination != destination:
+            _add_error(
+                errors,
+                "invalid_gem5_mount",
+                f"index={index}:noncanonical_destination={destination!r}",
+            )
+        for protected in expected_mounts:
+            if normalized_destination.startswith(f"{protected}/"):
+                code = (
+                    "invalid_gem5_evidence_mount"
+                    if protected == GEM5_EVIDENCE_MOUNT_PATH
+                    else "invalid_gem5_mount"
+                )
+                _add_error(
+                    errors,
+                    code,
+                    f"protected={protected}:nested={destination}",
+                )
+        mounts_by_destination.setdefault(destination, []).append(mount)
+    if len(docker_mounts) != len(expected_mounts) or \
+            set(mounts_by_destination) != set(expected_mounts):
+        _add_error(
+            errors,
+            "invalid_gem5_mount_set",
+            f"expected={sorted(expected_mounts)!r}:"
+            f"actual={sorted(mounts_by_destination)!r}",
+        )
+    for destination, expected_mount in expected_mounts.items():
+        matching_mounts = mounts_by_destination.get(destination, [])
+        code = (
+            "invalid_gem5_evidence_mount"
+            if destination == GEM5_EVIDENCE_MOUNT_PATH
+            else "invalid_gem5_mount"
+        )
+        if len(matching_mounts) != 1:
+            _add_error(
+                errors,
+                code,
+                f"destination={destination}:count={len(matching_mounts)}",
+            )
+            continue
+        mount = matching_mounts[0]
+        for field, expected in expected_mount.items():
+            actual = mount.get(field, "")
+            if type(actual) is not type(expected) or actual != expected:
+                _add_error(
+                    errors,
+                    code,
+                    f"destination={destination}:{field}:"
+                    f"expected={expected!r}:actual={actual!r}",
+                )
     docker_state = docker_container.get("State")
     if not isinstance(docker_state, Mapping):
         _add_error(errors, "invalid_docker_inspect", "missing State")
@@ -2877,11 +3049,22 @@ def _validate_row(
     launch_words = _shell_words(
         errors, "launch_invocation.argv", launch_invocation.get("argv")
     )
+    try:
+        expected_boundary_token = evidence_boundary_token(
+            local.get("session_id", ""), program
+        )
+    except ValueError as error:
+        _add_error(errors, "invalid_evidence_boundary_identity", str(error))
+        expected_boundary_token = ""
     expected_launch_words = [
         "--share-dir",
         str((artifact_dir / "staging").resolve()),
         "--artifact-dir",
         str(artifact_dir),
+        "--evidence-test-id",
+        program,
+        "--evidence-token",
+        expected_boundary_token,
         *passthrough_words,
     ]
     if launch_words != expected_launch_words:
@@ -2909,6 +3092,10 @@ def _validate_row(
     )
     for field, expected in (
         ("gem5_docker_image", "gem5-run:local"),
+        ("gem5_evidence", str(artifact_dir / "gem5-evidence.tsv")),
+        ("gem5_container_evidence", GEM5_EVIDENCE_CONTAINER_PATH),
+        ("gem5_evidence_test_id", program),
+        ("gem5_evidence_token", expected_boundary_token),
         ("qemu_binary", str(canonical_qemu)),
         ("disk_image", str(canonical_disk)),
         ("kernel", str(canonical_kernel)),
@@ -3056,8 +3243,17 @@ def _validate_row(
             "invocation_passthrough_mismatch",
             f"argv={parsed_passthrough!r}:recorded={passthrough_words!r}",
         )
-    effective_gem5_binary, effective_gem5_config = _effective_gem5_invocation(
-        errors, parsed_passthrough, runner_cwd, repo_root
+    (
+        effective_gem5_binary,
+        effective_gem5_config,
+        expected_gem5_command,
+    ) = _effective_gem5_invocation(
+        errors,
+        parsed_passthrough,
+        runner_cwd,
+        repo_root,
+        local.get("session_id", ""),
+        program,
     )
     canonical_gem5_binary = (
         repo_root / "gem5" / "build" / "VEGA_X86" / "gem5.opt"
@@ -3165,6 +3361,13 @@ def _validate_row(
         manifest.get("runner_argument", program),
         metadata.get("runner_argument", ""),
     )
+    if "runner_arg" in metadata:
+        _expect_value(
+            errors,
+            "metadata.runner_arg",
+            manifest.get("runner_argument", program),
+            metadata["runner_arg"],
+        )
     for field in ("program_source", "program_binary", "runner_argument"):
         _expect_value(
             errors,
@@ -3198,6 +3401,23 @@ def _validate_row(
             f"invocation.{field}",
             expected,
             invocation.get(field, ""),
+        )
+    for role, values in (
+        ("metadata", metadata),
+        ("runner_invocation", invocation),
+        ("launch_invocation", launch_invocation),
+    ):
+        _expect_value(
+            errors,
+            f"{role}.gem5_evidence_test_id",
+            program,
+            values.get("gem5_evidence_test_id", ""),
+        )
+        _expect_value(
+            errors,
+            f"{role}.gem5_evidence_token",
+            expected_boundary_token,
+            values.get("gem5_evidence_token", ""),
         )
     _expect_value(
         errors,
@@ -3334,6 +3554,9 @@ def _validate_row(
         expected_program=program,
         expected_hsa=expected_hsa,
         expected_test_timeout=expected_test_timeout,
+        expected_boundary_helper_sha256=invocation.get(
+            "gem5_evidence_boundary_binary_sha256", ""
+        ),
     )
     result["qemu_guest_execution"] = qemu_analysis
     exact_pass_count = _parse_int(qemu_analysis.get("pass_count")) or 0
@@ -3344,6 +3567,17 @@ def _validate_row(
             errors,
             "qemu_log_snapshot_invalid",
             str(qemu_analysis.get("read_error")),
+        )
+    if qemu_analysis.get("ok") is not True:
+        _add_error(
+            errors,
+            "qemu_completion_unproven",
+            "encoding="
+            f"{qemu_analysis.get('invalid_encoding_lines')!r}:"
+            "order="
+            f"{qemu_analysis.get('order_errors')!r}:"
+            "suspicious="
+            f"{qemu_analysis.get('suspicious_completion_lines')!r}",
         )
     run_markers = qemu_analysis.get("run_markers")
     if not isinstance(run_markers, list) or len(run_markers) != 1 or \
@@ -3526,17 +3760,45 @@ def _validate_row(
     gem5_analysis = analyze_gem5_log(
         paths["gem5_log"],
         expected_run_id=local.get("session_id", ""),
+        expected_test_id=program,
+        expected_boundary_token=expected_boundary_token,
         test_started_at=metadata.get("guest_test_started_at", ""),
         test_finished_at=metadata.get("guest_test_finished_at", ""),
     )
-    result["gem5_gpu_execution"] = gem5_analysis
-    docker_command = [str(docker_container.get("Path", "")), *docker_args]
-    _expect_value(
-        errors,
-        "docker_inspect.command",
-        repr(gem5_analysis.get("command_words", [])),
-        repr(docker_command),
+    num_gpu_matches = re.findall(
+        r"(?:^|[:,;])num-gpus=([1-9][0-9]*)",
+        metadata.get("gem5_config_args", ""),
     )
+    expected_num_gpus = num_gpu_matches[0] \
+        if len(num_gpu_matches) == 1 else ""
+    gpu_evidence_analysis = analyze_gpu_evidence(
+        paths["gem5_evidence"],
+        expected_run_id=local.get("session_id", ""),
+        expected_num_gpus=expected_num_gpus,
+        require_test_boundaries=True,
+        start_seq=metadata.get("gem5_evidence_start_seq"),
+        end_seq=metadata.get("gem5_evidence_end_seq"),
+    )
+    result["gem5_gpu_execution"] = {
+        "evidence": gpu_evidence_analysis,
+        "log": gem5_analysis,
+        "ok": gem5_analysis.get("ok") is True
+        and gpu_evidence_analysis.get("ok") is True,
+    }
+    docker_command = docker_gem5_args
+    gem5_reported_command = gem5_analysis.get("command_words", [])
+    if docker_command != expected_gem5_command:
+        _add_error(
+            errors,
+            "docker_gem5_argv_mismatch",
+            f"expected={expected_gem5_command!r}:actual={docker_command!r}",
+        )
+    if gem5_reported_command != expected_gem5_command:
+        _add_error(
+            errors,
+            "gem5_reported_argv_mismatch",
+            f"expected={expected_gem5_command!r}:actual={gem5_reported_command!r}",
+        )
     recorded_gem5_log_sha = _validate_sha(
         errors,
         "metadata.gem5_log_sha256",
@@ -3583,31 +3845,73 @@ def _validate_row(
             "gem5_command_identity_mismatch",
             "count="
             f"{gem5_analysis.get('command_line_count')}:missing="
-            f"{gem5_analysis.get('missing_run_tokens')}:debug="
+            f"{gem5_analysis.get('missing_run_tokens')}:noncanonical="
+            f"{gem5_analysis.get('noncanonical_run_tokens')}:debug="
             f"{gem5_analysis.get('missing_debug_flags')}",
-        )
-    if _parse_int(gem5_analysis.get("client_connected_count")) in {None, 0}:
-        _add_error(errors, "gem5_client_not_connected", "missing client marker")
-    if gem5_analysis.get("causal_chain_ok") is not True:
-        _add_error(
-            errors,
-            "gem5_causal_chain_unproven",
-            "command="
-            f"{gem5_analysis.get('command_event')!r}:client="
-            f"{gem5_analysis.get('client_event')!r}:launch="
-            f"{gem5_analysis.get('gpu_sequence', {}).get('launch')!r}",
         )
     if gem5_analysis.get("window_ok") is not True:
         _add_error(errors, "invalid_guest_test_window", "runner_metadata")
-    if gem5_analysis.get("gpu_sequence", {}).get("ok") is not True:
+    if gem5_analysis.get("command_before_test_ok") is not True:
+        _add_error(
+            errors,
+            "gem5_causal_chain_unproven",
+            f"command={gem5_analysis.get('command_event')!r}",
+        )
+    recorded_evidence_sha = _validate_sha(
+        errors,
+        "metadata.gem5_evidence_sha256",
+        metadata.get("gem5_evidence_sha256"),
+    )
+    actual_evidence_sha = str(
+        gpu_evidence_analysis.get("gpu_evidence_sha256", "")
+    )
+    if recorded_evidence_sha is not None and \
+            recorded_evidence_sha != actual_evidence_sha:
+        _add_error(
+            errors,
+            "gem5_evidence_hash_mismatch",
+            f"expected={recorded_evidence_sha}:actual={actual_evidence_sha}",
+        )
+    if gpu_evidence_analysis.get("read_error") is not None:
+        _add_error(
+            errors,
+            "gem5_evidence_read_error",
+            str(gpu_evidence_analysis.get("read_error")),
+        )
+    if gpu_evidence_analysis.get("structural_ok") is not True:
+        _add_error(
+            errors,
+            "invalid_gem5_evidence_structure",
+            "mode_ok="
+            f"{gpu_evidence_analysis.get('mode_ok')}:errors="
+            f"{gpu_evidence_analysis.get('structural_errors')!r}",
+        )
+    if gpu_evidence_analysis.get("boundary_ok") is not True:
+        _add_error(
+            errors,
+            "invalid_gem5_evidence_window",
+            "start="
+            f"{gpu_evidence_analysis.get('start_seq')}:end="
+            f"{gpu_evidence_analysis.get('end_seq')}:final="
+            f"{gpu_evidence_analysis.get('final_seq')}:events="
+            f"{gpu_evidence_analysis.get('boundary_events')!r}",
+        )
+    if _parse_int(gpu_evidence_analysis.get("client_connected_count")) in {
+        None,
+        0,
+    }:
+        _add_error(
+            errors,
+            "gem5_client_not_connected",
+            "structured client event is missing",
+        )
+    if gpu_evidence_analysis.get("gpu_sequence", {}).get("ok") is not True:
         _add_error(
             errors,
             "gem5_gpu_execution_unproven",
-            "launch="
-            f"{gem5_analysis.get('kernel_launch_count')}:dispatch="
-            f"{gem5_analysis.get('workgroup_dispatch_count')}:completion="
-            f"{gem5_analysis.get('workgroup_completion_count')}:kernel_completion="
-            f"{gem5_analysis.get('kernel_completion_count')}",
+            "counts="
+            f"{gpu_evidence_analysis.get('window_event_counts')!r}:causal="
+            f"{gpu_evidence_analysis.get('causal_errors')!r}",
         )
     if _nested(verdict, "checks", "gem5_gpu_execution", "ok") is not True:
         _add_error(errors, "invalid_verdict_check", "gem5_gpu_execution")
@@ -3617,12 +3921,19 @@ def _validate_row(
         actual_gem5_log_sha,
         _nested(verdict, "provenance", "gem5_log_sha256"),
     )
+    _expect_value(
+        errors,
+        "verdict.provenance.gem5_evidence_sha256",
+        actual_evidence_sha,
+        _nested(verdict, "provenance", "gem5_evidence_sha256"),
+    )
 
     if verdict.get("schema") != "cosim-run-verdict/v1":
         _add_error(errors, "invalid_verdict_schema", str(verdict.get("schema")))
     for check in (
         "binary_provenance",
         "cleanup",
+        "evidence_boundary_helper",
         "effective_environment",
         "program_identity",
         "required_evidence",
@@ -3783,10 +4094,12 @@ def _validate_row(
         verdict,
         {
             "binary_provenance": paths["binary_provenance"],
+            "gem5_evidence": paths["gem5_evidence"],
             "gem5_log": paths["gem5_log"],
             "guest_log": paths["qemu_log"],
             "metadata": paths["metadata"],
             "qemu_log": paths["qemu_log"],
+            "runner_invocation": paths["runner_invocation"],
             "source_snapshot": paths["source_snapshot"],
         },
         repo_root,
@@ -3845,6 +4158,8 @@ def _validate_row(
         "gem5_docker_image",
         "test_binary",
         "test_binary_sha256",
+        "gem5_evidence_boundary_binary",
+        "gem5_evidence_boundary_binary_sha256",
     )
     for key in required_provenance:
         if not provenance.get(key):
@@ -3865,6 +4180,9 @@ def _validate_row(
     )
     gem5_path = _resolve_reference(provenance.get("gem5_binary", ""), repo_root)
     test_binary = _resolve_reference(provenance.get("test_binary", ""), repo_root)
+    boundary_binary = _resolve_reference(
+        provenance.get("gem5_evidence_boundary_binary", ""), repo_root
+    )
     _expect_path(
         errors,
         "manifest.gem5_binary",
@@ -3937,6 +4255,93 @@ def _validate_row(
             "binary_provenance.test_binary:"
             f"expected={expected_test_binary.resolve()}:actual={test_binary}",
         )
+    expected_boundary_binary = (
+        artifact_dir / "staging" / "tools-build" / "cosim_evidence_boundary"
+    )
+    if expected_boundary_binary.is_symlink():
+        _add_error(
+            errors,
+            "symlink_not_allowed",
+            f"gem5_evidence_boundary_binary:{expected_boundary_binary}",
+        )
+    if boundary_binary != expected_boundary_binary.resolve():
+        _add_error(
+            errors,
+            "path_mismatch",
+            "binary_provenance.gem5_evidence_boundary_binary:"
+            f"expected={expected_boundary_binary.resolve()}:"
+            f"actual={boundary_binary}",
+        )
+    for role, recorded_path in (
+        (
+            "runner_invocation",
+            invocation.get("gem5_evidence_boundary_binary"),
+        ),
+        ("metadata", metadata.get("gem5_evidence_boundary_binary")),
+        ("top", top.get("gem5_evidence_boundary_binary")),
+        (
+            "verdict.provenance",
+            _nested(verdict, "provenance", "gem5_evidence_boundary_binary"),
+        ),
+        (
+            "verdict.checks.evidence_boundary_helper",
+            _nested(
+                verdict,
+                "checks",
+                "evidence_boundary_helper",
+                "path",
+            ),
+        ),
+    ):
+        _expect_path(
+            errors,
+            f"{role}.gem5_evidence_boundary_binary",
+            recorded_path,
+            boundary_binary,
+            repo_root,
+        )
+    anchored_boundary_sha256 = invocation.get(
+        "gem5_evidence_boundary_binary_sha256", ""
+    )
+    _validate_sha(
+        errors,
+        "runner_invocation.gem5_evidence_boundary_binary_sha256",
+        anchored_boundary_sha256,
+    )
+    for role, recorded_sha256 in (
+        (
+            "binary_provenance",
+            provenance.get("gem5_evidence_boundary_binary_sha256", ""),
+        ),
+        (
+            "metadata",
+            metadata.get("gem5_evidence_boundary_binary_sha256", ""),
+        ),
+        ("top", top.get("gem5_evidence_boundary_binary_sha256", "")),
+        (
+            "verdict.provenance",
+            _nested(
+                verdict,
+                "provenance",
+                "gem5_evidence_boundary_binary_sha256",
+            ),
+        ),
+        (
+            "verdict.checks.evidence_boundary_helper",
+            _nested(
+                verdict,
+                "checks",
+                "evidence_boundary_helper",
+                "sha256",
+            ),
+        ),
+    ):
+        _expect_value(
+            errors,
+            f"{role}.gem5_evidence_boundary_binary_sha256",
+            anchored_boundary_sha256,
+            recorded_sha256,
+        )
     canonical_gem5_lexical = (
         repo_root / "gem5" / "build" / "VEGA_X86" / "gem5.opt"
     )
@@ -3955,6 +4360,14 @@ def _validate_row(
         if not os.access(test_binary, os.X_OK):
             _add_error(errors, "binary_not_executable", f"test_binary:{test_binary}")
         _verify_hip_executable(errors, test_binary)
+    if _require_file(
+        boundary_binary, errors, "gem5_evidence_boundary_binary"
+    ) and not os.access(boundary_binary, os.X_OK):
+        _add_error(
+            errors,
+            "binary_not_executable",
+            f"gem5_evidence_boundary_binary:{boundary_binary}",
+        )
     _verify_file_hash(
         errors,
         "binary_provenance.gem5_sha256",
@@ -4137,6 +4550,20 @@ def _validate_row(
         "binary_provenance.test_binary_sha256",
         test_binary,
         provenance.get("test_binary_sha256"),
+        cache,
+    )
+    _verify_file_hash(
+        errors,
+        "binary_provenance.gem5_evidence_boundary_binary_sha256",
+        boundary_binary,
+        provenance.get("gem5_evidence_boundary_binary_sha256"),
+        cache,
+    )
+    _verify_file_hash(
+        errors,
+        "runner_invocation.gem5_evidence_boundary_binary_sha256",
+        boundary_binary,
+        anchored_boundary_sha256,
         cache,
     )
     for field in ("gem5_source_commit", "gem5_sha256", "test_binary_sha256"):

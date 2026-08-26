@@ -23,14 +23,20 @@ from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 try:
     from scripts.cosim_log_evidence import (
         analyze_gem5_log,
+        analyze_gpu_evidence,
         analyze_qemu_log,
+        evidence_boundary_token,
         simulator_fatal_kind,
+        stable_log_sha256,
     )
 except ModuleNotFoundError:  # 允许直接执行 scripts/classify_runs.py。
     from cosim_log_evidence import (
         analyze_gem5_log,
+        analyze_gpu_evidence,
         analyze_qemu_log,
+        evidence_boundary_token,
         simulator_fatal_kind,
+        stable_log_sha256,
     )
 
 
@@ -69,11 +75,13 @@ QEMU_LOG_NAMES = (
     "logs/qemu-console.log",
 )
 GEM5_LOG_NAMES = ("gem5.log", "logs/gem5.log")
+GEM5_EVIDENCE_NAMES = ("gem5-evidence.tsv", "logs/gem5-evidence.tsv")
 SOURCE_SNAPSHOT_NAMES = ("patch/source-snapshot.txt", "source-snapshot.txt")
 PROVENANCE_NAMES = (
     "patch/binary-provenance.txt",
     "binary-provenance.txt",
 )
+RUNNER_INVOCATION_NAMES = ("runner-invocation.txt",)
 GEM5_STATUS_NAMES = ("patch/gem5-status.txt", "gem5-status.txt")
 GEM5_PATCH_NAMES = ("patch/gem5.patch", "gem5.patch")
 UNTRACKED_LIST_NAMES = (
@@ -86,6 +94,22 @@ UNTRACKED_ARCHIVE_NAMES = (
 )
 
 ENV_RE = re.compile(r"^\[COSIM_ENV\] HSA_ENABLE_INTERRUPT=([01])$")
+PROGRAM_RE = re.compile(r"^[a-z0-9_]{1,128}$")
+PROGRAM_IDENTITY_CLAIM_KEYS = (
+    "program",
+    "test",
+    "expected_program",
+    "runner_argument",
+    "runner_arg",
+)
+PROGRAM_ID_METADATA_KEYS = {
+    "expected_program",
+    "gem5_evidence_test_id",
+    "program",
+    "runner_arg",
+    "runner_argument",
+    "test",
+}
 FAIL_RE = re.compile(r"^\[FAIL\](?:\s|$)")
 TIMEOUT_SIGNAL_RE = re.compile(
     r"^\[(?:COSIM_)?(?:BOOT_|GEM5_INIT_|TEST_)?TIMEOUT\](?:\s|$)"
@@ -125,11 +149,17 @@ def locate_evidence(root: Path) -> Dict[str, LocatedFile]:
         "guest_log": LocatedFile("guest_log", _first_file(root, GUEST_LOG_NAMES)),
         "qemu_log": LocatedFile("qemu_log", _first_file(root, QEMU_LOG_NAMES)),
         "gem5_log": LocatedFile("gem5_log", _first_file(root, GEM5_LOG_NAMES)),
+        "gem5_evidence": LocatedFile(
+            "gem5_evidence", _first_file(root, GEM5_EVIDENCE_NAMES)
+        ),
         "source_snapshot": LocatedFile(
             "source_snapshot", _first_file(root, SOURCE_SNAPSHOT_NAMES)
         ),
         "binary_provenance": LocatedFile(
             "binary_provenance", _first_file(root, PROVENANCE_NAMES)
+        ),
+        "runner_invocation": LocatedFile(
+            "runner_invocation", _first_file(root, RUNNER_INVOCATION_NAMES)
         ),
         "gem5_status": LocatedFile(
             # git status --short is empty for the desired clean-tree case.
@@ -148,7 +178,10 @@ def locate_evidence(root: Path) -> Dict[str, LocatedFile]:
     }
 
 
-def read_key_values(path: Optional[Path]) -> Tuple[Dict[str, str], Dict[str, int]]:
+def read_key_values(
+    path: Optional[Path],
+    program_identity_claims: Optional[List[Tuple[str, str, int]]] = None,
+) -> Tuple[Dict[str, str], Dict[str, int]]:
     values: Dict[str, str] = {}
     lines: Dict[str, int] = {}
     if path is None or not path.is_file():
@@ -163,7 +196,15 @@ def read_key_values(path: Optional[Path]) -> Tuple[Dict[str, str], Dict[str, int
             key = key.strip()
             if not key:
                 continue
-            values[key] = value.strip()
+            parsed_value = (
+                value if key in PROGRAM_ID_METADATA_KEYS else value.strip()
+            )
+            values[key] = parsed_value
+            if program_identity_claims is not None and \
+                    key in PROGRAM_IDENTITY_CLAIM_KEYS:
+                program_identity_claims.append(
+                    (key, parsed_value, line_number)
+                )
             lines[key] = line_number
     return values, lines
 
@@ -185,6 +226,14 @@ def _parse_int(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def _recorded_num_gpus(metadata: Mapping[str, str]) -> str:
+    matches = re.findall(
+        r"(?:^|[:,;])num-gpus=([1-9][0-9]*)",
+        metadata.get("gem5_config_args", ""),
+    )
+    return matches[0] if len(matches) == 1 else ""
+
+
 def _relative_or_absolute(path: Optional[Path]) -> Optional[str]:
     return str(path) if path is not None else None
 
@@ -198,56 +247,109 @@ def _iter_normalized_lines(path: Optional[Path]) -> Iterator[Tuple[int, str]]:
 
 
 def _identity_check(
-    metadata: Mapping[str, str], requested_program: Optional[str]
-) -> Tuple[Optional[str], bool, str, Dict[str, Optional[str]]]:
-    recorded_program = _first_value(metadata, ("program", "test", "expected_program"))
-    expected_program = requested_program or recorded_program
+    metadata: Mapping[str, str],
+    requested_program: Optional[str],
+    program_identity_claims: Optional[Sequence[Tuple[str, str, int]]] = None,
+) -> Tuple[Optional[str], bool, str, Dict[str, object]]:
+    if program_identity_claims is None:
+        identity_claims = [
+            (name, metadata[name], 0)
+            for name in PROGRAM_IDENTITY_CLAIM_KEYS
+            if name in metadata
+        ]
+    else:
+        identity_claims = list(program_identity_claims)
+    claims_by_key: Dict[str, List[str]] = {}
+    for key, value, _ in identity_claims:
+        claims_by_key.setdefault(key, []).append(value)
+    duplicate_identity_keys = sorted(
+        key for key, values in claims_by_key.items() if len(values) > 1
+    )
+    program_claims = [
+        value
+        for key, value, _ in identity_claims
+        if key in {"program", "test", "expected_program"}
+    ]
+    runner_claims = [
+        value
+        for key, value, _ in identity_claims
+        if key in {"runner_argument", "runner_arg"}
+    ]
+    recorded_program = next(
+        (
+            claims_by_key[name][0]
+            for name in ("program", "test", "expected_program")
+            if name in claims_by_key
+        ),
+        None,
+    )
+    expected_program = (
+        requested_program if requested_program is not None else recorded_program
+    )
     source = _first_value(
         metadata, ("program_source", "source_path", "source")
     )
     binary = _first_value(
         metadata, ("program_binary", "binary_path", "test_binary")
     )
-    runner_argument = _first_value(
-        metadata, ("runner_argument", "runner_arg")
+    runner_argument = next(
+        (
+            claims_by_key[name][0]
+            for name in ("runner_argument", "runner_arg")
+            if name in claims_by_key
+        ),
+        None,
     )
-    details: Dict[str, Optional[str]] = {
+    details: Dict[str, object] = {
         "requested_program": requested_program,
         "recorded_program": recorded_program,
         "program_source": source,
         "program_binary": binary,
         "runner_argument": runner_argument,
+        "identity_claims": [
+            {"key": key, "value": value, "line": line_number}
+            for key, value, line_number in identity_claims
+        ],
+        "duplicate_identity_keys": duplicate_identity_keys,
     }
 
+    if duplicate_identity_keys:
+        return (
+            expected_program,
+            False,
+            "program_identity_duplicate",
+            details,
+        )
+    if (
+        expected_program is not None
+        and PROGRAM_RE.fullmatch(expected_program) is None
+    ) or any(
+        PROGRAM_RE.fullmatch(value) is None
+        for value in (*program_claims, *runner_claims)
+    ):
+        return expected_program, False, "program_identity_invalid", details
     missing = [
         name
         for name, value in (
             ("program", recorded_program),
             ("program_source", source),
             ("program_binary", binary),
-            ("runner_argument", runner_argument),
         )
         if not value
     ]
+    if not runner_claims:
+        missing.append("runner_argument")
     if expected_program is None or missing:
         return expected_program, False, "program_identity_incomplete", details
-
-    claimed_values = [
-        metadata[name]
-        for name in ("program", "test", "expected_program")
-        if metadata.get(name)
-    ]
-    if any(value != expected_program for value in claimed_values):
+    if any(value != expected_program for value in program_claims):
         return expected_program, False, "program_identity_mismatch", details
-    if runner_argument != expected_program:
+    if any(value != expected_program for value in runner_claims):
         return expected_program, False, "program_identity_mismatch", details
 
-    # Local kernels have an unambiguous source and binary basename contract.
-    if "/" not in expected_program:
-        expected_source = f"tests/kernels/{expected_program}.cpp"
-        expected_binary = f"tests/build/{expected_program}"
-        if source != expected_source or binary != expected_binary:
-            return expected_program, False, "program_identity_mismatch", details
+    expected_source = f"tests/kernels/{expected_program}.cpp"
+    expected_binary = f"tests/build/{expected_program}"
+    if source != expected_source or binary != expected_binary:
+        return expected_program, False, "program_identity_mismatch", details
 
     return expected_program, True, "ok", details
 
@@ -290,10 +392,22 @@ def classify_artifact(
 ) -> Dict[str, object]:
     root = artifact_dir.resolve()
     evidence = locate_evidence(root)
-    metadata, _ = read_key_values(evidence["metadata"].path)
+    program_identity_claims: List[Tuple[str, str, int]] = []
+    metadata, _ = read_key_values(
+        evidence["metadata"].path, program_identity_claims
+    )
+    runner_invocation, _ = read_key_values(evidence["runner_invocation"].path)
+    recorded_boundary_helper_sha256 = metadata.get(
+        "gem5_evidence_boundary_binary_sha256", ""
+    ).lower()
+    expected_boundary_helper_sha256 = (
+        recorded_boundary_helper_sha256
+        if re.fullmatch(r"[0-9a-f]{64}", recorded_boundary_helper_sha256)
+        else ""
+    )
 
     program, identity_ok, identity_reason, identity = _identity_check(
-        metadata, requested_program
+        metadata, requested_program, program_identity_claims
     )
 
     compile_raw = _first_value(metadata, ("compile_exit_code", "build_exit_code"))
@@ -339,6 +453,7 @@ def classify_artifact(
             expected_program=program or "",
             expected_hsa=metadata.get("expected_hsa_enable_interrupt", ""),
             expected_test_timeout=metadata.get("test_timeout", ""),
+            expected_boundary_helper_sha256=expected_boundary_helper_sha256,
         )
 
     guest_is_qemu = bool(
@@ -402,12 +517,24 @@ def classify_artifact(
                     simulator_fatal_events.append(joined_event)
 
     strict_acceptance = metadata.get("strict_acceptance") == "1"
+    expected_boundary_token = ""
+    if strict_acceptance and program:
+        try:
+            expected_boundary_token = evidence_boundary_token(
+                metadata.get("run_id", ""), program
+            )
+        except ValueError:
+            expected_boundary_token = ""
     gem5_analysis: Optional[Dict[str, object]] = None
+    gpu_evidence_analysis: Optional[Dict[str, object]] = None
+    combined_gpu_analysis: Optional[Dict[str, object]] = None
     gem5_log = evidence["gem5_log"].path
     if gem5_log is not None:
         gem5_analysis = analyze_gem5_log(
             gem5_log,
             expected_run_id=metadata.get("run_id", ""),
+            expected_test_id=program if strict_acceptance and program else "",
+            expected_boundary_token=expected_boundary_token,
             test_started_at=metadata.get("guest_test_started_at", ""),
             test_finished_at=metadata.get("guest_test_finished_at", ""),
         )
@@ -419,6 +546,52 @@ def classify_artifact(
                 simulator_fatal_events.append(
                     {"role": "gem5_log", **dict(event)}
                 )
+    gem5_evidence = evidence["gem5_evidence"].path
+    if gem5_evidence is not None:
+        gpu_evidence_analysis = analyze_gpu_evidence(
+            gem5_evidence,
+            expected_run_id=metadata.get("run_id", ""),
+            expected_num_gpus=(
+                _recorded_num_gpus(metadata) if strict_acceptance else None
+            ),
+            require_test_boundaries=strict_acceptance,
+            start_seq=metadata.get("gem5_evidence_start_seq"),
+            end_seq=metadata.get("gem5_evidence_end_seq"),
+        )
+    if gem5_analysis is not None:
+        combined_gpu_analysis = dict(gem5_analysis)
+        combined_gpu_analysis["log_ok"] = gem5_analysis.get("ok") is True
+        combined_gpu_analysis["gpu_evidence"] = gpu_evidence_analysis
+        if gpu_evidence_analysis is not None:
+            combined_gpu_analysis.update(
+                {
+                    "causal_chain_ok": gpu_evidence_analysis.get(
+                        "gpu_sequence", {}
+                    ).get("ok") is True
+                    and gem5_analysis.get("command_before_test_ok") is True,
+                    "client_connected_count": gpu_evidence_analysis.get(
+                        "client_connected_count"
+                    ),
+                    "gpu_sequence": gpu_evidence_analysis.get("gpu_sequence"),
+                    "kernel_completion_count": gpu_evidence_analysis.get(
+                        "window_event_counts", {}
+                    ).get("kernel_complete"),
+                    "kernel_launch_count": gpu_evidence_analysis.get(
+                        "window_event_counts", {}
+                    ).get("kernel_launch"),
+                    "workgroup_completion_count": gpu_evidence_analysis.get(
+                        "window_event_counts", {}
+                    ).get("workgroup_complete"),
+                    "workgroup_dispatch_count": gpu_evidence_analysis.get(
+                        "window_event_counts", {}
+                    ).get("workgroup_dispatch"),
+                }
+            )
+        combined_gpu_analysis["ok"] = bool(
+            gem5_analysis.get("ok") is True
+            and gpu_evidence_analysis is not None
+            and gpu_evidence_analysis.get("ok") is True
+        )
 
     snapshot_ok, snapshot_problems = _source_snapshot_check(
         evidence["source_snapshot"].path
@@ -442,6 +615,78 @@ def classify_artifact(
             missing_evidence.append(role)
     missing_evidence.extend(snapshot_problems)
     missing_evidence.extend(provenance_problems)
+    helper_marker_ok = not expected_boundary_helper_sha256
+    if expected_boundary_helper_sha256:
+        helper_marker_ok = bool(
+            qemu_analysis is not None
+            and qemu_analysis.get("boundary_ready_marker_count") == 1
+            and qemu_analysis.get("sequence", {}).get("boundary_ready")
+            is not None
+            and qemu_analysis.get("sequence", {}).get("ok") is True
+        )
+        if not helper_marker_ok:
+            missing_evidence.append("qemu_log:boundary_helper_marker")
+    helper_identity_ok = not strict_acceptance
+    helper_identity_problems: List[str] = []
+    helper_path = ""
+    helper_sha256 = ""
+    if strict_acceptance:
+        if not evidence["runner_invocation"].present:
+            helper_identity_problems.append("runner_invocation")
+        helper_fields = (
+            "gem5_evidence_boundary_binary",
+            "gem5_evidence_boundary_binary_sha256",
+        )
+        helper_records = (
+            ("runner_invocation", runner_invocation),
+            ("metadata", metadata),
+            ("binary_provenance", provenance),
+        )
+        for role, values in helper_records:
+            for key in helper_fields:
+                if not values.get(key):
+                    helper_identity_problems.append(f"{role}:{key}")
+        helper_paths = {
+            values.get("gem5_evidence_boundary_binary", "")
+            for _, values in helper_records
+            if values.get("gem5_evidence_boundary_binary", "")
+        }
+        helper_hashes = {
+            values.get("gem5_evidence_boundary_binary_sha256", "").lower()
+            for _, values in helper_records
+            if values.get("gem5_evidence_boundary_binary_sha256", "")
+        }
+        if len(helper_paths) != 1:
+            helper_identity_problems.append("helper_identity:path_mismatch")
+        else:
+            helper_path = next(iter(helper_paths))
+        if len(helper_hashes) != 1:
+            helper_identity_problems.append("helper_identity:sha256_mismatch")
+        else:
+            helper_sha256 = next(iter(helper_hashes))
+        if helper_sha256 and not re.fullmatch(r"[0-9a-f]{64}", helper_sha256):
+            helper_identity_problems.append("helper_identity:invalid_sha256")
+        expected_helper = root / "staging/tools-build/cosim_evidence_boundary"
+        if helper_path and helper_path != str(expected_helper):
+            helper_identity_problems.append("helper_identity:noncanonical_path")
+        if expected_helper.is_symlink() or expected_helper.resolve() != expected_helper:
+            helper_identity_problems.append("helper_identity:symlink_or_escape")
+        elif not expected_helper.is_file() or not os.access(expected_helper, os.X_OK):
+            helper_identity_problems.append("helper_identity:not_executable")
+        elif helper_sha256:
+            try:
+                live_helper_sha256 = stable_log_sha256(expected_helper)
+            except OSError:
+                helper_identity_problems.append("helper_identity:unstable_live_file")
+            else:
+                if live_helper_sha256 != helper_sha256:
+                    helper_identity_problems.append(
+                        "helper_identity:live_sha256_mismatch"
+                    )
+        helper_identity_ok = not helper_identity_problems
+        if not helper_identity_ok:
+            provenance_ok = False
+            missing_evidence.extend(helper_identity_problems)
     status_path = evidence["gem5_status"].path
     patch_path = evidence["gem5_patch"].path
     if status_path is not None and status_path.is_file():
@@ -498,8 +743,26 @@ def classify_artifact(
     strict_gpu_execution_ok = not strict_acceptance
     if strict_acceptance:
         for key in (
+            "gem5_evidence_boundary_binary",
+            "gem5_evidence_boundary_binary_sha256",
+        ):
+            if not provenance.get(key):
+                missing_evidence.append(f"binary_provenance:{key}")
+        if not re.fullmatch(
+            r"[0-9a-fA-F]{64}",
+            provenance.get("gem5_evidence_boundary_binary_sha256", ""),
+        ):
+            missing_evidence.append(
+                "binary_provenance:invalid_gem5_evidence_boundary_binary_sha256"
+            )
+        for key in (
             "guest_test_started_at",
             "guest_test_finished_at",
+            "gem5_evidence_end_seq",
+            "gem5_evidence_sha256",
+            "gem5_evidence_start_seq",
+            "gem5_evidence_test_id",
+            "gem5_evidence_token",
             "gem5_log_sha256",
         ):
             if not metadata.get(key):
@@ -510,13 +773,28 @@ def classify_artifact(
         elif gem5_analysis is not None and recorded_log_sha.lower() != \
                 gem5_analysis.get("gem5_log_sha256"):
             missing_evidence.append("gem5_log:sha256_mismatch")
+        recorded_evidence_sha = metadata.get("gem5_evidence_sha256", "")
+        if metadata.get("gem5_evidence_test_id", "") != program:
+            missing_evidence.append("metadata:invalid_gem5_evidence_test_id")
+        if metadata.get("gem5_evidence_token", "") != expected_boundary_token:
+            missing_evidence.append("metadata:invalid_gem5_evidence_token")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", recorded_evidence_sha):
+            missing_evidence.append("metadata:invalid_gem5_evidence_sha256")
+        elif gpu_evidence_analysis is not None and \
+                recorded_evidence_sha.lower() != \
+                gpu_evidence_analysis.get("gpu_evidence_sha256"):
+            missing_evidence.append("gem5_evidence:sha256_mismatch")
+        if not evidence["gem5_evidence"].present:
+            missing_evidence.append("gem5_evidence")
         strict_gpu_execution_ok = bool(
-            gem5_analysis is not None
-            and gem5_analysis.get("ok") is True
+            combined_gpu_analysis is not None
+            and combined_gpu_analysis.get("ok") is True
             and recorded_log_sha.lower() == gem5_analysis.get("gem5_log_sha256")
+            and recorded_evidence_sha.lower()
+            == gpu_evidence_analysis.get("gpu_evidence_sha256")
         )
         if not strict_gpu_execution_ok:
-            missing_evidence.append("gem5_log:strict_gpu_execution")
+            missing_evidence.append("gem5_evidence:strict_gpu_execution")
 
     reasons: List[str] = []
     if not identity_ok:
@@ -583,7 +861,7 @@ def classify_artifact(
             "gem5_gpu_execution": {
                 "ok": strict_gpu_execution_ok,
                 "required": strict_acceptance,
-                "analysis": gem5_analysis,
+                "analysis": combined_gpu_analysis,
             },
             "qemu_completion": {
                 "ok": strict_qemu_completion_ok,
@@ -601,6 +879,12 @@ def classify_artifact(
             },
             "source_snapshot": {"ok": snapshot_ok},
             "binary_provenance": {"ok": provenance_ok},
+            "evidence_boundary_helper": {
+                "ok": helper_identity_ok and helper_marker_ok,
+                "marker_ok": helper_marker_ok,
+                "path": helper_path or None,
+                "sha256": helper_sha256 or None,
+            },
             "effective_environment": {
                 "ok": len(set(env_values)) == 1 and bool(env_values),
                 "hsa_enable_interrupt": env_values[-1] if env_values else None,
@@ -611,11 +895,22 @@ def classify_artifact(
         },
         "provenance": {
             key: provenance.get(key)
-            for key in ("gem5_source_commit", "gem5_binary", "gem5_sha256")
+            for key in (
+                "gem5_source_commit",
+                "gem5_binary",
+                "gem5_sha256",
+                "gem5_evidence_boundary_binary",
+                "gem5_evidence_boundary_binary_sha256",
+            )
         },
     }
     result["provenance"]["gem5_log_sha256"] = (
         gem5_analysis.get("gem5_log_sha256") if gem5_analysis is not None else None
+    )
+    result["provenance"]["gem5_evidence_sha256"] = (
+        gpu_evidence_analysis.get("gpu_evidence_sha256")
+        if gpu_evidence_analysis is not None
+        else None
     )
     result["provenance"]["qemu_log_sha256"] = (
         qemu_analysis.get("qemu_log_sha256") if qemu_analysis is not None else None
@@ -737,7 +1032,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    if args.program and len(artifact_dirs) != 1:
+    if args.program is not None and PROGRAM_RE.fullmatch(args.program) is None:
+        parser.error("`--program` 必须匹配 ASCII [a-z0-9_]{1,128}")
+    if args.program is not None and len(artifact_dirs) != 1:
         parser.error("--program requires exactly one artifact directory")
     if args.write_verdict and len(artifact_dirs) != 1:
         parser.error("--write-verdict requires exactly one artifact directory")

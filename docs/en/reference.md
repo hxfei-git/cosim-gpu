@@ -242,6 +242,7 @@ An operator artifact normally contains:
 | exact command/environment | `runner-invocation.txt`, `launch-invocation.txt`, `runner-metadata.txt`, `guest-run.sh` |
 | Guest and QEMU stream | `qemu.log` |
 | gem5 stream | `gem5.log` |
+| structured gem5 GPU events and in-stream test boundaries | `gem5-evidence.tsv` |
 | program result | `verdict.json`, `classifier-output.json`, local `matrix.tsv` |
 | source identity | `patch/source-snapshot.txt`, repo/gem5 status and patch files |
 | binary identity | `patch/binary-provenance.txt` |
@@ -256,9 +257,33 @@ identity, compile exit 0, test exit 0, exactly one `[PASS] <program>`, no FAIL
 marker or timeout/early simulator exit, one effective HSA interrupt value,
 agreement between the manifest and effective invocation/timeouts, complete
 source/binary provenance, full QEMU/gem5 evidence, and verified cleanup. An
-accepted `gem5.log` must also show, inside that row's test window, a same-kernel
-launch, workgroup dispatch, `WgCompl`, and kernel completion sequence, with
-argv matching `docker-inspect.json`. An ordinary learning or dirty-replay run defaults to diagnostic mode and is not a
+accepted `gem5.log` proves command identity, fatal scanning, and ordered
+timestamps; GPU acceptance events come only from `gem5-evidence.tsv`, created
+exclusively by gem5. That file must match the run ID and hash, use a contiguous
+sequence and nondecreasing ticks. After compiling the helper, the Guest first
+emits a run-bound READY marker and SHA-256; before BEGIN, the host stably verifies
+and persists that identity, then releases a one-shot 9p acknowledgement.
+Immediately before and after the target program, the archived Guest helper
+submits BEGIN and END vendor-specific AQL packets carrying the run/program-bound
+token and waits for each completion signal and AQL read-index retirement. gem5
+appends and `fdatasync()`s the corresponding `test_begin` or
+`test_end` record before it signals that packet's completion. Strict verification
+requires the same unique token across the runner, launcher, gem5 configuration,
+metadata, and verifier; exactly one matching boundary pair; and the complete
+same-GPU/kernel/WG causal chain—kernel launch, every workgroup dispatch and
+completion, and same-ID kernel completion—strictly between the boundaries.
+`test_end` must be the final record. The Docker and gem5-reported argv must both
+exactly equal the complete ordered command derived from the runner, and
+`/gem5`, `/tmp`, `/dev/shm`, and `/cosim-artifacts` must be unique exact bind
+mounts without shadow mounts.
+
+The boundary packet and acknowledgement scheme is a cosim-gpu-specific
+instrumentation protocol and workaround. It is not part of the real AMD GPU
+packet ABI or ROCm ABI and must not be treated as native-hardware behavior.
+Strict PASS also depends on the Guest amdgpu/KFD/HSA path successfully carrying
+the AQL queue submission, doorbell notification, and completion signal, as well
+as the workload's GPU chain. Ordinary log text cannot fill a missing event. An
+ordinary learning or dirty-replay run defaults to diagnostic mode and is not a
 strict v2 PASS. Only artifacts recording `COSIM_STRICT_ACCEPTANCE=1` may enter
 the final v2 matrix.
 

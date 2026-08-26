@@ -82,6 +82,8 @@ GEM5_TIMEOUT=120
 QEMU_TRACE=""
 SHARE_DIR=""
 NUM_GPUS="1"
+EVIDENCE_TEST_ID=""
+EVIDENCE_TOKEN=""
 FORCE_CLEAN=""
 FORCE_CLEAN_CONFIRM=""
 
@@ -109,6 +111,11 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
+valid_evidence_test_id() (
+    export LC_ALL=C
+    [[ "${1:-}" =~ ^[a-z0-9_]{1,128}$ ]]
+)
+
 # ---- Argument parsing ----
 
 usage() {
@@ -134,6 +141,8 @@ Options:
   --num-gpus N            Number of GPU instances (default: 1)
   --timeout SECS          gem5 init timeout (default: 120)
   --artifact-dir PATH     Run artifact directory under this repository
+  --evidence-test-id ID   runner 内部管理的结构化证据测试标识
+  --evidence-token HEX    runner 内部管理的 128-bit AQL 边界 token
   --force-clean           List orphaned cosim resources (dry-run)
   --confirm               Reserved; unscoped deletion is refused
   -h, --help              Show this help
@@ -159,6 +168,8 @@ while [[ $# -gt 0 ]]; do
         --num-gpus)      NUM_GPUS="$2";         shift 2 ;;
         --timeout)       GEM5_TIMEOUT="$2";     shift 2 ;;
         --artifact-dir)  ARTIFACT_DIR="$2";     shift 2 ;;
+        --evidence-test-id) EVIDENCE_TEST_ID="$2"; shift 2 ;;
+        --evidence-token) EVIDENCE_TOKEN="$2"; shift 2 ;;
         --force-clean)   FORCE_CLEAN=1;         shift ;;
         --confirm)       FORCE_CLEAN_CONFIRM=1; shift ;;
         -h|--help)       usage ;;
@@ -176,11 +187,21 @@ for numeric_name in HOST_CPUS NUM_CUS NUM_GPUS GEM5_TIMEOUT; do
     [[ "$numeric_value" =~ ^[1-9][0-9]*$ ]] || error "${numeric_name} must be a positive integer"
 done
 for invocation_value in "$GEM5_BIN" "$QEMU_BIN" "$QEMU_IMG" "$GEM5_DEBUG" \
-    "$HOST_MEM" "$VRAM_SIZE"; do
+    "$HOST_MEM" "$VRAM_SIZE" "$EVIDENCE_TEST_ID" "$EVIDENCE_TOKEN"; do
     [[ "$invocation_value" != *$'\n'* && "$invocation_value" != *$'\r'* && \
        "$invocation_value" != *$'\t'* ]] || \
         error "control whitespace is not allowed in invocation values"
 done
+[[ -z "$EVIDENCE_TEST_ID" && -z "$EVIDENCE_TOKEN" ]] || {
+    valid_evidence_test_id "$EVIDENCE_TEST_ID" || \
+        error "无效的证据测试标识：${EVIDENCE_TEST_ID}"
+    [[ "$EVIDENCE_TOKEN" =~ ^[0-9a-f]{32}$ ]] || \
+        error "无效的证据边界 token"
+}
+if [[ "$STRICT_ACCEPTANCE" == "1" && \
+      ( -z "$EVIDENCE_TEST_ID" || -z "$EVIDENCE_TOKEN" ) ]]; then
+    error "strict 验收要求由 runner 管理证据边界"
+fi
 ARTIFACT_DIR="$(realpath -m -- "$ARTIFACT_DIR")"
 case "$ARTIFACT_DIR" in
     "${COSIM_DIR}/artifacts/"*) ;;
@@ -258,7 +279,12 @@ fi
     error "--gem5-bin must resolve to ${CANONICAL_GEM5_BIN}"
 C_GEM5_BIN="/gem5/build/VEGA_X86/gem5.opt"
 C_GEM5_CONFIG="/gem5/configs/example/gpufs/mi300_cosim.py"
+C_GEM5_EVIDENCE="/cosim-artifacts/gem5-evidence.tsv"
+GEM5_EVIDENCE="${ARTIFACT_DIR}/gem5-evidence.tsv"
 GEM5_CONFIG_ARGS="defaults:num-gpus=${NUM_GPUS},num-cus=${NUM_CUS},host-mem=${HOST_MEM},vram-size=${VRAM_SIZE}"
+if [[ -n "$EVIDENCE_TEST_ID" ]]; then
+    GEM5_CONFIG_ARGS+=";evidence-test-id=${EVIDENCE_TEST_ID},evidence-token=${EVIDENCE_TOKEN}"
+fi
 if [[ -n "$GEM5_DEBUG" ]]; then
     GEM5_CONFIG_ARGS+=";debug-flags=${GEM5_DEBUG}"
 fi
@@ -466,6 +492,10 @@ mkdir -p "$ARTIFACT_DIR"
     echo "share_dir=${SHARE_DIR}"
     echo "gem5_binary=${GEM5_BIN}"
     echo "gem5_container_binary=${C_GEM5_BIN}"
+    echo "gem5_evidence=${GEM5_EVIDENCE}"
+    echo "gem5_container_evidence=${C_GEM5_EVIDENCE}"
+    echo "gem5_evidence_test_id=${EVIDENCE_TEST_ID}"
+    echo "gem5_evidence_token=${EVIDENCE_TOKEN}"
     echo "gem5_config_args=${GEM5_CONFIG_ARGS}"
     echo "gem5_docker_image=${GEM5_DOCKER_IMAGE}"
     echo "qemu_binary=${QEMU_BIN}"
@@ -592,6 +622,9 @@ fi
 
 step "Starting gem5 MI300X GPU model in Docker..."
 
+[[ ! -e "$GEM5_EVIDENCE" && ! -L "$GEM5_EVIDENCE" ]] || \
+    error "本次运行的 gem5 证据路径已经存在：${GEM5_EVIDENCE}"
+
 GEM5_DOCKER_CMD=(
     docker run -d
     --name "$GEM5_CONTAINER"
@@ -601,9 +634,16 @@ GEM5_DOCKER_CMD=(
     -v "${GEM5_DIR}:/gem5"
     -v /tmp:/tmp
     -v /dev/shm:/dev/shm
+    -v "${ARTIFACT_DIR}:/cosim-artifacts"
     -w /gem5
     -e "PYTHONPATH=/usr/lib/python3.12/lib-dynload"
     "$GEM5_DOCKER_IMAGE"
+    # 在容器内、gem5 exec 前合并 stderr，保证 Docker 只为一个有序流打时间戳。
+    # 最终验证器会逐字验证这个 wrapper，再与 gem5 自报 argv 对照。
+    /bin/sh
+    -c
+    'exec "$@" 2>&1'
+    cosim-gem5
     "$C_GEM5_BIN"
 )
 
@@ -617,11 +657,20 @@ GEM5_DOCKER_CMD+=(
     "--socket-path=$SOCKET_PATH"
     "--shmem-path=$SHMEM_PATH"
     "--shmem-host-path=$SHMEM_HOST_PATH"
+    "--evidence-path=$C_GEM5_EVIDENCE"
+    "--evidence-run-id=$COSIM_RUN_ID"
     "--dgpu-mem-size=$VRAM_SIZE"
     "--num-compute-units=$NUM_CUS"
     "--mem-size=$HOST_MEM"
     "--num-gpus=$NUM_GPUS"
 )
+
+if [[ -n "$EVIDENCE_TEST_ID" ]]; then
+    GEM5_DOCKER_CMD+=(
+        "--evidence-test-id=$EVIDENCE_TEST_ID"
+        "--evidence-token=$EVIDENCE_TOKEN"
+    )
+fi
 
 "${GEM5_DOCKER_CMD[@]}" >/dev/null
 

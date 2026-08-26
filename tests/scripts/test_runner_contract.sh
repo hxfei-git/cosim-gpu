@@ -7,6 +7,7 @@ COSIM_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 HOST_RUNNER="${COSIM_DIR}/scripts/run_cosim_tests.sh"
 LAUNCHER="${COSIM_DIR}/scripts/cosim_launch.sh"
 PREFLIGHT="${COSIM_DIR}/scripts/cosim_preflight.sh"
+GEM5_CONFIG="${COSIM_DIR}/gem5/configs/example/gpufs/mi300_cosim.py"
 FIXTURE_DIR="$(mktemp -d /tmp/cosim-runner-contract.XXXXXX)"
 trap 'rm -rf -- "$FIXTURE_DIR"' EXIT
 
@@ -56,6 +57,51 @@ if TEST_BUILD_DIR="$FIXTURE_DIR" TEST_TIMEOUT_SECS=2 \
     "${COSIM_DIR}/tests/run_tests.sh" goo >/dev/null 2>&1; then
     fail "substring filter was accepted"
 fi
+GUEST_EMPTY_LOG="${FIXTURE_DIR}/guest-explicit-empty.log"
+if TEST_BUILD_DIR="$FIXTURE_DIR" TEST_TIMEOUT_SECS=2 \
+    "${COSIM_DIR}/tests/run_tests.sh" '' >"$GUEST_EMPTY_LOG" 2>&1; then
+    fail "Guest test runner 接受了显式空位置参数"
+fi
+grep -Fq 'Invalid test name:' "$GUEST_EMPTY_LOG" || \
+    fail "Guest test runner 未将显式空位置参数判定为非法 ID"
+if grep -Fq '[RUN] good' "$GUEST_EMPTY_LOG"; then
+    fail "Guest test runner 将显式空位置参数退化为了 all-mode"
+fi
+GUEST_SECOND_POSITION_LOG="${FIXTURE_DIR}/guest-second-position.log"
+if TEST_BUILD_DIR="$FIXTURE_DIR" TEST_TIMEOUT_SECS=2 \
+    "${COSIM_DIR}/tests/run_tests.sh" good good \
+    >"$GUEST_SECOND_POSITION_LOG" 2>&1; then
+    fail "Guest test runner 接受了第二个位置参数"
+fi
+grep -Fxq 'Only one exact test name may be supplied.' \
+    "$GUEST_SECOND_POSITION_LOG" || \
+    fail "Guest test runner 第二位置参数拒绝缺少精确诊断"
+if grep -Fq '[RUN] good' "$GUEST_SECOND_POSITION_LOG"; then
+    fail "Guest test runner 在拒绝第二位置参数前执行了 fixture"
+fi
+PROGRAM_ID_128="$(printf 'a%.0s' {1..128})"
+PROGRAM_ID_129="${PROGRAM_ID_128}a"
+make_fixture "$PROGRAM_ID_128" \
+    "echo '[PASS] ${PROGRAM_ID_128}'; exit 0"
+TEST_BUILD_DIR="$FIXTURE_DIR" TEST_TIMEOUT_SECS=2 \
+    "${COSIM_DIR}/tests/run_tests.sh" "$PROGRAM_ID_128" >/dev/null || \
+    fail "Guest test runner 拒绝了 128 字符 program ID"
+make_fixture "$PROGRAM_ID_129" \
+    "echo '[PASS] ${PROGRAM_ID_129}'; exit 0"
+if TEST_BUILD_DIR="$FIXTURE_DIR" TEST_TIMEOUT_SECS=2 \
+    "${COSIM_DIR}/tests/run_tests.sh" "$PROGRAM_ID_129" >/dev/null 2>&1; then
+    fail "Guest test runner 接受了 129 字符 program ID"
+fi
+
+GUEST_ALL_DIR="${FIXTURE_DIR}/guest-all"
+mkdir "$GUEST_ALL_DIR"
+cp -- "${FIXTURE_DIR}/good" "${GUEST_ALL_DIR}/good"
+GUEST_ALL_LOG="${FIXTURE_DIR}/guest-no-argument.log"
+TEST_BUILD_DIR="$GUEST_ALL_DIR" TEST_TIMEOUT_SECS=2 \
+    "${COSIM_DIR}/tests/run_tests.sh" >"$GUEST_ALL_LOG" 2>&1 || \
+    fail "Guest test runner 的真正无参数 all-mode 发生回归"
+grep -Fq '[RUN] good' "$GUEST_ALL_LOG" || \
+    fail "Guest test runner 的真正无参数 all-mode 未执行 fixture"
 
 # Host runner 的证据文件必须在 launcher 启动前固化。
 runner_help="$($HOST_RUNNER --help)"
@@ -67,6 +113,24 @@ grep -Fq '1：strict v2 候选；要求顶层仓库与 gem5/ clean' <<<"$runner_
     fail "runner help 未说明 strict clean-tree 门禁"
 grep -Fq '且 tracked baseline lock 与 HEAD 一致' <<<"$runner_help" || \
     fail "runner help 未说明 strict tracked-lock 门禁"
+
+HOST_EMPTY_LOG="${FIXTURE_DIR}/host-explicit-empty.log"
+if COSIM_RUN_ID=contract-explicit-empty \
+    "$HOST_RUNNER" '' >"$HOST_EMPTY_LOG" 2>&1; then
+    fail "Host runner 接受了显式空位置参数"
+fi
+grep -Fq 'invalid operator name:' "$HOST_EMPTY_LOG" || \
+    fail "Host runner 未将显式空位置参数判定为非法 ID"
+if grep -Fq 'Host-side single-operator cosim test runner.' "$HOST_EMPTY_LOG"; then
+    fail "Host runner 将显式空位置参数退化为了 usage 成功路径"
+fi
+HOST_NO_ARGUMENT_LOG="${FIXTURE_DIR}/host-no-argument.log"
+COSIM_RUN_ID=contract-no-argument \
+    "$HOST_RUNNER" >"$HOST_NO_ARGUMENT_LOG" 2>&1 || \
+    fail "Host runner 的真正无参数 usage 路径发生回归"
+grep -Fq 'Host-side single-operator cosim test runner.' \
+    "$HOST_NO_ARGUMENT_LOG" || \
+    fail "Host runner 的真正无参数调用未显示 usage"
 
 # shellcheck disable=SC2016
 launch_line="$(grep -nF 'setsid stdbuf -oL -eL "$LAUNCH_SCRIPT"' "$HOST_RUNNER" | cut -d: -f1)"
@@ -88,8 +152,9 @@ grep -Fq "cosim_print_shell_words \"\${PASSTHROUGH_ARGS[@]}\"" "$HOST_RUNNER" ||
     fail "runner passthrough argv 没有使用统一序列化合同"
 grep -Fq "cosim_print_shell_words \"\${ORIGINAL_ARGS[@]}\"" "$LAUNCHER" || \
     fail "launcher argv 没有使用统一序列化合同"
-grep -Fq -- '--share-dir|--artifact-dir)' "$HOST_RUNNER" || \
-    fail "runner-owned launcher paths are not rejected"
+grep -Fq -- '--share-dir|--artifact-dir|--evidence-test-id|--evidence-token)' \
+    "$HOST_RUNNER" || \
+    fail "runner 未拒绝调用方覆盖内部 launcher 路径或证据身份"
 # shellcheck disable=SC2016
 grep -Fq 'cp -- "$GUEST_SCRIPT_ARCHIVE" "$GUEST_SCRIPT_HOST"' "$HOST_RUNNER" || \
     fail "Guest staging script is not copied from the archived script"
@@ -184,6 +249,65 @@ grep -Fq "date -u +'%Y-%m-%dT%H:%M:%S.%9NZ'" "$HOST_RUNNER" || \
 grep -Fq 'gem5_log_sha256=${GEM5_LOG_SHA256}' "$HOST_RUNNER" || \
     fail "runner 未在 metadata 记录 gem5.log SHA256"
 # shellcheck disable=SC2016
+grep -Fq 'evidence-boundaries "$GEM5_EVIDENCE"' "$HOST_RUNNER" || \
+    fail "runner 未从结构化 gem5 证据读取流内 BEGIN/END 边界"
+# shellcheck disable=SC2016
+grep -Fq 'GEM5_EVIDENCE_START_SEQ=""' "$HOST_RUNNER" || \
+    fail "runner 未允许失败 artifact 的 BEGIN seq 留空"
+# shellcheck disable=SC2016
+grep -Fq 'GEM5_EVIDENCE_END_SEQ=""' "$HOST_RUNNER" || \
+    fail "runner 未允许失败 artifact 的 END seq 留空"
+grep -Fq 'boundary_capture_attempts=1' "$HOST_RUNNER" || \
+    fail "非零 result 未使用单次最佳努力 boundary 捕获"
+grep -Fq 'boundary_capture_attempts=10' "$HOST_RUNNER" || \
+    fail "成功 result 未保留有界 boundary closure 重试"
+# shellcheck disable=SC2016
+missing_boundary_error_line="$(grep -nF \
+    'error "[${TEST_NAME}] 无法确认 gem5 证据流内已闭合的边界"' \
+    "$HOST_RUNNER" | cut -d: -f1)"
+[[ -n "$missing_boundary_error_line" ]] || \
+    fail "runner 缺少成功结果的 boundary closure 门禁"
+# shellcheck disable=SC2016
+sed -n "$((missing_boundary_error_line - 1)),${missing_boundary_error_line}p" \
+    "$HOST_RUNNER" | grep -Fq 'elif [[ "$result_rc" -eq 0 ]]; then' || \
+    fail "boundary capture 缺失仍会截断非零 result 的归档路径"
+# shellcheck disable=SC2016
+invalid_boundary_error_line="$(grep -nF \
+    'error "[${TEST_NAME}] gem5 证据流内边界无效"' \
+    "$HOST_RUNNER" | cut -d: -f1)"
+# shellcheck disable=SC2016
+sed -n "$((invalid_boundary_error_line - 1)),${invalid_boundary_error_line}p" \
+    "$HOST_RUNNER" | grep -Fq 'if [[ "$result_rc" -eq 0 ]]; then' || \
+    fail "boundary 解析失败仍会截断非零 result 的归档路径"
+# shellcheck disable=SC2016
+grep -Fq 'if [[ "$result_rc" -eq 0 && ! -x "$EVIDENCE_BOUNDARY_BINARY" ]]' \
+    "$HOST_RUNNER" || \
+    fail "helper 缺失门禁未限制为成功 result"
+for key in gem5_evidence_start_seq gem5_evidence_end_seq \
+           gem5_evidence_test_id gem5_evidence_token \
+           gem5_evidence_sha256; do
+    grep -Fq "${key}=" "$HOST_RUNNER" || \
+        fail "runner metadata 缺少 ${key}"
+done
+# shellcheck disable=SC2016
+grep -Fq 'stable-sha256 "$GEM5_EVIDENCE"' "$HOST_RUNNER" || \
+    fail "runner 未稳定哈希结构化 gem5 证据"
+# shellcheck disable=SC2016
+grep -Fq -- '-v "${ARTIFACT_DIR}:/cosim-artifacts"' "$LAUNCHER" || \
+    fail "launcher 未绑定 run-scoped artifact 证据目录"
+# shellcheck disable=SC2016
+grep -Fq '"--evidence-path=$C_GEM5_EVIDENCE"' "$LAUNCHER" || \
+    fail "launcher 未传递固定容器证据路径"
+# shellcheck disable=SC2016
+grep -Fq '"--evidence-run-id=$COSIM_RUN_ID"' "$LAUNCHER" || \
+    fail "launcher 未将结构化证据绑定 run ID"
+# shellcheck disable=SC2016
+grep -Fq '"--evidence-test-id=$EVIDENCE_TEST_ID"' "$LAUNCHER" || \
+    fail "launcher 未将 AQL boundary 绑定测试标识"
+# shellcheck disable=SC2016
+grep -Fq '"--evidence-token=$EVIDENCE_TOKEN"' "$LAUNCHER" || \
+    fail "launcher 未将 AQL boundary 绑定 128-bit token"
+# shellcheck disable=SC2016
 grep -Fq 'TOKEN_RUN_SHA256="$(printf '\''%s'\'' "$COSIM_RUN_ID" | sha256sum' \
     "$HOST_RUNNER" || fail "completion token 未绑定 COSIM_RUN_ID 的 SHA256"
 # shellcheck disable=SC2016
@@ -192,6 +316,36 @@ grep -Fq 'TOKEN="COSIM_TEST_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"' \
 # shellcheck disable=SC2016
 grep -Fq 'COMPILE_TOKEN="COSIM_COMPILE_DONE_${TEST_NAME}_${TOKEN_RUN_SHA256}"' \
     "$HOST_RUNNER" || fail "compile completion token 未使用 run ID identity"
+# shellcheck disable=SC2016
+grep -Fq 'BOUNDARY_READY_TOKEN="COSIM_BOUNDARY_READY_${TEST_NAME}_${TOKEN_RUN_SHA256}"' \
+    "$HOST_RUNNER" || fail "helper READY marker 未绑定 run/program identity"
+# shellcheck disable=SC2016
+grep -Fq '[[ "${1:-}" =~ ^[a-z0-9_]{1,128}$ ]]' "$HOST_RUNNER" || \
+    fail "runner 未统一 1..128 字符 program ID"
+# shellcheck disable=SC2016
+grep -Fq 'valid_test_id "$FILTER"' "$HOST_RUNNER" || \
+    fail "runner single/repeat 入口未调用统一 program ID validator"
+# shellcheck disable=SC2016
+grep -Fq 'valid_evidence_test_id "$EVIDENCE_TEST_ID"' "$LAUNCHER" || \
+    fail "launcher 未统一 1..128 字符 evidence test ID"
+grep -Fq 'export LC_ALL=C' "$HOST_RUNNER" || \
+    fail "runner program ID validator 未固定 ASCII locale"
+grep -Fq 'export LC_ALL=C' "$LAUNCHER" || \
+    fail "launcher test ID validator 未固定 ASCII locale"
+grep -Fq 're.fullmatch(r"[a-z0-9_]{1,128}", evidence_test_id)' \
+    "$GEM5_CONFIG" || fail "gem5 Python config 未统一 1..128 字符 test ID"
+# shellcheck disable=SC2016
+grep -Fq 'stable-sha256 "$canonical_path"' "$HOST_RUNNER" || \
+    fail "Host 未在 ack 前稳定复核 helper"
+# shellcheck disable=SC2016
+grep -Fq 'sync -f "${RUNNER_ARTIFACT_DIR}/runner-invocation.txt"' \
+    "$HOST_RUNNER" || fail "runner invocation helper 锚点未在 ack 前持久化"
+# shellcheck disable=SC2016
+grep -Fq 'ln -- "$ack_tmp" "$EVIDENCE_BOUNDARY_ACK"' "$HOST_RUNNER" || \
+    fail "helper ack 未使用 no-clobber 原子发布"
+# shellcheck disable=SC2016
+grep -Fq '"$EVIDENCE_BOUNDARY_BINARY_CANONICAL")' "$HOST_RUNNER" || \
+    fail "runner 缺少 helper 最终稳定重哈希"
 # shellcheck disable=SC2016
 grep -Fq 'stable-sha256 "$SCREEN_LOG"' "$HOST_RUNNER" || \
     fail "runner 未使用 O_NOFOLLOW 稳定快照哈希 QEMU 日志"
@@ -207,13 +361,30 @@ session_closed_line="$(grep -nF 'exec {CONTROL_FD}>&-' "$HOST_RUNNER" | cut -d: 
 qemu_hash_line="$(grep -nF 'stable-sha256 "$SCREEN_LOG"' "$HOST_RUNNER" | cut -d: -f1)"
 # shellcheck disable=SC2016
 gem5_hash_line="$(grep -nF 'stable-sha256 "$GEM5_LOG"' "$HOST_RUNNER" | cut -d: -f1)"
+# shellcheck disable=SC2016
+evidence_hash_line="$(grep -nF 'stable-sha256 "$GEM5_EVIDENCE"' \
+    "$HOST_RUNNER" | cut -d: -f1)"
 classifier_line="$(grep -nF 'classify_runs.py' "$HOST_RUNNER" | tail -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016
+metadata_line="$(grep -nF '} > "${RUNNER_ARTIFACT_DIR}/runner-metadata.txt"' \
+    "$HOST_RUNNER" | cut -d: -f1)"
+# shellcheck disable=SC2016
+cleanup_line="$(grep -nF 'step "[${TEST_NAME}] Cleaning up detached session' \
+    "$HOST_RUNNER" | cut -d: -f1)"
+# shellcheck disable=SC2016
+matrix_line="$(grep -nF '} > "${RUNNER_ARTIFACT_DIR}/matrix.tsv"' \
+    "$HOST_RUNNER" | cut -d: -f1)"
 [[ -n "$session_closed_line" && -n "$qemu_hash_line" && \
-   -n "$gem5_hash_line" && -n "$classifier_line" && \
+   -n "$gem5_hash_line" && -n "$evidence_hash_line" && \
+   -n "$metadata_line" && -n "$cleanup_line" && -n "$classifier_line" && \
+   -n "$matrix_line" && \
+   "$metadata_line" -lt "$cleanup_line" && \
    "$session_closed_line" -lt "$qemu_hash_line" && \
    "$qemu_hash_line" -lt "$gem5_hash_line" && \
-   "$gem5_hash_line" -lt "$classifier_line" ]] || \
-    fail "QEMU log stable hash 必须位于 cleanup 完成后、classifier 之前"
+   "$gem5_hash_line" -lt "$evidence_hash_line" && \
+   "$evidence_hash_line" -lt "$classifier_line" && \
+   "$classifier_line" -lt "$matrix_line" ]] || \
+    fail "失败结果未保持 metadata、cleanup、稳定哈希、verdict、matrix 完整归档顺序"
 # shellcheck disable=SC2016
 [[ "$(grep -Fc 'echo "strict_acceptance=${STRICT_ACCEPTANCE}"' \
     "$HOST_RUNNER")" -eq 2 ]] || \
@@ -255,6 +426,14 @@ fi
 if "$HOST_RUNNER" --artifact-dir /tmp vector_add >/dev/null 2>&1; then
     fail "runner accepted a caller-owned --artifact-dir"
 fi
+if "$HOST_RUNNER" --evidence-test-id vector_add vector_add \
+        >/dev/null 2>&1; then
+    fail "runner 接受了调用方提供的 --evidence-test-id"
+fi
+if "$HOST_RUNNER" --evidence-token 00000000000000000000000000000000 \
+        vector_add >/dev/null 2>&1; then
+    fail "runner 接受了调用方提供的 --evidence-token"
+fi
 if "$HOST_RUNNER" --gem5-bin /tmp/external-gem5.opt vector_add >/dev/null 2>&1; then
     fail "runner accepted a gem5 binary from another source tree"
 fi
@@ -277,7 +456,8 @@ mkdir -p "${PRODUCER_ROOT}/scripts" "${PRODUCER_ROOT}/tests/kernels" \
 cp "$HOST_RUNNER" "$PRODUCER_RUNNER"
 cp "${COSIM_DIR}/scripts/cosim_lib.sh" \
     "${COSIM_DIR}/scripts/cosim_guest_env.sh" \
-    "${COSIM_DIR}/scripts/cosim_log_evidence.py" "${PRODUCER_ROOT}/scripts/"
+    "${COSIM_DIR}/scripts/cosim_log_evidence.py" \
+    "${COSIM_DIR}/scripts/classify_runs.py" "${PRODUCER_ROOT}/scripts/"
 cp "$LAUNCHER" "$STRICT_LAUNCHER"
 cat > "${PRODUCER_ROOT}/scripts/cosim_build.sh" <<'EOF'
 #!/bin/bash
@@ -290,21 +470,77 @@ cat > "$PRODUCER_LAUNCHER" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 artifact_dir=""
+share_dir=""
+evidence_test_id=""
 while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--artifact-dir" ]]; then
-        artifact_dir="$2"
-        shift 2
-    else
-        shift
-    fi
+    case "$1" in
+        --artifact-dir) artifact_dir="$2"; shift 2 ;;
+        --share-dir) share_dir="$2"; shift 2 ;;
+        --evidence-test-id) evidence_test_id="$2"; shift 2 ;;
+        --evidence-token) shift 2 ;;
+        *) shift ;;
+    esac
 done
 [[ -n "$artifact_dir" ]] || exit 2
+if [[ "${COSIM_RUN_ID:-}" != "archive-compile-failure" && \
+      "${COSIM_RUN_ID:-}" != "archive-open-boundary" ]]; then
+    printf '%s\n' \
+        'result=PASS' \
+        'primary_category=infra_unknown' \
+        'secondary_category=none' > "${artifact_dir}/cleanup-status.txt"
+    echo '[FAKE_LAUNCH_REACHED]'
+    exit 1
+fi
+[[ -n "$share_dir" && -n "$evidence_test_id" ]] || exit 2
+cleanup() {
+    printf '%s\n' \
+        'result=PASS' \
+        'primary_category=test_fail' \
+        'secondary_category=none' > "${artifact_dir}/cleanup-status.txt"
+    exit 0
+}
+trap cleanup INT TERM
+run_sha256="$(printf '%s' "$COSIM_RUN_ID" | sha256sum | awk '{print $1}')"
+printf 'gem5 simulation started\n' > "${artifact_dir}/gem5.log"
 printf '%s\n' \
-    'result=PASS' \
-    'primary_category=infra_unknown' \
-    'secondary_category=none' > "${artifact_dir}/cleanup-status.txt"
-echo '[FAKE_LAUNCH_REACHED]'
-exit 1
+    $'schema\trun_id\tseq\ttick\tevent\tgpu\tdispatch\twg\tcu' \
+    $'COSIM_GPU_EVIDENCE_V1\t'"${COSIM_RUN_ID}"$'\t0\t0\tsession_start\t-1\t-1\t-1\t-1' \
+    > "${artifact_dir}/gem5-evidence.tsv"
+echo 'root@gem5:~#'
+IFS= read -r _guest_command || true
+echo '[COSIM_ENV] HSA_ENABLE_INTERRUPT=0'
+echo '[COSIM_TIMEOUT] TEST_TIMEOUT_SECS=1'
+if [[ "$COSIM_RUN_ID" == "archive-compile-failure" ]]; then
+    echo "__COSIM_COMPILE_DONE_${evidence_test_id}_${run_sha256}__:2"
+    echo "__COSIM_TEST_DONE_${evidence_test_id}_${run_sha256}__:2"
+else
+    mkdir -p "${share_dir}/build" "${share_dir}/tools-build"
+    printf 'fixture test binary\n' > "${share_dir}/build/${evidence_test_id}"
+    printf 'fixture boundary helper\n' > \
+        "${share_dir}/tools-build/cosim_evidence_boundary"
+    chmod +x "${share_dir}/build/${evidence_test_id}" \
+        "${share_dir}/tools-build/cosim_evidence_boundary"
+    boundary_sha256="$(sha256sum \
+        "${share_dir}/tools-build/cosim_evidence_boundary" | awk '{print $1}')"
+    printf '%s\n' \
+        $'COSIM_GPU_EVIDENCE_V1\t'"${COSIM_RUN_ID}"$'\t1\t1\tclient_connected\t0\t-1\t-1\t-1' \
+        $'COSIM_GPU_EVIDENCE_V1\t'"${COSIM_RUN_ID}"$'\t2\t2\ttest_begin\t0\t-1\t-1\t-1' \
+        >> "${artifact_dir}/gem5-evidence.tsv"
+    echo "__COSIM_COMPILE_DONE_${evidence_test_id}_${run_sha256}__:0"
+    echo "__COSIM_BOUNDARY_READY_${evidence_test_id}_${run_sha256}__:${boundary_sha256}"
+    ack_path="${share_dir}/.cosim_evidence_boundary_ack.${run_sha256}"
+    for ((attempt=0; attempt<100; attempt++)); do
+        if [[ -f "$ack_path" && ! -L "$ack_path" ]]; then
+            rm -f -- "$ack_path"
+            break
+        fi
+        sleep 0.1
+    done
+    echo "__COSIM_TEST_DONE_${evidence_test_id}_${run_sha256}__:7"
+fi
+while true; do
+    sleep 1
+done
 EOF
 chmod +x "$PRODUCER_RUNNER" "$PRODUCER_LAUNCHER" "$STRICT_LAUNCHER" \
     "${PRODUCER_ROOT}/scripts/cosim_build.sh"
@@ -384,7 +620,7 @@ write_producer_metadata() {
         "docker_image=${docker_image}" > "$PRODUCER_GEM5_META"
 }
 
-run_producer_case() {
+run_producer_exact_case() {
     local case_name="$1"
     local strict_acceptance="${COSIM_STRICT_ACCEPTANCE:-0}"
     shift
@@ -394,7 +630,29 @@ run_producer_case() {
         --session-name "contract-${case_name}" \
         --boot-timeout 1 \
         --output-dir "${PRODUCER_ROOT}/artifacts/${case_name}" \
-        "$@" vector_add > "${PRODUCER_ROOT}/${case_name}.log" 2>&1
+        "$@" > "${PRODUCER_ROOT}/${case_name}.log" 2>&1
+}
+
+run_producer_case() {
+    local case_name="$1"
+    shift
+    run_producer_exact_case "$case_name" "$@" vector_add
+}
+
+run_archive_failure_case() {
+    local case_name="$1"
+    local artifact_dir="${PRODUCER_ROOT}/artifacts/${case_name}"
+
+    PATH="${PRODUCER_FAKE_BIN}:${PATH}" \
+        PYTHONDONTWRITEBYTECODE=1 COSIM_STRICT_ACCEPTANCE=0 \
+        COSIM_RUN_ID="$case_name" \
+        "$PRODUCER_RUNNER" \
+        --session-name "contract-${case_name}" \
+        --boot-timeout 3 \
+        --test-timeout 1 \
+        --guest-run-timeout 15 \
+        --output-dir "$artifact_dir" \
+        vector_add > "${PRODUCER_ROOT}/${case_name}.log" 2>&1
 }
 
 for control_whitespace in $'\n' $'\r' $'\t'; do
@@ -434,6 +692,59 @@ assert_snapshot_hash() {
 }
 
 write_producer_metadata
+
+if run_producer_exact_case producer-second-position \
+        vector_add vector_add; then
+    fail "copied Host runner 接受了第二个位置参数"
+fi
+grep -Fq 'only one operator name may be supplied' \
+    "${PRODUCER_ROOT}/producer-second-position.log" || \
+    fail "copied Host runner 第二位置参数拒绝缺少精确诊断"
+[[ ! -e "${PRODUCER_ROOT}/artifacts/producer-second-position" ]] || \
+    fail "copied Host runner 在拒绝第二位置参数前创建了 artifact"
+if grep -Fq '[FAKE_LAUNCH_REACHED]' \
+        "${PRODUCER_ROOT}/producer-second-position.log"; then
+    fail "copied Host runner 的第二位置参数到达了 fake launcher"
+fi
+
+assert_single_mode_child() {
+    local case_name="$1"
+    local expected_session="$2"
+    local case_root="${PRODUCER_ROOT}/artifacts/${case_name}"
+    local child_invocation child_artifact expected_argv
+    local -a child_invocations=()
+
+    mapfile -d '' -t child_invocations < <(
+        find "$case_root" -type f -name runner-invocation.txt -print0
+    )
+    [[ "${#child_invocations[@]}" -eq 1 ]] || \
+        fail "${case_name} 未生成唯一 child runner invocation"
+    child_invocation="${child_invocations[0]}"
+    child_artifact="${child_invocation%/runner-invocation.txt}"
+    printf -v expected_argv \
+        'argv= --session-name %q --boot-timeout 1 --test-timeout 60 --guest-run-timeout 1800 --output-dir %q vector_add' \
+        "$expected_session" "$child_artifact"
+    grep -Fxq "$expected_argv" "$child_invocation" || \
+        fail "${case_name} child runner argv 不符合单 program 合同"
+    grep -Fxq 'runner_argument=vector_add' "$child_invocation" || \
+        fail "${case_name} child runner 未归档 canonical program"
+    grep -Fq '[FAKE_LAUNCH_REACHED]' "${child_artifact}/qemu.log" || \
+        fail "${case_name} child 未到达隔离 fake launcher"
+}
+
+if run_producer_exact_case producer-repeat-one --repeat 1 vector_add; then
+    fail "repeat fixture 在 fake launcher 失败后意外成功"
+fi
+assert_single_mode_child \
+    producer-repeat-one contract-producer-repeat-one-repeat-1
+
+if run_producer_exact_case producer-all-one --all; then
+    fail "all fixture 在 fake launcher 失败后意外成功"
+fi
+VECTOR_ADD_SHA256="$(printf '%s' vector_add | sha256sum | awk '{print $1}')"
+assert_single_mode_child producer-all-one \
+    "contract-producer-all-one-all-${VECTOR_ADD_SHA256:0:16}"
+
 if run_producer_case producer-valid; then
     fail "producer fixture unexpectedly completed a fake launch"
 fi
@@ -447,6 +758,69 @@ python3 -B "${PRODUCER_ROOT}/scripts/cosim_log_evidence.py" render-guest-script 
     --test-timeout 60 > "$EXPECTED_GUEST_SCRIPT"
 cmp -s "$EXPECTED_GUEST_SCRIPT" "${VALID_ARTIFACT}/guest-run.sh" || \
     fail "producer did not archive the shared canonical Guest script"
+MIN_TIMEOUT_GUEST_SCRIPT="${FIXTURE_DIR}/minimum-timeout-guest-run.sh"
+python3 -B "${PRODUCER_ROOT}/scripts/cosim_log_evidence.py" render-guest-script \
+    --program vector_add --run-id producer-timeout-one \
+    --hsa-enable-interrupt 0 --test-timeout 1 > "$MIN_TIMEOUT_GUEST_SCRIPT"
+boundary_handshake_budget="$(sed -n \
+    's/^boundary_handshake_timeout_secs=//p' "$MIN_TIMEOUT_GUEST_SCRIPT")"
+[[ "$boundary_handshake_budget" =~ ^[0-9]+$ && \
+   "$boundary_handshake_budget" -ge 30 ]] || \
+    fail "TEST_TIMEOUT=1 未获得至少 30 秒的独立 boundary handshake 预算"
+grep -Fq 'boundary_wait<boundary_handshake_timeout_secs' \
+    "$MIN_TIMEOUT_GUEST_SCRIPT" || \
+    fail "Guest ack 等待未使用独立 boundary handshake 预算"
+# shellcheck disable=SC2016
+[[ "$(grep -Fc \
+    'timeout --signal=TERM "${boundary_handshake_timeout_secs}s"' \
+    "$MIN_TIMEOUT_GUEST_SCRIPT")" -eq 2 ]] || \
+    fail "BEGIN/END helper 未统一使用独立 boundary handshake 预算"
+grep -Fq 'TEST_TIMEOUT_SECS=1 ./run_tests.sh vector_add' \
+    "$MIN_TIMEOUT_GUEST_SCRIPT" || \
+    fail "workload 未继续使用调用方 TEST_TIMEOUT=1"
+ack_loop_line="$(grep -nF 'boundary_wait<boundary_handshake_timeout_secs' \
+    "$MIN_TIMEOUT_GUEST_SCRIPT" | cut -d: -f1)"
+# shellcheck disable=SC2016
+ack_final_check_line="$(grep -nF 'if [[ -e "$boundary_ack" || -L "$boundary_ack" ]]; then' \
+    "$MIN_TIMEOUT_GUEST_SCRIPT" | tail -n 1 | cut -d: -f1)"
+ack_timeout_line="$(grep -nF '__:124"' "$MIN_TIMEOUT_GUEST_SCRIPT" | \
+    cut -d: -f1)"
+[[ -n "$ack_loop_line" && -n "$ack_final_check_line" && \
+   -n "$ack_timeout_line" && "$ack_loop_line" -lt "$ack_final_check_line" && \
+   "$ack_final_check_line" -lt "$ack_timeout_line" ]] || \
+    fail "Guest ack 等待缺少完整预算结束后的末次检查"
+# shellcheck disable=SC2016
+begin_line="$(grep -nF '"$boundary_tool" begin "$boundary_token"' \
+    "$EXPECTED_GUEST_SCRIPT" | cut -d: -f1)"
+ready_line="$(grep -nF 'echo "__COSIM_BOUNDARY_READY_vector_add_' \
+    "$EXPECTED_GUEST_SCRIPT" | cut -d: -f1)"
+# shellcheck disable=SC2016
+ack_line="$(grep -nF 'boundary_ack_sha256="$(sed -n' \
+    "$EXPECTED_GUEST_SCRIPT" | cut -d: -f1)"
+# shellcheck disable=SC2016
+pre_begin_hash_line="$(grep -nF 'boundary_pre_begin_sha256="$(sha256sum' \
+    "$EXPECTED_GUEST_SCRIPT" | cut -d: -f1)"
+target_line="$(grep -nF './run_tests.sh vector_add' \
+    "$EXPECTED_GUEST_SCRIPT" | cut -d: -f1)"
+# shellcheck disable=SC2016
+pre_end_hash_line="$(grep -nF 'boundary_pre_end_sha256="$(sha256sum' \
+    "$EXPECTED_GUEST_SCRIPT" | cut -d: -f1)"
+# shellcheck disable=SC2016
+end_line="$(grep -nF '"$boundary_tool" end "$boundary_token"' \
+    "$EXPECTED_GUEST_SCRIPT" | cut -d: -f1)"
+token_line="$(grep -nF 'echo "__COSIM_TEST_DONE_vector_add_' \
+    "$EXPECTED_GUEST_SCRIPT" | tail -n 1 | cut -d: -f1)"
+[[ -n "$ready_line" && -n "$ack_line" && -n "$pre_begin_hash_line" && \
+   -n "$begin_line" && -n "$target_line" && -n "$pre_end_hash_line" && \
+   -n "$end_line" && \
+   -n "$token_line" && "$ready_line" -lt "$ack_line" && \
+   "$ack_line" -lt "$pre_begin_hash_line" && \
+   "$pre_begin_hash_line" -lt "$begin_line" && \
+   "$begin_line" -lt "$target_line" && \
+   "$target_line" -lt "$pre_end_hash_line" && \
+   "$pre_end_hash_line" -lt "$end_line" && \
+   "$end_line" -lt "$token_line" ]] || \
+    fail "canonical Guest 脚本未保证 READY、ack、重哈希、BEGIN、目标、END、完成标记顺序"
 cmp -s "$PRODUCER_GEM5_META" "${VALID_PATCH}/gem5-build-meta.txt" || \
     fail "archived gem5 metadata differs from the validated source"
 cmp -s "$PRODUCER_GEM5_LOCK" "${VALID_PATCH}/gem5-baseline.lock" || \
@@ -475,6 +849,47 @@ grep -Fq 'strict_acceptance=0' "${VALID_ARTIFACT}/runner-invocation.txt" || \
     fail "default producer invocation does not record strict_acceptance=0"
 grep -Fxq 'passthrough_args=' "${VALID_ARTIFACT}/runner-invocation.txt" || \
     fail "空 passthrough 没有序列化为零个参数"
+
+for failure_case in archive-compile-failure archive-open-boundary; do
+    if run_archive_failure_case "$failure_case"; then
+        fail "${failure_case} fixture 意外返回成功"
+    fi
+    failure_artifact="${PRODUCER_ROOT}/artifacts/${failure_case}"
+    [[ -f "${failure_artifact}/runner-metadata.txt" ]] || \
+        fail "${failure_case} 未归档 runner metadata"
+    [[ -f "${failure_artifact}/verdict.json" ]] || {
+        sed -n '1,240p' "${PRODUCER_ROOT}/${failure_case}.log" >&2
+        fail "${failure_case} 未归档 FAIL verdict"
+    }
+    [[ -f "${failure_artifact}/matrix.tsv" ]] || \
+        fail "${failure_case} 未归档单行 matrix"
+    grep -Fxq 'cleanup_status=verified' \
+        "${failure_artifact}/runner-metadata.txt" || \
+        fail "${failure_case} 未完成可证明 cleanup"
+    grep -Fxq 'gem5_evidence_start_seq=' \
+        "${failure_artifact}/runner-metadata.txt" || \
+        fail "${failure_case} 未以空 BEGIN seq 归档失败"
+    grep -Fxq 'gem5_evidence_end_seq=' \
+        "${failure_artifact}/runner-metadata.txt" || \
+        fail "${failure_case} 未以空 END seq 归档失败"
+    python3 -c \
+        'import json,sys; data=json.load(open(sys.argv[1])); assert data["outcome"] == "FAIL"; assert sys.argv[2] in data["reasons"]' \
+        "${failure_artifact}/verdict.json" \
+        "$([[ "$failure_case" == archive-compile-failure ]] && \
+            printf compile_failure || printf nonzero_test_exit)" || \
+        fail "${failure_case} verdict 缺少精确失败原因"
+    awk -F '\t' 'NR == 2 {found = ($5 == "FAIL")} END {exit !found}' \
+        "${failure_artifact}/matrix.tsv" || \
+        fail "${failure_case} matrix 未记录 FAIL"
+done
+compile_evidence="${PRODUCER_ROOT}/artifacts/archive-compile-failure/gem5-evidence.tsv"
+[[ "$(grep -c $'\ttest_begin\t' "$compile_evidence" || true)" -eq 0 && \
+   "$(grep -c $'\ttest_end\t' "$compile_evidence" || true)" -eq 0 ]] || \
+    fail "compile failure fixture 意外产生 boundary"
+open_evidence="${PRODUCER_ROOT}/artifacts/archive-open-boundary/gem5-evidence.tsv"
+[[ "$(grep -c $'\ttest_begin\t' "$open_evidence" || true)" -eq 1 && \
+   "$(grep -c $'\ttest_end\t' "$open_evidence" || true)" -eq 0 ]] || \
+    fail "open boundary fixture 未保留唯一 BEGIN 且缺少 END 的原始证据"
 
 if run_producer_case producer-valid-passthrough \
         --gem5-debug ContractDebugFlag; then

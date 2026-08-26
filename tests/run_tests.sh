@@ -12,18 +12,25 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${TEST_BUILD_DIR:-${SCRIPT_DIR}/build}"
 FILTER=""
+FILTER_SET=0
 JSON=0
 TEST_TIMEOUT_SECS="${TEST_TIMEOUT_SECS:-60}"
+
+valid_test_id() (
+    export LC_ALL=C
+    [[ "${1:-}" =~ ^[a-z0-9_]{1,128}$ ]]
+)
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --json)  JSON=1; shift ;;
         *)
-            [[ -z "$FILTER" ]] || {
+            [[ "$FILTER_SET" -eq 0 ]] || {
                 echo "Only one exact test name may be supplied." >&2
                 exit 2
             }
             FILTER="$1"
+            FILTER_SET=1
             shift
             ;;
     esac
@@ -33,7 +40,7 @@ done
     echo "TEST_TIMEOUT_SECS must be a positive integer." >&2
     exit 2
 }
-[[ -z "$FILTER" || "$FILTER" =~ ^[a-z0-9_]+$ ]] || {
+[[ "$FILTER_SET" -eq 0 ]] || valid_test_id "$FILTER" || {
     echo "Invalid test name: $FILTER" >&2
     exit 2
 }
@@ -47,7 +54,11 @@ TESTS=()
 for bin in "$BUILD_DIR"/*; do
     [[ -x "$bin" ]] || continue
     name="$(basename "$bin")"
-    if [[ -n "$FILTER" && "$name" != "$FILTER" ]]; then
+    valid_test_id "$name" || {
+        echo "Invalid test binary name: $name" >&2
+        exit 2
+    }
+    if [[ "$FILTER_SET" -eq 1 && "$name" != "$FILTER" ]]; then
         continue
     fi
     TESTS+=("$bin")

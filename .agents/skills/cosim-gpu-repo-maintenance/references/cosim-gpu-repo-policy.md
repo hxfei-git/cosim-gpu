@@ -1,83 +1,65 @@
-# Cosim GPU Repository Policy
+# cosim GPU 仓库策略
 
-This file contains project-specific repository maintenance rules. General Git
-practice belongs in the main skill and should not be treated as unique to this
-project.
+本文记录 cosim-gpu 特有的仓库维护规则。通用 Git 操作规范保留在主技能中，不应
+误写成项目独有行为。
 
-## Repository Shape
+## 仓库结构
 
-The top-level repository records two nested repositories:
+顶层仓库包含以下内容：
 
-| Path | Meaning |
+| 路径 | 含义 |
 |---|---|
-| `.agents` | reusable cosim GPU skills vendored in-tree |
-| `gem5` | simulator source submodule |
-| `gem5-resources` | resources and guest image inputs |
+| `.agents` | 直接随仓库维护的可复用 cosim GPU 技能 |
+| `gem5` | 仿真器源码 submodule |
+| `gem5-resources` | 资源与 Guest 镜像输入 submodule |
 
-The superproject records `gem5` and `gem5-resources` commits as gitlinks.
-`.agents` is ordinary top-level content with no separate skill repository or
-gitlink. A dirty submodule work tree is not the same as a changed superproject
-pointer.
+Superproject 使用 gitlink 记录 `gem5` 与 `gem5-resources` 的提交。`.agents` 是普通
+顶层内容，不是独立 skill 仓库或 gitlink。Submodule 工作树 dirty 与 superproject
+指针变化是两种不同状态。
 
-## Skill Location
+## 规则与技能位置
 
-Reusable workflows live in `.agents/skills/` and are tracked directly by this
-repository. Do not add new project-specific command implementations under
-`.claude/commands`.
+顶层代理规则只有 `AGENTS.md` 一个入口。可复用工作流位于 `.agents/skills/` 并由
+本仓库直接跟踪；不得在 `.claude/commands` 下新增项目专用命令实现。技能目录改名
+时必须同步更新 `AGENTS.md` 与合同测试中的路由。
 
-`AGENTS.md` and `CLAUDE.md` map to the top-level agent rules. Keep skill path
-references current when skill folders are renamed.
+## 提交归属
 
-## Commit Ownership
+- `.agents` 内的修改属于顶层仓库，直接提交到 cosim-gpu。
+- `gem5` 或 `gem5-resources` 内的修改必须先在对应 submodule 中提交，再由顶层仓库记录 gitlink。
+- 顶层脚本、文档、测试和忽略规则属于 superproject。
+- 不得把 submodule 内部源码修改与顶层指针更新混成一个 submodule 提交；它们属于不同仓库。
 
-- Changes inside `.agents` are ordinary top-level repository changes and are
-  committed directly in cosim-gpu.
-- Changes inside `gem5` or `gem5-resources` must be committed in that submodule
-  first. Then commit the top-level gitlink pointer.
-- Top-level script, docs, tests, and ignore-rule changes belong to the
-  superproject.
-- Do not mix `gem5` or `gem5-resources` internal source changes and top-level
-  pointer updates in one submodule commit; they are different repositories.
+## 项目提交规则
 
-## Project Commit Rules
+- gem5 应运行 pre-commit 钩子，并在适用时使用 `MAINTAINERS.yaml` 中的标签。
+- 顶层 cosim-gpu 没有项目专用 hook。
+- 除非 submodule 另有身份要求，使用顶层 Git 配置中的身份添加 `Signed-off-by`。
 
-- gem5: pre-commit hooks apply; use tags from `MAINTAINERS.yaml` when relevant.
-- Top-level cosim-gpu: no project-specific hooks.
-- Sign commits with `Signed-off-by` from top-level git config unless the
-  submodule has its own required author identity.
+## 生成物
 
-## Generated Outputs
-
-Default exclude list for commits:
+提交默认排除：
 
 - `artifacts/`
 - `m5out/`
 - `local-cosim-runs/`
 - `*.log`
-- test `.out`, `.strace`, `.gdb`, `.proc`, and guest-run files
-- local scratch scripts or one-off command transcripts unless explicitly
-  promoted to repository scripts or docs
+- 测试 `.out`、`.strace`、`.gdb`、`.proc` 与 guest-run 文件
+- 未明确提升为仓库脚本或正式文档的临时脚本和一次性命令记录
 
-If a generated file is needed as durable evidence, prefer placing a concise
-source document under `docs/` or an artifact summary under a task workspace.
+如需长期保留生成证据，优先在 `docs/` 中编写精简来源文档，或在任务 workspace
+中保存 artifact 摘要。
 
-## Documentation Pairing
+## 文档布局
 
-Project docs under `docs/` must keep both `docs/zh/` and `docs/en/` versions.
-The first line links to the other language version:
+根目录只保留中文 `README.zh.md`。正式项目文档直接放在 `docs/` 下，使用中文
+文件名和中文内容；`docs/文档索引.md` 是统一入口。不得重新引入 `docs/zh/`、
+`docs/en/` 或重复的英文项目文档。
 
-```text
-[English](../en/<file>.md)
-[中文](../zh/<file>.md)
-```
+## 安全检查 submodule 指针
 
-When adding or modifying project docs, update both languages unless the file is
-explicitly a temporary patch or source evidence artifact.
-
-## Safe Submodule Pointer Review
-
-Before committing a submodule pointer (`gem5` or `gem5-resources`; `.agents`
-is vendored and has no pointer):
+提交 submodule 指针前（`gem5` 或 `gem5-resources`；`.agents` 为 vendored 内容，
+没有指针）运行：
 
 ```bash
 git submodule status
@@ -86,19 +68,16 @@ git -C <submodule> log --oneline -1
 git diff --submodule=short -- <submodule>
 ```
 
-If the submodule has local commits, confirm the top-level pointer records the
-intended final commit. If the submodule is dirty, finish or separate that work
-before committing the pointer.
+若 submodule 含本地提交，确认顶层指针记录预期的最终提交。若 submodule 工作树
+dirty，先完成或拆分该工作，再提交指针。
 
-## Splitting Skill Changes
+## 拆分技能修改
 
-For `.agents` skill work (now vendored in this repository), prefer commit
-boundaries by reader-facing behavior:
+`.agents` 技能修改应按读者可感知的行为划分提交边界：
 
-- routing or trigger changes
-- shared review or workflow contracts
-- test, build, or debug reference extraction
-- project policy or repository maintenance skills
+- 路由或触发条件
+- 共享审查或工作流合同
+- 测试、构建或调试参考资料抽取
+- 项目策略或仓库维护技能
 
-After splitting, verify the final tree matches the intended working tree and
-that references point to existing files.
+拆分后确认最终工作树符合预期，并检查所有引用均指向现存文件。

@@ -147,6 +147,6 @@ fi
 launcher 直接运行 cleanup，也不得执行无范围删除。
 
 完整的有界终止、manifest 快照、fallback 与验证范式见
-[Lab 2](../../../../../docs/zh/labs.md#lab-amdgpu-kfd-init)。完成条件是诊断证据已归档、
+[Lab 2](../../../../../docs/学习实验.md#lab-amdgpu-kfd-init)。完成条件是诊断证据已归档、
 launcher process group 不存在、manifest 中列出的 runtime 资源不存在，并且本次
 cleanup 状态为 `PASS`。

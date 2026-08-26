@@ -2,7 +2,6 @@
 name: cosim-gpu-rlcr-loop
 description: Use for iterative cosim implementation, debugging, or validation after cosim-gpu-flow-plan. Runs bounded rounds until frozen acceptance criteria and independent review gates pass.
 ---
-
 # Cosim RLCR Loop
 
 Run iterative implementation or debugging after `cosim-gpu-flow-plan`. This

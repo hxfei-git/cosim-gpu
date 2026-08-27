@@ -15,7 +15,7 @@ Guest Linux 中的 HIP 程序
 
 ## 快速开始
 
-Host 必须是 x86_64 Linux（原生 Linux 或 WSL 2），并且 KVM 可用、Docker daemon 可访问。Docker 组权限等价于 root；授权前必须确认这一信任边界。资源要求、组权限刷新、WSL、代理检查和恢复方法见完整的[环境与构建指南](docs/环境与构建.md)。
+Host 必须是 x86_64 Linux（原生 Linux 或 WSL 2），并且 KVM 可用、Docker daemon 可访问。Docker 组权限等价于 root；授权前必须确认这一信任边界。资源、权限、WSL、代理和运行条件由下方 preflight 检查；参数与修复提示以当前 wrapper 的 `--help` 和实际输出为准。
 
 ```bash
 git submodule update --init --recursive
@@ -52,12 +52,11 @@ GUEST_TEST_PREFIX=HSA_ENABLE_INTERRUPT=0 \
 | 交互式协同仿真                      | `./scripts/cosim_launch.sh`                                                                                 |
 | 全新会话的分类测试                  | `./scripts/run_cosim_tests.sh <program>`                                                                    |
 | 查看运行范围内的清理清单（dry-run） | `./scripts/cosim_cleanup.sh --run-id <id>`                                                                  |
-| 有 ownership gate 的中断恢复        | [先校验并停止精确 launcher process group，再执行 manifest cleanup](docs/环境与构建.md#manifest-scoped-cleanup) |
+| 有 ownership gate 的中断恢复        | 先校验并停止精确 launcher process group，再执行 exact-manifest cleanup                                         |
 
 不要用手写 Docker、SCons、Packer 或 QEMU 命令替换这些入口。Wrapper 会强制使用锁定输入、运行范围内的资源名和 manifest，并执行 provenance、证据归档与清理检查。
-Cleanup inventory 只读，不授权清理 live run。中断恢复必须遵循链接中的
-`launcher.pid` ownership 与 process-group exit gate，随后才允许 exact-manifest
-cleanup。
+Cleanup inventory 只读，不授权清理 live run。中断恢复必须校验 `launcher.pid`
+ownership，通过 process-group exit gate 后才允许 exact-manifest cleanup。
 
 ## 仓库结构
 
@@ -66,27 +65,16 @@ cleanup。
 - `configs/cosim/` — lockfile 与协同仿真配置。
 - `scripts/` — preflight、构建、启动、测试、分类、审计和清理入口。
 - `tests/kernels/` — HIP 集成程序；`tests/common/` 提供共享辅助代码。
-- `docs/` — 使用中文文件名的项目文档与学习实验。
+- `docs/` — 当前学习路线、统一文档索引和后续生成的正式学习文档。
+- `docs/tmp/` — 仅用于原样保留旧资料的备份区，不参与当前文档导航。
 
-## 文档与实验
+## 文档
 
-- [文档索引](docs/文档索引.md) — 按使用、验证、架构和学习主题组织全部文档。
-- [环境与构建](docs/环境与构建.md) — Host 设置、可复现构建、启动、验证、证据和清理。
-- [学习实验](docs/学习实验.md) — 面向源码的 PCI/BAR/MMIO、内存转换、队列、PM4、SDMA、中断与 HIP Dispatch 实验。
-- [系统架构](docs/系统架构.md) — 传输、内存共享、GPUVM/GART、DMA 和 MSI-X 数据流。
-- [调试参考](docs/调试参考.md) — 参数、源码地图、已知限制和诊断特征。
+- [文档索引](docs/文档索引.md) — 当前正式文档的统一入口。
+- [学习路线](docs/学习路线.md) — 记录转型目标、阶段任务、当前进度与双仓库动态调整。
 
-| 学习主题                          | 实验入口                                            |
-| --------------------------------- | --------------------------------------------------- |
-| PCI / BAR / MMIO                  | [打开实验](docs/学习实验.md#lab-pci-bar-mmio)        |
-| amdgpu / KFD 初始化               | [打开实验](docs/学习实验.md#lab-amdgpu-kfd-init)     |
-| VRAM / GTT / GART / GPUVM         | [打开实验](docs/学习实验.md#lab-vram-gtt-gart-gpuvm) |
-| Ring / Queue / Doorbell           | [打开实验](docs/学习实验.md#lab-ring-queue-doorbell) |
-| PM4                               | [打开实验](docs/学习实验.md#lab-pm4)                 |
-| SDMA                              | [打开实验](docs/学习实验.md#lab-sdma)                |
-| Fence / IH / MSI-X                | [打开实验](docs/学习实验.md#lab-fence-ih-msix)       |
-| HIP → KFD/amdgpu → GPU Dispatch | [打开实验](docs/学习实验.md#lab-hip-dispatch)        |
-| gem5 GPU 模型与调试               | [打开实验](docs/学习实验.md#lab-gem5-debug)          |
+`docs/tmp/` 只保存备份，不在 README、文档索引或文档合同中链接。后续正式学习文档由
+用户按阶段生成，加入 `docs/` 后再同步更新索引与合同。
 
 ## 本地检查点
 

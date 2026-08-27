@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查中文文档布局、实验结构、链接与公开命令合同。"""
+"""检查当前中文文档布局、链接、公开命令与代理规则合同。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,11 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
+BACKUP_DOCS = DOCS / "tmp"
 DOC_INDEX = DOCS / "文档索引.md"
+LEARNING_ROUTE_DOC = DOCS / "学习路线.md"
+# 以下路径只为将来重新生成同名正式文档时复用旧合同辅助函数。不要将它们改指
+# BACKUP_DOCS；main() 在这些正式文档重新建立前不会调用相应检查。
 ARCHITECTURE_DOC = DOCS / "系统架构.md"
 GETTING_STARTED_DOC = DOCS / "环境与构建.md"
 LABS_DOC = DOCS / "学习实验.md"
@@ -156,20 +160,26 @@ def without_fenced_blocks(text: str) -> str:
 
 
 def public_markdown_files() -> list[Path]:
-    return [ROOT / "README.zh.md", DOC_INDEX, *PROJECT_DOCS]
+    current_docs = sorted(path for path in DOCS.glob("*.md") if path.is_file())
+    return [ROOT / "README.zh.md", *current_docs]
 
 
 def markdown_files() -> list[Path]:
     files = public_markdown_files()
+    files.append(ROOT / "AGENTS.md")
     files.extend(sorted((ROOT / ".agents" / "skills").glob("**/*.md")))
     return files
 
 
 def check_document_layout(contract: Contract) -> None:
-    """确认正式文档使用单层中文布局。"""
+    """确认当前文档使用单层中文布局，备份目录不参与导航。"""
 
     contract.require(not (DOCS / "zh").exists(), "docs/zh 目录不应继续存在")
     contract.require(not (DOCS / "en").exists(), "docs/en 目录不应继续存在")
+    contract.require(
+        BACKUP_DOCS.is_dir() and not BACKUP_DOCS.is_symlink(),
+        "docs/tmp 必须作为普通目录保留旧资料备份",
+    )
     for path in (
         ROOT / "README.md",
         ROOT / "agents.md",
@@ -180,7 +190,7 @@ def check_document_layout(contract: Contract) -> None:
             not path.exists() and not path.is_symlink(),
             f"已废弃入口不应继续存在：{path.name}",
         )
-    for path in (DOC_INDEX, *PROJECT_DOCS):
+    for path in (DOC_INDEX, LEARNING_ROUTE_DOC):
         contract.require(path.is_file(), f"缺少正式文档：{path.relative_to(ROOT)}")
         if not path.is_file():
             continue
@@ -190,6 +200,21 @@ def check_document_layout(contract: Contract) -> None:
             bool(lines) and lines[0].startswith("# "),
             f"{path.relative_to(ROOT)} 首行必须是一级中文标题",
         )
+
+    if DOC_INDEX.is_file():
+        index_text = without_fenced_blocks(read_text(DOC_INDEX))
+        for path in sorted(DOCS.glob("*.md")):
+            if path == DOC_INDEX or not path.is_file():
+                continue
+            contract.require(
+                re.search(rf"\]\({re.escape(path.name)}(?:#[^)]*)?\)", index_text)
+                is not None,
+                f"docs/文档索引.md 未索引正式文档：{path.name}",
+            )
+
+    readme = read_text(ROOT / "README.zh.md")
+    for target in ("docs/文档索引.md", "docs/学习路线.md"):
+        contract.require(target in readme, f"README.zh.md 未索引当前文档：{target}")
 
 
 def normalized_link_target(raw_target: str) -> str:
@@ -212,6 +237,15 @@ def check_local_links(contract: Contract) -> None:
             target_part = unquote(parsed.path)
             fragment = unquote(parsed.fragment)
             target = source if not target_part else (source.parent / target_part).resolve()
+            try:
+                target.relative_to(BACKUP_DOCS.resolve())
+            except ValueError:
+                pass
+            else:
+                contract.errors.append(
+                    f"{source.relative_to(ROOT)} 不得链接 docs/tmp 备份：{raw_target}"
+                )
+                continue
             try:
                 target.relative_to(ROOT)
             except ValueError:
@@ -1434,7 +1468,7 @@ def readme_cleanup_contract_issues(documents: dict[str, str]) -> list[str]:
             "README.zh.md",
             "查看运行范围内的清理清单（dry-run）",
             "有 ownership gate 的中断恢复",
-            "docs/环境与构建.md#manifest-scoped-cleanup",
+            "先校验并停止精确 launcher process group，再执行 exact-manifest cleanup",
         ),
     )
     for name, dry_label, recovery_label, recovery_link in contracts:
@@ -1462,8 +1496,7 @@ def check_readme_cleanup_mutation_guard(contract: Contract) -> None:
         {
             **documents,
             "README.zh.md": documents["README.zh.md"].replace(
-                "[先校验并停止精确 launcher process group，再执行 manifest cleanup]"
-                "(docs/环境与构建.md#manifest-scoped-cleanup)",
+                "先校验并停止精确 launcher process group，再执行 exact-manifest cleanup",
                 "`./scripts/cosim_cleanup.sh --run-id <id> --confirm`",
                 1,
             ),
@@ -1600,8 +1633,10 @@ def check_public_commands(contract: Contract) -> None:
         )
     contract.require(
         "README.zh.md" in top_agents and "docs/文档索引.md" in top_agents and
+        "docs/学习路线.md" in top_agents and
+        "不要让文档合同扫描它" in top_agents and
         "不维护重复的英文副本" in top_agents,
-        "AGENTS.md 未锁定单一中文文档布局",
+        "AGENTS.md 未锁定当前中文文档与 docs/tmp 备份边界",
     )
 
     skills_root = ROOT / ".agents" / "skills"
@@ -1681,19 +1716,14 @@ def main() -> int:
     contract = Contract()
     check_document_layout(contract)
     check_local_links(contract)
-    check_labs(contract)
-    check_issue_playbooks(contract)
-    check_shell_and_source_contracts(contract)
-    check_phase6_recovery_contract(contract)
-    check_strict_acceptance_contract(contract)
+    # 旧 Lab、架构、调试资料的细节检查有意停用；docs/tmp 只是备份，不能作为合同输入。
     check_public_commands(contract)
-    check_evidence_contract(contract)
     if contract.errors:
         print("[FAIL] 文档合同检查失败：", file=sys.stderr)
         for error in contract.errors:
             print(f"  - {error}", file=sys.stderr)
         return 1
-    print("[PASS] 中文文档布局、链接、实验结构、公开命令与代理规则合同均通过")
+    print("[PASS] 当前中文文档布局、链接、公开命令与代理规则合同均通过")
     return 0
 
 

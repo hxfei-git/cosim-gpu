@@ -1,191 +1,83 @@
 ---
 name: cosim-gpu-debug
-description: 用于定位 cosim 中的 gem5 crash/assertion、hang、timeout、地址翻译 fault、non-PASS 测试、Guest wait，以及可能继发于 gem5 的 QEMU 退出；先保留证据，再判断第一个失败组件。
+description: 定位 cosim 中的 gem5、QEMU 或 Guest crash、hang、timeout、GPUVM fault 与错误结果时使用；只加载当前症状相关的日志和源码。
 ---
 
-# Cosim 调试
+# cosim-gpu 调试
 
-本技能是 non-PASS cosim 行为的调试入口。流程以证据为先：先确定权威 artifact，判断
-第一个失败组件，再只读取与已观察机制匹配的 reference。
-
-## 入口门禁
-
-调试请求直接使用本流程，不要搜索已退役的 debug skill 或旧路由名。把历史对话转换为
-具体证据字段：artifact path、failing command、program identity、run ID、environment
-row、first durable failure、live wait state、comparison row 和正在检查的 source
-mechanism。
-
-单独询问 environment variable 并不构成 debug evidence。Runner prefix 使用
-`cosim-gpu-test`，ROCm 语义使用 `cosim-gpu-rocm-stack`；environment row 产生
-non-PASS 或 live wait 后再回到本技能。
-
-## Strict 与 diagnostic 边界
-
-调试、dirty candidate 与 live-state sampling 默认使用
-`COSIM_STRICT_ACCEPTANCE=0`。Runner 仍会校验 working baseline lock、build metadata、
-当前 source fingerprint、binary hash 与 runtime image 一致，并归档 dirty state；这类
-artifact 可用于定位和候选判断，但不能进入 strict v2 matrix。
-
-现有 `strict_acceptance=1` row 的 artifact 不得因后续调试被改写或降级。修复后需要最终
-accepted evidence 时，先提交 source 与 baseline lock、确认顶层仓库和 `gem5/` 都
-clean，再通过 `cosim-gpu-test` 新建 fresh `COSIM_STRICT_ACCEPTANCE=1` row。不得把
-default-mode `PASS`、standalone launch 或 keep-alive artifact 事后改标为 accepted。
-
-## 证据权威
-
-大型 artifact intake、历史对话复核或可能需要扫描许多 log 的任务使用
-`cosim-gpu-info-gathering`。本技能应先根据紧凑 evidence map 推理，再打开 raw log。
-
-先分类 artifact 状态：
-
-| Artifact 状态 | 动作 |
-|---|---|
-| `verdict.json`、`matrix.tsv` 与 `patch/binary-provenance.txt` 存在 | 将归档文件作为行为证据；只有 strict 字段与 verifier 同时通过时才视为 accepted。 |
-| Runner row 不完整且 matching process 存活 | 仅在 active plan 允许时采集有界 live sample。 |
-| Runner row 不完整且 process 已死 | 保留旧目录，用 `cosim-gpu-test` 按原 manifest 目标新建 exact rerun row；不得覆盖旧 artifact。 |
-| 旧 row 缺少归属判断所需的 gem5 log | 使用相同 program、environment、timeout 与 binary 创建固定 diagnostic rerun row。 |
-| QEMU-visible failure 没有 matching gem5 evidence | 在取得 gem5 log 前保持 provisional classification。 |
-
-接受 build 或 test evidence 前，记录精确 source 与 binary provenance。Build 规则使用
-`cosim-gpu-build`，不要在本技能重复实现。
-
-## Observable event 路由
-
-对 timeout、wait 与 non-PASS row，先生成紧凑 event summary，再读取大范围 log。
-`GPUWgProgress`、`HSAPacketProcessor` 与 `GPUCommandProc` 等 debug flag 是 event
-source，不是 classification model；不同 log 可以填充同一 observation dimension。
-
-使用 `references/analysis/observable-dimensions.md` 把 log 映射为标准维度：
-
-- progress：dispatch count、completion count、active wave state；
-- queue：read pointer、write pointer、dispatch pointer、packet completion；
-- signal：completion signal address、signal write、interrupt/event wakeup；
-- pressure：SQC retry、Ruby rejection、BufferFull、DMA/cache backpressure；
-- failure：fatal、panic、assertion、translation fault、QEMU exit。
-
-优先使用 `coverage.tsv`、`progress.tsv`、`queue.tsv`、`signals.tsv` 和简短的
-`diagnostic-summary.tsv`。空白维度表示未采集；`UNEXPLAINED` 表示已经检查但没有发现
-有用差异。缺失维度应指导下一项最小 debug flag，而不是触发广泛 log 扫描。
-
-## 通用证据流程
-
-提出 source edit 前收集：
-
-- program path、run ID、interrupt mode、timeout value 与 exact runner command；
-- 完整 gem5/QEMU/Guest log、verdict、matrix row 与 binary provenance；
-- 第一条 durable failure，以及之前最后 50–100 条相关记录；
-- 最近 passing comparison，或无法取得 comparison 的原因；
-- 第一个不同的 object：packet ID、queue ID、doorbell offset、signal address、PASID、
-  VMID、GPU virtual address、physical address、PTE value、callback ID 或 interrupt
-  cookie。
-
-先做定向搜索：
+目标是找出三侧中的第一个可靠失败点，而不是从最后一条报错倒推。先固定一个
+run artifact，按时间查看 `gem5.log`、`qemu.log` 和其中的 Guest kernel/service
+输出：
 
 ```bash
-rg -n 'fatal|panic|assert|PM4|SDMA|VMID|PASID|doorbell|interrupt|signal|GART|PTE|translation|fault|timeout|Broken pipe|error_setv' \
-  <artifact>/logs/gem5.log <artifact>/logs/qemu.log <artifact>/logs/guest
+ARTIFACT_DIR=artifacts/vector_add/replace-with-run-id
+rg -n -i -g '*.log' \
+    'fatal|panic|assert|abort|timeout|fault|translation|PTE|GPUVM|VMID|PASID|PM4|SDMA|doorbell|signal|interrupt|Broken pipe|socket|error_setv' \
+    "$ARTIFACT_DIR"
 ```
 
-## 组件判断
+保留失败前最后一个正常状态和第一条错误即可；不要先展开整个 artifact 或固定生成
+额外汇总表。
 
-根据第一条 durable evidence 选择后续动作：
+## 判断首个失败组件
 
-| Evidence | 动作 |
-|---|---|
-| gem5 log 以 `fatal`、`panic`、assertion 或 container exit 结束 | 检查 gem5 log 并加载 `references/gem5-model/overview.md`。 |
-| QEMU 出现 `error_setv`、vfio-user abort、socket close 或 `Aborted`，而 gem5 可能先退出 | 在 `references/qemu/error-setv-pattern.md` 与 gem5 log 证明相反前，把 QEMU 视为继发症状。 |
-| gem5 log 出现 `User translation fault`、`GART`、unmapped page、VMID/PASID、PTE 或 doorbell evidence | 加载 `references/gem5-model/address-translation-fault.md`。 |
-| Workload 存活但 output 与 progress counter 停止变化 | 保留 Guest，并加载 `references/analysis/live-wait-state.md`。 |
-| Workload timeout 时 dispatch/completion 仍变化 | 编辑 model 前先分类为 throughput、scale 或 timeout-budget evidence。 |
-| Non-PASS 没有 crash | 使用 `references/analysis/debug-analysis.md` 与 `references/analysis/observable-dimensions.md`。 |
-| log 出现 cache、signal、PM4、VMID、PASID、SDMA、TLB 或 PWC | 加载匹配的 gem5 model reference。 |
+- gem5 先出现 `fatal`、`panic`、assertion、translation fault 或容器退出：
+  先查 gem5。随后出现的 QEMU vfio-user socket EOF、broken pipe、`error_setv`
+  或 abort 通常是 gem5 endpoint 消失后的次生错误。
+- gem5 仍运行且 vfio-user/MMIO 请求正常，但 QEMU 自己先 abort 或 KVM 退出：
+  查 QEMU 命令行、trace 和同一时刻的 socket 请求。
+- 两侧仍运行，而 `cosim-gpu-setup.service`、amdgpu/KFD、`rocminfo` 或 HIP
+  首先失败：查 Guest 的 service log 与 `dmesg`；部分初始化的 Guest 不原地重载
+  driver。
+- timeout 时先判断进度是否仍变化。仍有 dispatch/workgroup/completion 表示规模或
+  timeout budget 问题；queue、signal 和 CU 状态都不再变化才继续查等待链。
 
-对已知 MAP_QUEUES VMID assertion，检查：
+## 关键状态链
 
-```bash
-grep -n 'assert.*vmid\|assert(queue_vmid)\|MAPQueues' \
-  gem5/src/dev/amdgpu/pm4_packet_processor.cc
-```
+沿当前症状所在的链路向前找第一个缺口：
 
-随后阅读：
+1. PCI/BAR/MMIO：vfio-user callback 是否到达 `AMDGPUDevice::writeMMIO`。
+2. PM4/process：`MAP_PROCESS` 是否建立 PASID→VMID/page-table base，
+   `MAP_QUEUES` 是否注册 MQD、queue 和 doorbell。
+3. AQL/doorbell：BAR2 write 是否路由到正确 queue，read/write/dispatch pointer
+   是否推进，packet header 与 kernel object 是否有效。
+4. 执行：command processor 是否提交 packet，dispatcher/CU 是否开始并完成
+   workgroup。
+5. 地址转换：区分 VMID0 GART 与 user GPUVM；记录 faulting GPU VA、VMID/PASID、
+   page-table base、PTE、system bit，以及失败发生在 TLB/PWC 前后。
+6. 完成：completion signal 是否递减；interrupt 模式下再检查 CP_EOP cookie、IH
+   ring entry/write pointer、MSI-X raise 和 Guest KFD 唤醒。signal 更新与 IRQ
+   唤醒是两个检查点。
 
-- `references/gem5-model/vmid-assert-lesson.md`；
-- `references/gem5-model/examples/vmid-assert-crash.md`；
-- `references/gem5-model/vmid-pasid-architecture.md`。
+MMIO、doorbell、queue、signal、VMID/PASID、GPU VA/PTE 和 interrupt cookie 都应
+使用同一次 run 中的实际身份，不能用相邻 run 的数值拼接。
 
-## Timeout 与 wait 流程
+## gem5 源码导航
 
-Artifact summary 已指出缺失维度或 live state 后，阅读
-`references/analysis/debug-workflows.md` 中的 timeout、wait-state 与 throughput
-流程。
+| 主题 | 当前源码与关键入口 |
+| --- | --- |
+| vfio-user、BAR、IRQ | `gem5/src/dev/amdgpu/mi300x_vfio_user.cc`：`handleMmioAccess`、`handleDoorbellAccess`、`sendIrqRaise` |
+| 设备路由、VMID | `gem5/src/dev/amdgpu/amdgpu_device.cc`：`writeMMIO`、`writeDoorbell`、`allocateVMID`、`mapDoorbellToVMID`、`intrPost` |
+| PM4/process/queue | `gem5/src/dev/amdgpu/pm4_packet_processor.cc`：`process`、`mapProcess`、`mapQueues` |
+| AQL queue | `gem5/src/dev/hsa/hw_scheduler.cc` 与 `hsa_packet_processor.cc`：`HWScheduler::write`、`getCommandsFromHost`、`processPkt`、`finishPkt` |
+| Dispatch/CU | `gem5/src/gpu-compute/gpu_command_processor.cc` 与 `dispatcher.cc`：`submitDispatchPkt`、`dispatchPkt`、`GPUDispatcher::dispatch` |
+| GPUVM/PTE | `gem5/src/dev/amdgpu/amdgpu_vm.cc`、`gem5/src/arch/amdgpu/vega/pagetable_walker.cc`、`tlb.cc` |
+| SDMA | `gem5/src/dev/amdgpu/sdma_engine.cc` |
+| Signal/IH | `gem5/src/gpu-compute/gpu_command_processor.cc` 的 `sendCompletionSignal`、`updateHsaSignalData`，以及 `gem5/src/dev/amdgpu/interrupt_handler.cc` |
 
-## Performance optimization 流程
+## 定向日志
 
-Active objective 是 simulator efficiency 而非 functional correctness 时，阅读
-`references/analysis/debug-workflows.md`。
+只开启与缺失状态相邻的 flags：
 
-## 地址翻译 fault 审查
+| 现象 | 建议 flags |
+| --- | --- |
+| vfio-user、BAR、MMIO、IRQ | `MI300XCosim,AMDGPUDevice` |
+| PM4、process、MQD | `PM4PacketProcessor,AMDGPUDevice` |
+| AQL queue 与 dispatch | `HSAPacketProcessor,GPUCommandProc,GPUDisp,GPUKernelInfo` |
+| GPUVM、PTE、TLB | `AMDGPUMem,GPUPTWalker,GPUTLB` |
+| SDMA | `SDMAEngine,SDMAData` |
 
-gem5 在 crash 附近出现 `User translation fault`、`GART cosim`、unmapped page、PTE
-diagnostic、VMID/PASID mismatch 或 unknown doorbell evidence 时使用本节，并阅读
-`references/gem5-model/address-translation-fault.md`。
-
-编辑前至少记录：
-
-- failing program、run ID、HSA interrupt value 与最近 passing row；
-- 第一条 gem5 fatal 与任何继发 QEMU socket/`error_setv` 症状；
-- faulting GPU virtual address、可能的 physical address、PTE value、GART base、
-  page-table base、VMID、PASID、queue ID 与 doorbell offset；
-- failure 前的 PM4、SDMA 或 HSA packet sequence；
-- fault 是否在不同 interrupt mode 下 deterministic。
-
-同一 run ID 的 gem5 log 先出现 translation fatal 时，QEMU `error_setv`、EOF、broken
-pipe 与 device-lost message 都是继发症状。
-
-## Script 纪律
-
-添加 debug script 或 source instrumentation 前阅读
-`references/analysis/debug-workflows.md`。
-
-## Guest 检查
-
-Console transport 与 Guest command injection 使用 `cosim-gpu-guest`。采集：
-
-- emulated GPU 的 PCI device state；
-- loaded amdgpu module state；
-- `cosim-gpu-setup.service` status；
-- ROCm device visibility 与 agent enumeration；
-- 完整及过滤后的 kernel log；
-- target process ID、thread table、wait channel、kernel stack、file descriptor，以及
-  target 仍存活时的 user-space backtrace。
-
-## Patch readiness
-
-判断 source edit 是否 ready 前阅读 `references/analysis/debug-workflows.md`。
-
-## QEMU trace
-
-需要 QEMU-side protocol evidence 时，用标准 vfio-user transport 做 diagnostic trace：
-
-```bash
-COSIM_STRICT_ACCEPTANCE=0 ./scripts/cosim_launch.sh --qemu-trace 'vfio_user_*'
-```
-
-记录 exact launch command 与 trace log。Standalone trace 只属于诊断；若该维度必须进入
-最终证据，使用 runner passthrough 在 clean tree 上另建 strict row。
-
-## References
-
-- `references/analysis/debug-analysis.md`：事实记录与 comparison guide；
-- `references/analysis/observable-dimensions.md`：observable dimension checklist；
-- `references/analysis/live-wait-state.md`：live Guest wait-state sampling；
-- `references/analysis/debug-workflows.md`：timeout、performance、script 与 patch-ready 流程；
-- `references/gem5-model/overview.md`：gem5 MI300X model map；
-- `references/gem5-model/discovery-log.md`：历史 model discovery；
-- `references/gem5-model/cache-coherence-checkpoints.md`：TLB、PWC、SQC、GL2 checkpoint；
-- `references/gem5-model/address-translation-fault.md`：GART、PTE、VMID/PASID 与 doorbell fault；
-- `references/gem5-model/hsa-signal-completion-pattern.md`：HSA signal completion design；
-- `references/gem5-model/vmid-pasid-architecture.md`：VMID/PASID semantics；
-- `references/gem5-model/vmid-assert-lesson.md`：MAP_QUEUES VMID assertion lesson；
-- `references/qemu/qemu-first-failure.md`：QEMU-first failure；
-- `references/qemu/error-setv-pattern.md`：QEMU error propagation pattern。
+通过 launcher 或 runner 的 `--gem5-debug` 传入这些 flag；只有 socket/protocol
+仍无法判断时再加 `--qemu-trace`。历史故障只在当前签名匹配时查
+`docs/调试参考.md`，并先核对当前顶层与 gem5 revision；不要把历史单一修复方案
+直接套到新问题。

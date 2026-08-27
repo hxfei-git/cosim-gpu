@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "cosim-gpu skills",
     "shortDescription": "QEMU+gem5 MI300X co-simulation workflows.",
-    "longDescription": "Reusable skills for debugging, guest interaction, and guest disk-image maintenance in the cosim-gpu project.",
+    "longDescription": "Optional project skills for build, run, test, debug, and disk-image operations in cosim-gpu.",
     "developerName": "Chao Liu",
     "category": "Productivity",
     "capabilities": [
@@ -28,6 +28,6 @@
       "Debug",
       "Operations"
     ],
-    "defaultPrompt": "Use the cosim-gpu skills to diagnose and verify a QEMU+gem5 MI300X co-simulation issue."
+    "defaultPrompt": "Use a project skill only when the request directly matches a retained build, run, test, debug, or disk-image operation. Otherwise inspect the repository and use the model's native reasoning and development capabilities."
   }
 }

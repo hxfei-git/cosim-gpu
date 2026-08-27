@@ -54,40 +54,17 @@ ISSUE_SIGNATURES = (
     "kgd2kfd_device_exit",
 )
 
-ROUTED_POLICY_FILES = (
-    ROOT / ".agents" / "skills" / "cosim-gpu-build" / "SKILL.md",
-    ROOT / ".agents" / "skills" / "cosim-gpu-launch" / "SKILL.md",
-    ROOT / ".agents" / "skills" / "cosim-gpu-guest" / "SKILL.md",
-    ROOT / ".agents" / "skills" / "cosim-gpu-debug" / "references" /
-        "qemu" / "error-setv-pattern.md",
-    ROOT / ".agents" / "skills" / "cosim-gpu-test" / "SKILL.md",
-    ROOT / ".agents" / "skills" / "cosim-gpu-debug" / "SKILL.md",
-    ROOT / ".agents" / "skills" / "cosim-gpu-debug" / "references" /
-        "analysis" / "live-wait-state.md",
-)
-
 SKILL_MARKDOWN_FILES = tuple(
     sorted((ROOT / ".agents" / "skills").glob("**/*.md"))
 )
 
 ROUTE_CONTRACTS = {
-    "cosim-gpu-flow-plan": ".agents/skills/cosim-gpu-flow-plan/SKILL.md",
     "cosim-gpu-build": ".agents/skills/cosim-gpu-build/SKILL.md",
-    "cosim-gpu-launch": ".agents/skills/cosim-gpu-launch/SKILL.md",
-    "cosim-gpu-guest": ".agents/skills/cosim-gpu-guest/SKILL.md",
+    "cosim-gpu-run": ".agents/skills/cosim-gpu-run/SKILL.md",
     "cosim-gpu-test": ".agents/skills/cosim-gpu-test/SKILL.md",
     "cosim-gpu-debug": ".agents/skills/cosim-gpu-debug/SKILL.md",
-    "cosim-gpu-rocm-stack": ".agents/skills/cosim-gpu-rocm-stack/SKILL.md",
     "cosim-gpu-disk-image-edit":
         ".agents/skills/cosim-gpu-disk-image-edit/SKILL.md",
-    "cosim-gpu-info-gathering":
-        ".agents/skills/cosim-gpu-info-gathering/SKILL.md",
-    "cosim-gpu-review": ".agents/skills/cosim-gpu-review/SKILL.md",
-    "cosim-gpu-codex-review":
-        ".agents/skills/cosim-gpu-codex-review/SKILL.md",
-    "cosim-gpu-rlcr-loop": ".agents/skills/cosim-gpu-rlcr-loop/SKILL.md",
-    "cosim-gpu-repo-maintenance":
-        ".agents/skills/cosim-gpu-repo-maintenance/SKILL.md",
 }
 
 ZH_LAB_SECTIONS = (
@@ -1448,72 +1425,6 @@ def check_shell_and_source_contracts(contract: Contract) -> None:
     check_source_identifier_mutation_guard(contract)
 
 
-def live_wait_contract_issues(text: str) -> list[str]:
-    """返回 live-wait Guest/Host 双重 deadline 与采样门禁漂移。"""
-
-    issues: list[str] = []
-    required_tokens = (
-        (
-            'send_console "timeout --kill-after=5s 45s bash -c',
-            "缺少 Guest-side timeout --kill-after=5s 45s",
-        ),
-        ("sample_rc=\\$?", "缺少 Guest wrapper 退出码采集"),
-        (
-            "echo __WAIT_SAMPLE_END__:${sample}:\\${sample_rc}",
-            "END marker 未携带 Guest wrapper 退出码",
-        ),
-        (
-            'grep -q "__WAIT_SAMPLE_END__:${sample}:0"',
-            "未要求 Guest wrapper END marker 的退出码为 0",
-        ),
-    )
-    for token, message in required_tokens:
-        if token not in text:
-            issues.append(message)
-
-    sample_gate = re.search(
-        r"if ! capture_wait_sample 1; then\n"
-        r"(?:(?:    ).*\n)*?"
-        r"    exit 1\n"
-        r"fi\n"
-        r"sleep 15\n"
-        r"if ! capture_wait_sample 2; then",
-        text,
-    )
-    if sample_gate is None:
-        issues.append("sample 1 失败后未在 sample 2 前退出")
-    return issues
-
-
-def check_live_wait_mutation_guard(contract: Contract, text: str) -> None:
-    """纯内存破坏 live-wait 门禁，确认合同拒绝 Host-only deadline 回归。"""
-
-    mutations = (
-        (
-            "timeout --kill-after=5s 45s",
-            "timeout 45s",
-            "Guest-side timeout",
-        ),
-        (
-            "echo __WAIT_SAMPLE_END__:${sample}:\\${sample_rc}",
-            "echo __WAIT_SAMPLE_END__:${sample}",
-            "带 rc 的 END marker",
-        ),
-        (
-            "    exit 1\nfi\nsleep 15\nif ! capture_wait_sample 2; then",
-            "    true\nfi\nsleep 15\nif ! capture_wait_sample 2; then",
-            "sample 1 失败停止 sample 2",
-        ),
-    )
-    for old, new, label in mutations:
-        mutated = text.replace(old, new, 1)
-        contract.require(mutated != text, f"live-wait {label} mutation fixture 缺失")
-        contract.require(
-            bool(live_wait_contract_issues(mutated)),
-            f"live-wait {label} mutation 未被拒绝",
-        )
-
-
 def readme_cleanup_contract_issues(documents: dict[str, str]) -> list[str]:
     """返回根 README 的 dry-run inventory 与 ownership-gated recovery 漂移。"""
 
@@ -1692,81 +1603,61 @@ def check_public_commands(contract: Contract) -> None:
         "不维护重复的英文副本" in top_agents,
         "AGENTS.md 未锁定单一中文文档布局",
     )
+
+    skills_root = ROOT / ".agents" / "skills"
+    expected_skill_dirs = set(ROUTE_CONTRACTS)
+    actual_skill_dirs = {
+        path.name for path in skills_root.iterdir() if path.is_dir()
+    }
     contract.require(
-        "只有用户单独明确要求推送并确认目标 remote/branch 后才能推送" in top_agents,
-        "AGENTS.md 未保留 remote/branch 级别的单独 push 授权",
-    )
-    contract.require(
-        "远端推送必须由用户单独明确授权" in top_agents,
-        "AGENTS.md 未保留单独 push 授权",
+        actual_skill_dirs == expected_skill_dirs,
+        "技能目录必须精确等于五个保留项："
+        f"expected={sorted(expected_skill_dirs)}, "
+        f"actual={sorted(actual_skill_dirs)}",
     )
 
-    skill_contracts = {
-        ROUTED_POLICY_FILES[1]: ("--cosim-backend", "legacy cosim", "manually load"),
-        ROUTED_POLICY_FILES[2]: (
-            "COSIM_GUEST_SUDO_PASSWORD",
-            "dd if=/root/roms/mi300.rom",
-            "modprobe amdgpu ip_block_mask",
-            "/tmp/${SESSION_NAME}-${RUN_ID}.log",
-        ),
-        ROUTED_POLICY_FILES[3]: (
-            "--args .local/cosim/qemu",
-            "qemu-system-x86_64 [args...]",
-        ),
-        ROUTED_POLICY_FILES[4]: (
-            "--hang-env",
-            "HIP-Basic/FloydWarshall",
-            "bash scripts/cosim_cleanup.sh",
-        ),
+    expected_skill_files = {
+        ROOT / route for route in ROUTE_CONTRACTS.values()
     }
-    for path, stale_values in skill_contracts.items():
-        text = read_text(path)
-        for stale in stale_values:
+    actual_skill_files = {
+        path for path in skills_root.glob("**/*") if path.is_file()
+    }
+    contract.require(
+        actual_skill_files == expected_skill_files,
+        "精简后的技能树只能包含五个 SKILL.md",
+    )
+
+    for source_skill, source_route in ROUTE_CONTRACTS.items():
+        source_text = read_text(ROOT / source_route)
+        contract.require(
+            f"name: {source_skill}" in source_text,
+            f"{source_route} 的 frontmatter name 不匹配",
+        )
+        for target_skill in expected_skill_dirs - {source_skill}:
             contract.require(
-                stale not in text,
-                f"{path.relative_to(ROOT)} 仍包含陈旧或不安全入口：{stale}",
+                target_skill not in source_text,
+                f"{source_route} 不应路由到另一个保留技能：{target_skill}",
             )
 
     all_skill_text = "\n".join(read_text(path) for path in SKILL_MARKDOWN_FILES)
-    for stale in ("--hang-env", "COSIM_GUEST_SUDO_PASSWORD", "sudo -S"):
-        contract.require(stale not in all_skill_text, f"技能树仍包含陈旧或秘密注入入口：{stale}")
+    for stale in ("COSIM_GUEST_SUDO_PASSWORD", "sudo -S"):
+        contract.require(
+            stale not in all_skill_text,
+            f"技能树仍包含秘密注入入口：{stale}",
+        )
 
-    guest_skill = read_text(ROUTED_POLICY_FILES[2])
-    for required in (
-        'label=io.cosim-gpu.run-id=${RUN_ID}',
-        'kill -0 "$LAUNCH_PID"',
-        "timeout 5s bash -c",
-        "deadline=$((SECONDS + 30))",
-    ):
-        contract.require(required in guest_skill, f"Guest 技能缺少有界交互合同：{required}")
-    contract.require(
-        "while true; do" not in guest_skill and
-        "--filter name=gem5-cosim" not in guest_skill,
-        "Guest 技能仍包含无界等待或非 run-scoped container 查询",
+    plugin_manifest = read_text(
+        ROOT / ".agents" / ".codex-plugin" / "plugin.json"
     )
-
-    live_wait = read_text(ROUTED_POLICY_FILES[6])
-    for required in (
-        "capture_wait_sample 1",
-        "capture_wait_sample 2",
-        "deadline=$((SECONDS + 60))",
-        "__DMESG_FULL__",
-        "__DMESG_FILTERED__",
-        "target-before.log",
-        "target-after.log",
-    ):
-        contract.require(required in live_wait, f"live-wait 缺少双样本合同：{required}")
-    for issue in live_wait_contract_issues(live_wait):
-        contract.errors.append(f"live-wait {issue}")
-    check_live_wait_mutation_guard(contract, live_wait)
-
-    discovery = read_text(
-        ROOT / ".agents" / "skills" / "cosim-gpu-debug" / "references" /
-        "gem5-model" / "discovery-log.md"
+    neutral_prompt = (
+        "Use a project skill only when the request directly matches a retained "
+        "build, run, test, debug, or disk-image operation. Otherwise inspect "
+        "the repository and use the model's native reasoning and development "
+        "capabilities."
     )
     contract.require(
-        "/dev/shm/cosim-guest-ram-<run-id>" in discovery,
-        "discovery-log.md 未使用 run-scoped Guest RAM 名称",
+        neutral_prompt in plugin_manifest,
+        "plugin.json 缺少按直接匹配选择技能的中性默认提示",
     )
 
 

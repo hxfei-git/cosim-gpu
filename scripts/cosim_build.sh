@@ -77,7 +77,7 @@ GUEST_BUILD_PIPELINE_EXIT_CODE=0
 GUEST_TEE_EXIT_CODE=0
 
 QEMU_BUILD_JOBS="${QEMU_BUILD_JOBS:-4}"
-GEM5_BUILD_JOBS="${GEM5_BUILD_JOBS:-4}"
+GEM5_BUILD_JOBS="${GEM5_BUILD_JOBS:-2}"
 M5_BUILD_JOBS="${M5_BUILD_JOBS:-4}"
 FORCE=0
 
@@ -88,7 +88,7 @@ Usage: $0 {lock-qemu-source|qemu|gem5|m5|guest|all|status} [--force]
 Environment:
   COSIM_LOCAL_ROOT   Local source/build/toolchain root
   QEMU_BUILD_JOBS    QEMU parallelism (default: 4)
-  GEM5_BUILD_JOBS    gem5 parallelism (default: 4)
+  GEM5_BUILD_JOBS    gem5 parallelism (default: 2)
   M5_BUILD_JOBS      m5 parallelism (default: 4)
   GEM5_DIR           Alternate gem5 worktree
   GEM5_RESOURCES_DIR Alternate gem5-resources worktree

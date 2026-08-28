@@ -39,14 +39,14 @@ gem5 通过 `scripts/Dockerfile.run` 构建。该文件基于锁定 digest 的
 `ghcr.io/gem5/gpu-fs`，补充 Python 3.12 与 json-c，并生成
 `gem5-build:local`、`gem5-run:local` 两个 tag。
 
-gem5 因 OOM 失败时降低并行度后重试同一 wrapper：
+gem5 默认使用两路并行，以控制 12～14 GiB Host 上的编译峰值：
 
 ```bash
-GEM5_BUILD_JOBS=2 ./scripts/cosim_build.sh gem5
+./scripts/cosim_build.sh gem5
 ```
 
-仍不足时改为 `GEM5_BUILD_JOBS=1`。QEMU 和 m5 分别使用
-`QEMU_BUILD_JOBS`、`M5_BUILD_JOBS`。
+需要覆盖时设置 `GEM5_BUILD_JOBS`；OOM 时降为 1。QEMU 和 m5 分别使用
+`QEMU_BUILD_JOBS`、`M5_BUILD_JOBS`，默认仍为 4。
 
 ## 产物位置
 

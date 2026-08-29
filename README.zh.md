@@ -72,8 +72,8 @@ ownership，通过 process-group exit gate 后才允许 exact-manifest cleanup�
 
 - [文档索引](docs/文档索引.md) — 当前正式文档的统一入口。
 - [学习路线](docs/学习路线.md) — 记录转型目标、阶段任务、当前进度与双仓库动态调整。
-- [阶段一：系统架构](docs/阶段一：系统架构.md) — Phase 1 的仓库结构、运行拓扑、数据流、artifact
-  速查与 `[REAL AMD]`/`[GEM5]`/`[COSIM]` 边界。
+- [阶段一：系统架构](docs/阶段一：系统架构.md) — Phase 1 的实验环境全景、代表性 AQL
+  下发路径、仓库结构、artifact 速查与 `[REAL AMD]`/`[GEM5]`/`[COSIM]` 边界。
 
 `docs/tmp/` 只保存备份，不在 README、文档索引或文档合同中链接。后续正式学习文档由
 用户按阶段生成，加入 `docs/` 后再同步更新索引与合同。
